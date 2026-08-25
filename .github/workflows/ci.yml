@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+env:
+  PRESENTMON_SHA256: 9BEC3083069F58F911E6A512F4806DB51A27BD096103087BC1D05EF54C80A191
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Verify bundled PresentMon hash
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash ThirdParty/PresentMon/PresentMon-2.5.1-x64.exe -Algorithm SHA256).Hash
+          if ($hash -ne $env:PRESENTMON_SHA256) {
+            Write-Error "PresentMon binary hash mismatch: $hash"
+            exit 1
+          }
+          Write-Host "PresentMon hash OK"
+
+      - name: Build (warnings are errors)
+        run: dotnet build -c Release
+
+      - name: Test
+        run: dotnet test -c Release --no-build --logger "console;verbosity=normal"
+
+      - name: Publish portable build
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: ./tools/publish.ps1 -Version "${{ github.ref_name }}"
+
+      - name: Build installer
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion="${{ github.ref_name }}" installer/afterglow.iss
+
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            artifacts/Afterglow-*-portable.zip
+            artifacts/Afterglow-*-setup.exe
+          generate_release_notes: true
