@@ -96,6 +96,13 @@ Afterglow is a from-scratch, MIT-licensed answer:
   backs off on the first failure and runs a confirmation pass — an open-method alternative
   to closed OC scanners
 
+<p align="center">
+  <img src="https://github.com/minewefu/afterglow/releases/download/v1.0.1/burn-demo.gif" width="800" alt="Afterglow dashboard while the burn test ramps an RTX 5090 to ~550 W" />
+  <br/>
+  <sub>Real capture at ~10× speed: the burn test takes an RTX 5090 from idle to ~550 W sustained
+  while the dashboard watches — clocks, power, temperatures, and fan ramp all live.</sub>
+</p>
+
 **Agent-native (AI integration)**
 - `afterglow-cli mcp` runs a **Model Context Protocol server**, so AI agents can monitor,
   tune, and stability-test the GPU with typed tools — including a fully autonomous
