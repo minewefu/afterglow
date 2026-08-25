@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Afterglow.App/Afterglow.App.csproj" />
+    <Project Path="src/Afterglow.Cli/Afterglow.Cli.csproj" />
+    <Project Path="src/Afterglow.Core/Afterglow.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Afterglow.Core.Tests/Afterglow.Core.Tests.csproj" />
+  </Folder>
+</Solution>
