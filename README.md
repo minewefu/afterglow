@@ -11,7 +11,9 @@
 </p>
 
 <p align="center">
-  <img src="docs/media/dashboard.png" width="820" alt="Afterglow dashboard" />
+  <img src="docs/media/dashboard.png" width="820" alt="Afterglow dashboard — live RTX 5090 telemetry during a burn test" />
+  <br/>
+  <sub>Real capture: an RTX 5090 riding through a built-in burn test — no synthetic data.</sub>
 </p>
 
 ---
@@ -53,6 +55,12 @@ Afterglow is a from-scratch, MIT-licensed answer:
   voltage the driver selects (plus continuous passive recording while you game). Pick any
   point on the measured curve and Afterglow computes the exact offset + lock that holds that
   clock at that voltage
+
+<p align="center">
+  <img src="docs/media/vfcurve.png" width="820" alt="Measured V/F curve of an RTX 5090" />
+  <br/>
+  <sub>An RTX 5090's real measured voltage/frequency curve — probed on hardware where NVIDIA removed the official curve APIs.</sub>
+</p>
 - Knob-by-knob apply results: every slider reports applied / clamped / failed individually
 
 **Fans**

@@ -146,12 +146,23 @@ public sealed class VfCurveChart : FrameworkElement
 
         var gridPen = new Pen(GridBrush, 1);
 
-        // Axes
-        for (double v = _minV; v <= _maxV; v += Math.Max(25, Math.Round((_maxV - _minV) / 8 / 25) * 25))
+        // X axis: the unit rides on the last tick's label instead of floating
+        // separately (a standalone "mV" collides with the final tick).
+        double tickStep = Math.Max(25, Math.Round((_maxV - _minV) / 8 / 25) * 25);
+        var ticks = new List<double>();
+        for (double v = _minV; v <= _maxV + 0.01; v += tickStep)
         {
-            var p = ToScreen(v, _minF);
+            ticks.Add(v);
+        }
+
+        for (int i = 0; i < ticks.Count; i++)
+        {
+            var p = ToScreen(ticks[i], _minF);
             dc.DrawLine(gridPen, new Point(p.X, r.Y), new Point(p.X, r.Bottom));
-            DrawLabel(dc, $"{v:F0}", new Point(p.X - 12, r.Bottom + 5), 10);
+            string text = i == ticks.Count - 1 ? $"{ticks[i]:F0} mV" : $"{ticks[i]:F0}";
+            var formatted = Format(text, 10, LabelBrush);
+            double x = Math.Min(p.X - (formatted.Width / 2), ActualWidth - formatted.Width - 2);
+            dc.DrawText(formatted, new Point(Math.Max(2, x), r.Bottom + 5));
         }
 
         for (int i = 0; i <= 4; i++)
@@ -161,8 +172,6 @@ public sealed class VfCurveChart : FrameworkElement
             dc.DrawLine(gridPen, new Point(r.X, p.Y), new Point(r.Right, p.Y));
             DrawLabel(dc, $"{f:F0}", new Point(4, p.Y - 7), 10);
         }
-
-        DrawLabel(dc, "mV", new Point(r.Right - 16, r.Bottom + 5), 10);
 
         if (curve is not { Count: > 1 })
         {
@@ -216,26 +225,48 @@ public sealed class VfCurveChart : FrameworkElement
             dc.DrawLine(dashed, new Point(r.X, t.Y), new Point(r.Right, t.Y));
             dc.DrawLine(dashed, new Point(t.X, r.Y), new Point(t.X, r.Bottom));
             dc.DrawEllipse(null, new Pen(TargetBrush, 2.5), t, 6, 6);
-            DrawLabel(dc, $"target {TargetClock:F0} MHz @ {TargetVoltage:F0} mV",
-                new Point(Math.Min(t.X + 10, r.Right - 165), t.Y - 18), 11, TargetBrush);
+
+            var targetLabel = Format($"target {TargetClock:F0} MHz @ {TargetVoltage:F0} mV", 11, TargetBrush);
+            double tx = Math.Clamp(t.X + 10, r.X + 2, r.Right - targetLabel.Width - 6);
+            double ty = Math.Clamp(t.Y - 20, r.Y + 2, r.Bottom - targetLabel.Height - 2);
+            var targetPill = new Rect(tx - 3, ty - 1, targetLabel.Width + 6, targetLabel.Height + 2);
+            dc.DrawRoundedRectangle(PillBrush, null, targetPill, 3, 3);
+            dc.DrawText(targetLabel, new Point(tx, ty));
         }
 
-        // Live operating point.
+        // Live operating point, labeled on a backing pill so it stays readable
+        // wherever it lands (on the curve, in shaded bars, near edges).
         if (LiveVoltage > 0 && LiveClock > 0)
         {
             var live = ToScreen(
                 Math.Clamp(LiveVoltage, _minV, _maxV),
                 Math.Clamp(LiveClock, _minF, _maxF));
             dc.DrawEllipse(LiveBrush, null, live, 4.5, 4.5);
-            DrawLabel(dc, "now", new Point(live.X + 8, live.Y - 16), 10, LiveBrush);
+
+            var label = Format("now", 10, LiveBrush);
+            double lx = live.X + 9;
+            double ly = live.Y - (label.Height / 2);
+            if (lx + label.Width + 6 > r.Right)
+            {
+                lx = live.X - label.Width - 13;
+            }
+
+            ly = Math.Clamp(ly, r.Y + 2, r.Bottom - label.Height - 2);
+            var pill = new Rect(lx - 3, ly - 1, label.Width + 6, label.Height + 2);
+            dc.DrawRoundedRectangle(PillBrush, null, pill, 3, 3);
+            dc.DrawText(label, new Point(lx, ly));
         }
     }
 
+    private static readonly Brush PillBrush = Freeze(new SolidColorBrush(Color.FromArgb(210, 12, 15, 20)));
+
+    private FormattedText Format(string text, double size, Brush brush) =>
+        new(text, CultureInfo.InvariantCulture, FlowDirection.LeftToRight,
+            LabelFace, size, brush, VisualTreeHelper.GetDpi(this).PixelsPerDip);
+
     private void DrawLabel(DrawingContext dc, string text, Point at, double size, Brush? brush = null)
     {
-        var formatted = new FormattedText(text, CultureInfo.InvariantCulture, FlowDirection.LeftToRight,
-            LabelFace, size, brush ?? LabelBrush, VisualTreeHelper.GetDpi(this).PixelsPerDip);
-        dc.DrawText(formatted, at);
+        dc.DrawText(Format(text, size, brush ?? LabelBrush), at);
     }
 
     protected override void OnMouseLeftButtonDown(MouseButtonEventArgs e)

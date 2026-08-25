@@ -249,8 +249,10 @@ public partial class App : Application
     }
 
     /// <summary>
-    /// Renders the window off-screen after a few telemetry ticks and saves a PNG.
-    /// Used for automated visual verification and README screenshots.
+    /// Renders the window off-screen after telemetry has accumulated and saves a
+    /// PNG. Used for automated visual verification and README screenshots.
+    /// --screenshot-delay N extends the accumulation window (e.g., to capture
+    /// real graphs while a load runs).
     /// </summary>
     private void RunScreenshotMode(MainWindow window, string path)
     {
@@ -260,8 +262,19 @@ public partial class App : Application
         window.ShowActivated = false;
         window.Show();
 
+        double delaySeconds = 4;
+        string[] cliArgs = Environment.GetCommandLineArgs();
+        for (int i = 0; i < cliArgs.Length - 1; i++)
+        {
+            if (cliArgs[i].Equals("--screenshot-delay", StringComparison.OrdinalIgnoreCase) &&
+                double.TryParse(cliArgs[i + 1], out double parsed))
+            {
+                delaySeconds = Math.Clamp(parsed, 1, 600);
+            }
+        }
+
         int attempts = 0;
-        var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(4) };
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(delaySeconds) };
         timer.Tick += (_, _) =>
         {
             attempts++;
