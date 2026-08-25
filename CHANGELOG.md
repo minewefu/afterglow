@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.1 — 2026-08-26
+
+- V/F chart: axis unit no longer collides with the last tick label; the
+  live "now" marker and target label render on backing pills with
+  edge-aware placement
+- Screenshot mode accepts `--screenshot-delay N` for longer telemetry
+  accumulation
+- README screenshots replaced with real RTX 5090 captures
+
 ## 1.0.0 — 2026-08-26
 
 Initial release.
