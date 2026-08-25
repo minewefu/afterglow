@@ -1,0 +1,91 @@
+<UserControl x:Class="Afterglow.App.Views.MetricsView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:controls="clr-namespace:Afterglow.App.Controls"
+             xmlns:views="clr-namespace:Afterglow.App.Views">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="24,18,24,24" MaxWidth="900" HorizontalAlignment="Left">
+
+            <TextBlock Text="FPS &amp; Frametimes" Style="{StaticResource PageTitle}" />
+            <TextBlock Style="{StaticResource PageSubtitle}"
+                       Text="Windows present-event tracing (Intel PresentMon) — no RivaTuner, no game injection, anticheat-friendly." />
+
+            <Border Style="{StaticResource Card}" Margin="0,14,0,0">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal">
+                        <Button Style="{StaticResource PrimaryButton}" MinWidth="140"
+                                Command="{Binding ToggleCaptureCommand}">
+                            <Button.Content>
+                                <TextBlock>
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Text" Value="Start capture" />
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding CaptureRunning}" Value="True">
+                                                    <Setter Property="Text" Value="Stop capture" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
+                            </Button.Content>
+                        </Button>
+                        <TextBlock Text="{Binding CaptureStatusText}" FontSize="12" Foreground="{StaticResource TextMuted}"
+                                   VerticalAlignment="Center" Margin="12,0,0,0" TextWrapping="Wrap" MaxWidth="620" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource Card}" Margin="0,10,0,0">
+                <StackPanel>
+                    <Grid>
+                        <StackPanel>
+                            <TextBlock Text="{Binding AppText}" FontWeight="SemiBold" FontSize="14" />
+                            <TextBlock Text="{Binding PresentModeText}" FontSize="11" Foreground="{StaticResource TextFaint}" />
+                        </StackPanel>
+                        <TextBlock Text="{Binding FrameCountText}" FontSize="11" Foreground="{StaticResource TextFaint}"
+                                   HorizontalAlignment="Right" />
+                    </Grid>
+
+                    <UniformGrid Columns="5" Margin="0,14,0,0">
+                        <StackPanel>
+                            <TextBlock Text="AVG FPS" Style="{StaticResource CardTitle}" />
+                            <TextBlock Text="{Binding AvgFpsText}" FontSize="24" FontWeight="SemiBold"
+                                       Foreground="{StaticResource SeriesFps}" />
+                        </StackPanel>
+                        <StackPanel>
+                            <TextBlock Text="P1 FPS" Style="{StaticResource CardTitle}" />
+                            <TextBlock Text="{Binding P1Text}" FontSize="24" FontWeight="SemiBold" />
+                        </StackPanel>
+                        <StackPanel>
+                            <TextBlock Text="P0.1 FPS" Style="{StaticResource CardTitle}" />
+                            <TextBlock Text="{Binding P01Text}" FontSize="24" FontWeight="SemiBold" />
+                        </StackPanel>
+                        <StackPanel>
+                            <TextBlock Text="1% LOW" Style="{StaticResource CardTitle}" />
+                            <TextBlock Text="{Binding Low1Text}" FontSize="24" FontWeight="SemiBold" />
+                        </StackPanel>
+                        <StackPanel>
+                            <TextBlock Text="0.1% LOW" Style="{StaticResource CardTitle}" />
+                            <TextBlock Text="{Binding Low01Text}" FontSize="24" FontWeight="SemiBold" />
+                        </StackPanel>
+                    </UniformGrid>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                        <TextBlock FontSize="11.5" Foreground="{StaticResource TextMuted}">
+                            <Run Text="frametime avg " /><Run Text="{Binding AvgFrametimeText}" /><Run Text="   worst " /><Run Text="{Binding MaxFrametimeText}" />
+                        </TextBlock>
+                    </StackPanel>
+
+                    <TextBlock Text="FRAMETIMES (ms) — LAST 600 FRAMES" Style="{StaticResource CardTitle}" Margin="0,14,0,0" />
+                    <controls:SparkGraph Values="{Binding FrametimeSeries}" Stroke="{StaticResource SeriesFps}"
+                                         Height="140" Margin="0,8,0,0" Capacity="600" />
+                </StackPanel>
+            </Border>
+
+            <TextBlock Text="{Binding MethodNote}" FontSize="11" Foreground="{StaticResource TextFaint}"
+                       TextWrapping="Wrap" Margin="2,10,0,0" />
+
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

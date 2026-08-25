@@ -1,0 +1,147 @@
+<UserControl x:Class="Afterglow.App.Views.StabilityView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:views="clr-namespace:Afterglow.App.Views">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="24,18,24,24" MaxWidth="900" HorizontalAlignment="Left">
+
+            <TextBlock Text="Stability" Style="{StaticResource PageTitle}" />
+            <TextBlock Style="{StaticResource PageSubtitle}"
+                       Text="Built-in burn test with bit-exact error detection, and a guided stepper that finds your stable overclock — the open-method alternative to closed OC scanners." />
+
+            <!-- Burn test -->
+            <Border Style="{StaticResource Card}" Margin="0,14,0,0">
+                <StackPanel>
+                    <TextBlock Text="Burn test" FontWeight="SemiBold" FontSize="13.5" />
+                    <TextBlock Text="Deterministic compute workload; any bit that comes back different means your GPU is miscalculating (unstable clocks). Driver resets (TDR) are caught and reported."
+                               FontSize="11.5" Foreground="{StaticResource TextFaint}" TextWrapping="Wrap" Margin="0,2,0,0" />
+
+                    <Grid Margin="0,12,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="170" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="190" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="Load intensity" FontSize="12.5" VerticalAlignment="Center" />
+                        <Slider Grid.Column="1" Style="{StaticResource TuneSlider}" Minimum="512" Maximum="8192"
+                                Value="{Binding Intensity}" TickFrequency="256" IsSnapToTickEnabled="True"
+                                VerticalAlignment="Center" IsEnabled="{Binding StressRunning, Converter={x:Static views:Converters.InverseBool}}" />
+                        <TextBlock Grid.Column="2" Text="{Binding IntensityLabel}" FontSize="12.5"
+                                   HorizontalAlignment="Right" VerticalAlignment="Center"
+                                   Foreground="{StaticResource TextMuted}" />
+                    </Grid>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                        <Button Style="{StaticResource PrimaryButton}" MinWidth="130" Command="{Binding ToggleStressCommand}">
+                            <Button.Content>
+                                <TextBlock>
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Text" Value="Start burn" />
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding StressRunning}" Value="True">
+                                                    <Setter Property="Text" Value="Stop burn" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
+                            </Button.Content>
+                        </Button>
+                        <TextBlock Text="{Binding StressElapsedText}" FontSize="15" FontWeight="SemiBold"
+                                   VerticalAlignment="Center" Margin="16,0,0,0" FontFamily="{StaticResource MonoFont}" />
+                        <TextBlock Text="{Binding StressRateText}" FontSize="12" Foreground="{StaticResource TextMuted}"
+                                   VerticalAlignment="Center" Margin="12,0,0,0" />
+                    </StackPanel>
+
+                    <TextBlock Text="{Binding LiveStatsText}" FontSize="12.5" Margin="0,10,0,0"
+                               FontFamily="{StaticResource MonoFont}" Foreground="{StaticResource SeriesFps}" />
+
+                    <TextBlock Text="{Binding StressStatusText}" FontSize="12.5" Margin="0,10,0,0" TextWrapping="Wrap">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock" BasedOn="{StaticResource {x:Type TextBlock}}">
+                                <Setter Property="Foreground" Value="{StaticResource TextMuted}" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding StressFailed}" Value="True">
+                                        <Setter Property="Foreground" Value="{StaticResource Bad}" />
+                                        <Setter Property="FontWeight" Value="SemiBold" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                </StackPanel>
+            </Border>
+
+            <!-- Stepper -->
+            <Border Style="{StaticResource Card}" Margin="0,10,0,0">
+                <StackPanel>
+                    <TextBlock Text="Find my stable overclock (guided stepper)" FontWeight="SemiBold" FontSize="13.5" />
+                    <TextBlock Text="Steps the core offset up, burn-testing each step; the first failure backs off and runs a longer confirmation. Leaves the confirmed stable offset applied."
+                               FontSize="11.5" Foreground="{StaticResource TextFaint}" TextWrapping="Wrap" Margin="0,2,0,0" />
+
+                    <Border Background="#33E8B33C" CornerRadius="8" Padding="12,8" Margin="0,10,0,0"
+                            Visibility="{Binding CanStep, Converter={x:Static views:Converters.InverseBoolToVisibility}}">
+                        <TextBlock Text="{Binding StepGateText}" Foreground="{StaticResource Warn}" FontSize="12" TextWrapping="Wrap" />
+                    </Border>
+
+                    <UniformGrid Columns="3" Margin="0,12,0,0">
+                        <StackPanel Margin="0,0,14,0">
+                            <TextBlock FontSize="12" Foreground="{StaticResource TextMuted}">
+                                <Run Text="Step: +" /><Run Text="{Binding StepMHz, StringFormat=F0}" /><Run Text=" MHz" />
+                            </TextBlock>
+                            <Slider Style="{StaticResource TuneSlider}" Minimum="10" Maximum="60" Value="{Binding StepMHz}"
+                                    TickFrequency="5" IsSnapToTickEnabled="True" Margin="0,8,0,0" />
+                        </StackPanel>
+                        <StackPanel Margin="0,0,14,0">
+                            <TextBlock FontSize="12" Foreground="{StaticResource TextMuted}">
+                                <Run Text="Per step: " /><Run Text="{Binding SecondsPerStep, StringFormat=F0}" /><Run Text=" s" />
+                            </TextBlock>
+                            <Slider Style="{StaticResource TuneSlider}" Minimum="30" Maximum="300" Value="{Binding SecondsPerStep}"
+                                    TickFrequency="15" IsSnapToTickEnabled="True" Margin="0,8,0,0" />
+                        </StackPanel>
+                        <StackPanel>
+                            <TextBlock FontSize="12" Foreground="{StaticResource TextMuted}">
+                                <Run Text="Ceiling: +" /><Run Text="{Binding MaxOffset, StringFormat=F0}" /><Run Text=" MHz" />
+                            </TextBlock>
+                            <Slider Style="{StaticResource TuneSlider}" Minimum="50" Maximum="600" Value="{Binding MaxOffset}"
+                                    TickFrequency="25" IsSnapToTickEnabled="True" Margin="0,8,0,0" />
+                        </StackPanel>
+                    </UniformGrid>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                        <Button Style="{StaticResource PrimaryButton}" MinWidth="150"
+                                Command="{Binding ToggleStepperCommand}" IsEnabled="{Binding CanStep}">
+                            <Button.Content>
+                                <TextBlock>
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Text" Value="Start stepper" />
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding StepperRunning}" Value="True">
+                                                    <Setter Property="Text" Value="Cancel stepper" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
+                            </Button.Content>
+                        </Button>
+                        <TextBlock Text="{Binding StepperPhaseText}" FontSize="12.5" VerticalAlignment="Center"
+                                   Margin="14,0,0,0" />
+                    </StackPanel>
+
+                    <ProgressBar Value="{Binding StepperProgress, Mode=OneWay}" Maximum="1" Height="5" Margin="0,10,0,0"
+                                 Background="{StaticResource Bg3}" Foreground="{StaticResource Accent}" BorderThickness="0" />
+
+                    <Border Background="{StaticResource Bg1}" CornerRadius="7" Padding="10" Margin="0,10,0,0"
+                            MinHeight="120">
+                        <TextBlock Text="{Binding StepperLog}" FontFamily="{StaticResource MonoFont}" FontSize="11"
+                                   Foreground="{StaticResource TextMuted}" TextWrapping="Wrap" />
+                    </Border>
+                </StackPanel>
+            </Border>
+
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

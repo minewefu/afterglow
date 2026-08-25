@@ -1,0 +1,201 @@
+<UserControl x:Class="Afterglow.App.Views.DashboardView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:controls="clr-namespace:Afterglow.App.Controls"
+             xmlns:views="clr-namespace:Afterglow.App.Views">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="24,18,24,24">
+
+            <Grid>
+                <StackPanel>
+                    <TextBlock Text="Dashboard" Style="{StaticResource PageTitle}" />
+                    <TextBlock Text="{Binding ThrottleMarginText}" Style="{StaticResource PageSubtitle}" />
+                </StackPanel>
+                <ItemsControl ItemsSource="{Binding ThrottleChips}" HorizontalAlignment="Right"
+                              VerticalAlignment="Top" Margin="0,4,0,0">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <StackPanel Orientation="Horizontal" />
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Border Background="{Binding Severity, Converter={x:Static views:Converters.SeverityToBrush}}"
+                                    CornerRadius="6" Padding="9,4" Margin="6,0,0,0"
+                                    ToolTip="{Binding Explanation}">
+                                <TextBlock Text="{Binding Label}" FontSize="11.5" />
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </Grid>
+
+            <!-- Hero cards -->
+            <UniformGrid Columns="4" Margin="0,14,0,0">
+                <Border Style="{StaticResource Card}" Margin="0,0,10,10">
+                    <StackPanel>
+                        <TextBlock Text="CORE CLOCK" Style="{StaticResource CardTitle}" />
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="{Binding CoreClockText}" Style="{StaticResource MetricValue}" />
+                            <TextBlock Text="MHz" Style="{StaticResource MetricUnit}" />
+                        </StackPanel>
+                        <TextBlock Text="{Binding MemClockText}" FontSize="11.5" Foreground="{StaticResource TextMuted}" />
+                        <controls:SparkGraph Values="{Binding CoreClockSeries}" Stroke="{StaticResource SeriesClock}"
+                                             Height="34" Margin="0,6,0,0" ShowScale="False" Capacity="180" />
+                    </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource Card}" Margin="0,0,10,10">
+                    <StackPanel>
+                        <TextBlock Text="TEMPERATURE" Style="{StaticResource CardTitle}" />
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="{Binding TempText}" Style="{StaticResource MetricValue}" />
+                            <TextBlock Text="°C" Style="{StaticResource MetricUnit}" />
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="{Binding HotSpotText}" FontSize="11.5" Foreground="{StaticResource TextMuted}" />
+                            <TextBlock Text="{Binding MemJunctionText}" FontSize="11.5" Foreground="{StaticResource TextMuted}"
+                                       Margin="8,0,0,0" />
+                        </StackPanel>
+                        <controls:SparkGraph Values="{Binding TempSeries}" Stroke="{StaticResource SeriesTemp}"
+                                             Height="34" Margin="0,6,0,0" ShowScale="False" Capacity="180" />
+                    </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource Card}" Margin="0,0,10,10">
+                    <StackPanel>
+                        <TextBlock Text="BOARD POWER" Style="{StaticResource CardTitle}" />
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="{Binding PowerText}" Style="{StaticResource MetricValue}" />
+                            <TextBlock Text="W" Style="{StaticResource MetricUnit}" />
+                        </StackPanel>
+                        <TextBlock Text="{Binding PowerLimitText}" FontSize="11.5" Foreground="{StaticResource TextMuted}" />
+                        <controls:SparkGraph Values="{Binding PowerSeries}" Stroke="{StaticResource SeriesPower}"
+                                             Height="34" Margin="0,6,0,0" ShowScale="False" Capacity="180" />
+                    </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource Card}" Margin="0,0,0,10">
+                    <StackPanel>
+                        <TextBlock Text="GPU LOAD" Style="{StaticResource CardTitle}" />
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="{Binding UtilText}" Style="{StaticResource MetricValue}" />
+                            <TextBlock Text="%" Style="{StaticResource MetricUnit}" />
+                        </StackPanel>
+                        <TextBlock Text="{Binding PerfStateText}" FontSize="11.5" Foreground="{StaticResource TextMuted}" />
+                        <controls:SparkGraph Values="{Binding UtilSeries}" Stroke="{StaticResource SeriesUtil}"
+                                             Height="34" Margin="0,6,0,0" ShowScale="False" Capacity="180"
+                                             FixedMin="0" FixedMax="100" />
+                    </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource Card}" Margin="0,0,10,0">
+                    <StackPanel>
+                        <TextBlock Text="VRAM" Style="{StaticResource CardTitle}" />
+                        <TextBlock Text="{Binding VramText}" FontSize="19" FontWeight="SemiBold" Margin="0,3,0,3" />
+                        <ProgressBar Value="{Binding VramFraction, Mode=OneWay}" Maximum="1" Height="6"
+                                     Background="{StaticResource Bg3}" Foreground="{StaticResource SeriesVram}"
+                                     BorderThickness="0" />
+                        <controls:SparkGraph Values="{Binding VramSeries}" Stroke="{StaticResource SeriesVram}"
+                                             Height="30" Margin="0,8,0,0" ShowScale="False" Capacity="180" />
+                    </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource Card}" Margin="0,0,10,0">
+                    <StackPanel>
+                        <TextBlock Text="FANS" Style="{StaticResource CardTitle}" />
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="{Binding FanText}" Style="{StaticResource MetricValue}" />
+                            <TextBlock Text="%" Style="{StaticResource MetricUnit}" />
+                        </StackPanel>
+                        <TextBlock Text="{Binding FanRpmText}" FontSize="11.5" Foreground="{StaticResource TextMuted}" />
+                        <controls:SparkGraph Values="{Binding FanSeries}" Stroke="{StaticResource SeriesFan}"
+                                             Height="34" Margin="0,6,0,0" ShowScale="False" Capacity="180"
+                                             FixedMin="0" FixedMax="100" />
+                    </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource Card}" Margin="0,0,10,0">
+                    <StackPanel>
+                        <TextBlock Text="CORE VOLTAGE" Style="{StaticResource CardTitle}" />
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="{Binding VoltageText}" Style="{StaticResource MetricValue}" />
+                            <TextBlock Text="mV" Style="{StaticResource MetricUnit}" />
+                        </StackPanel>
+                        <TextBlock Text="{Binding EnergyText}" FontSize="11.5" Foreground="{StaticResource TextMuted}" />
+                        <controls:SparkGraph Values="{Binding VoltageSeries}" Stroke="{StaticResource SeriesVoltage}"
+                                             Height="34" Margin="0,6,0,0" ShowScale="False" Capacity="180" />
+                    </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource Card}"
+                        Visibility="{Binding HasFps, Converter={x:Static views:Converters.BoolToVisibility}}">
+                    <StackPanel>
+                        <TextBlock Text="FPS" Style="{StaticResource CardTitle}" />
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="{Binding FpsText}" Style="{StaticResource MetricValue}"
+                                       Foreground="{StaticResource SeriesFps}" />
+                            <TextBlock Text="{Binding FpsAppText}" Style="{StaticResource MetricUnit}" />
+                        </StackPanel>
+                        <TextBlock Text="{Binding FpsLowsText}" FontSize="11.5" Foreground="{StaticResource TextMuted}" />
+                        <controls:SparkGraph Values="{Binding FrametimeSeries}" Stroke="{StaticResource SeriesFps}"
+                                             Height="34" Margin="0,6,0,0" ShowScale="False" Capacity="360" />
+                    </StackPanel>
+                </Border>
+            </UniformGrid>
+
+            <!-- Large graphs -->
+            <Grid Margin="0,8,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition />
+                    <RowDefinition />
+                </Grid.RowDefinitions>
+
+                <Border Style="{StaticResource Card}" Grid.Row="0" Grid.Column="0" Margin="0,0,10,10">
+                    <StackPanel>
+                        <TextBlock Text="CORE CLOCK — 10 MIN" Style="{StaticResource CardTitle}" />
+                        <controls:SparkGraph Values="{Binding CoreClockSeries}" Stroke="{StaticResource SeriesClock}"
+                                             Height="130" Margin="0,8,0,0" Capacity="600" />
+                    </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource Card}" Grid.Row="0" Grid.Column="1" Margin="0,0,0,10">
+                    <StackPanel>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="TEMPERATURES — 10 MIN" Style="{StaticResource CardTitle}" />
+                            <TextBlock Text="  ● GPU" FontSize="10.5" Foreground="{StaticResource SeriesTemp}" />
+                            <TextBlock Text="  ● memory junction" FontSize="10.5" Foreground="{StaticResource SeriesVram}" />
+                        </StackPanel>
+                        <Grid Height="130" Margin="0,8,0,0">
+                            <controls:SparkGraph Values="{Binding TempSeries}" Stroke="{StaticResource SeriesTemp}"
+                                                 FixedMin="25" FixedMax="95" Capacity="600" />
+                            <controls:SparkGraph Values="{Binding MemJunctionSeries}" Stroke="{StaticResource SeriesVram}"
+                                                 FixedMin="25" FixedMax="95" ShowScale="False" Capacity="600" />
+                        </Grid>
+                    </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource Card}" Grid.Row="1" Grid.Column="0" Margin="0,0,10,0">
+                    <StackPanel>
+                        <TextBlock Text="BOARD POWER — 10 MIN" Style="{StaticResource CardTitle}" />
+                        <controls:SparkGraph Values="{Binding PowerSeries}" Stroke="{StaticResource SeriesPower}"
+                                             Height="130" Margin="0,8,0,0" Capacity="600" />
+                    </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource Card}" Grid.Row="1" Grid.Column="1">
+                    <StackPanel>
+                        <TextBlock Text="GPU LOAD — 10 MIN" Style="{StaticResource CardTitle}" />
+                        <controls:SparkGraph Values="{Binding UtilSeries}" Stroke="{StaticResource SeriesUtil}"
+                                             Height="130" Margin="0,8,0,0" FixedMin="0" FixedMax="100" Capacity="600" />
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

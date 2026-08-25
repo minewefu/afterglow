@@ -1,0 +1,20 @@
+<Window x:Class="Afterglow.App.OverlayWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:controls="clr-namespace:Afterglow.App.Controls"
+        Title="Afterglow overlay"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        Topmost="True" ShowInTaskbar="False" ShowActivated="False"
+        SizeToContent="WidthAndHeight" ResizeMode="NoResize"
+        FontFamily="Cascadia Mono, Consolas">
+    <Border Background="#C90C0F14" CornerRadius="8" Padding="10,8" BorderBrush="#33FFFFFF" BorderThickness="1">
+        <StackPanel x:Name="Rows" MinWidth="150">
+            <TextBlock x:Name="FpsRow" FontSize="18" FontWeight="Bold" Foreground="#FF8A3C" />
+            <TextBlock x:Name="LowsRow" FontSize="11" Foreground="#B8C2CE" Margin="0,0,0,4" />
+            <controls:SparkGraph x:Name="FrametimeGraph" Height="42" Width="188" Margin="0,2,0,6"
+                                 ShowScale="False" Capacity="240" Stroke="#FF8A3C" />
+            <TextBlock x:Name="SensorRows" FontSize="12" Foreground="#E8EDF4" LineHeight="17" />
+            <TextBlock x:Name="ThrottleRow" FontSize="11" Foreground="#E8B33C" Margin="0,3,0,0" />
+        </StackPanel>
+    </Border>
+</Window>

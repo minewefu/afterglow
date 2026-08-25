@@ -1,0 +1,123 @@
+<UserControl x:Class="Afterglow.App.Views.FansView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:controls="clr-namespace:Afterglow.App.Controls"
+             xmlns:views="clr-namespace:Afterglow.App.Views">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="24,18,24,24" MaxWidth="900" HorizontalAlignment="Left">
+
+            <TextBlock Text="Fans" Style="{StaticResource PageTitle}" />
+            <TextBlock Text="{Binding LiveText}" Style="{StaticResource PageSubtitle}" />
+
+            <Border Background="#33E8B33C" CornerRadius="8" Padding="12,8" Margin="0,12,0,0"
+                    Visibility="{Binding CanControl, Converter={x:Static views:Converters.InverseBoolToVisibility}}">
+                <TextBlock Text="{Binding GateText}" Foreground="{StaticResource Warn}" FontSize="12.5" />
+            </Border>
+
+            <!-- Mode selection -->
+            <Border Style="{StaticResource Card}" Margin="0,14,0,0">
+                <StackPanel>
+                    <TextBlock Text="Control mode" FontWeight="SemiBold" FontSize="13.5" />
+                    <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                        <RadioButton Content="Firmware (auto)" GroupName="fanmode" Foreground="{StaticResource Text}"
+                                     IsChecked="{Binding ModeIndex, Converter={x:Static views:IndexMatch.Zero}}" />
+                        <RadioButton Content="Fixed duty" GroupName="fanmode" Margin="24,0,0,0" Foreground="{StaticResource Text}"
+                                     IsChecked="{Binding ModeIndex, Converter={x:Static views:IndexMatch.One}}" />
+                        <RadioButton Content="Custom curve" GroupName="fanmode" Margin="24,0,0,0" Foreground="{StaticResource Text}"
+                                     IsChecked="{Binding ModeIndex, Converter={x:Static views:IndexMatch.Two}}" />
+                    </StackPanel>
+
+                    <StackPanel Margin="0,12,0,0"
+                                Visibility="{Binding ModeIndex, Converter={x:Static views:IndexMatch.OneVisible}}">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="140" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="70" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="Duty (all fans)" FontSize="12.5" VerticalAlignment="Center" />
+                            <Slider Grid.Column="1" Style="{StaticResource TuneSlider}" Minimum="0" Maximum="100"
+                                    Value="{Binding FixedDuty}" VerticalAlignment="Center" TickFrequency="1" IsSnapToTickEnabled="True" />
+                            <TextBlock Grid.Column="2" Text="{Binding FixedDutyLabel}" FontSize="15" FontWeight="SemiBold"
+                                       HorizontalAlignment="Right" VerticalAlignment="Center" />
+                        </Grid>
+                        <TextBlock Text="0 % stops the fans (zero-RPM); 1 % and up rounds to the hardware minimum spin duty. Apply to a single fan for asymmetric setups:"
+                                   FontSize="11" Foreground="{StaticResource TextFaint}" Margin="0,8,0,0" TextWrapping="Wrap" />
+                        <ItemsControl ItemsSource="{Binding FanIds}" Margin="0,6,0,0">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <StackPanel Orientation="Horizontal" />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Button Style="{StaticResource GhostButton}" Padding="10,5" Margin="0,0,8,0"
+                                            Command="{Binding DataContext.SetSingleFanCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                                            CommandParameter="{Binding}">
+                                        <TextBlock FontSize="12">
+                                            <Run Text="Fan " /><Run Text="{Binding Mode=OneWay}" /><Run Text=" only" />
+                                        </TextBlock>
+                                    </Button>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,14,0,0">
+                        <Button Style="{StaticResource PrimaryButton}" Content="Apply mode" MinWidth="120"
+                                Command="{Binding ApplyModeCommand}" IsEnabled="{Binding CanControl}" />
+                        <TextBlock Text="{Binding StatusText}" FontSize="12" Foreground="{StaticResource TextMuted}"
+                                   VerticalAlignment="Center" Margin="12,0,0,0" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <!-- Curve editor -->
+            <Border Style="{StaticResource Card}" Margin="0,10,0,0">
+                <StackPanel>
+                    <Grid>
+                        <StackPanel>
+                            <TextBlock Text="Fan curve" FontWeight="SemiBold" FontSize="13.5" />
+                            <TextBlock Text="Drag points · double-click to add · right-click to remove. The orange line is the live temperature."
+                                       FontSize="11" Foreground="{StaticResource TextFaint}" />
+                        </StackPanel>
+                    </Grid>
+                    <controls:FanCurveEditor x:Name="CurveEditor" Height="260" Margin="0,10,0,0"
+                                             Config="{Binding Curve, Mode=TwoWay}"
+                                             LiveTemp="{Binding LiveTemp}" LiveDuty="{Binding LiveDuty}" />
+
+                    <UniformGrid Columns="3" Margin="0,14,0,0">
+                        <StackPanel Margin="0,0,14,0">
+                            <TextBlock Text="Temperature source" FontSize="12" Foreground="{StaticResource TextMuted}" />
+                            <ComboBox SelectedIndex="{Binding TempSourceIndex}" Margin="0,6,0,0">
+                                <ComboBoxItem Content="GPU core" />
+                                <ComboBoxItem Content="Hot spot (falls back to core)" />
+                                <ComboBoxItem Content="Memory junction" />
+                            </ComboBox>
+                        </StackPanel>
+                        <StackPanel Margin="0,0,14,0">
+                            <TextBlock FontSize="12" Foreground="{StaticResource TextMuted}">
+                                <Run Text="Hysteresis: " /><Run Text="{Binding Hysteresis, StringFormat=F0}" /><Run Text=" °C (damps fan drops)" />
+                            </TextBlock>
+                            <Slider Style="{StaticResource TuneSlider}" Minimum="0" Maximum="15" Value="{Binding Hysteresis}"
+                                    Margin="0,10,0,0" TickFrequency="1" IsSnapToTickEnabled="True" />
+                        </StackPanel>
+                        <StackPanel>
+                            <CheckBox Style="{StaticResource ToggleSwitch}" IsChecked="{Binding ZeroRpmEnabled}"
+                                      Content="Zero-RPM below" />
+                            <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                                <Slider Style="{StaticResource TuneSlider}" Minimum="30" Maximum="60" Width="150"
+                                        Value="{Binding ZeroRpmBelow}" TickFrequency="1" IsSnapToTickEnabled="True"
+                                        IsEnabled="{Binding ZeroRpmEnabled}" />
+                                <TextBlock FontSize="12.5" VerticalAlignment="Center" Margin="8,0,0,0">
+                                    <Run Text="{Binding ZeroRpmBelow, StringFormat=F0}" /><Run Text=" °C" />
+                                </TextBlock>
+                            </StackPanel>
+                        </StackPanel>
+                    </UniformGrid>
+                </StackPanel>
+            </Border>
+
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>
