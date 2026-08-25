@@ -6,6 +6,10 @@ on:
     tags: ["v*"]
   pull_request:
 
+# Needed by the tagged-release job to create the draft GitHub release.
+permissions:
+  contents: write
+
 env:
   PRESENTMON_SHA256: 9BEC3083069F58F911E6A512F4806DB51A27BD096103087BC1D05EF54C80A191
 
