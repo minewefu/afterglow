@@ -19,6 +19,7 @@ internal static class Program
             "reset" => TuneCommands.Reset(args),
             "fps" => FpsCommand.Run(args),
             "stress" => StressCommand.Run(args),
+            "vfcurve" => VfCurveCommand.Run(args),
             "mcp" => McpCommand.Run(),
             "help" or "--help" or "-h" => Help(),
             _ => Fail($"Unknown command '{command}'. Run 'afterglow-cli help'."),
@@ -44,6 +45,9 @@ internal static class Program
               fps [--seconds N]             Capture FPS/frametimes for all presenting apps.
               stress [--seconds N]          Burn test with bit-exact error detection.
                      [--intensity N]
+              vfcurve [--probe]             Record and print the measured voltage/frequency
+                      [--seconds N]         curve. --probe locks each clock step under load
+                      [--load] [--fresh]    and maps the full curve in ~1 min (admin).
               mcp                           Model Context Protocol server over stdio, so AI
                                             agents can monitor, tune, and stability-test the
                                             GPU with typed tools (run elevated for writes).
@@ -128,6 +132,16 @@ internal static class SelfTest
             ReportNv("Temp limit current", gpu.TryGetTempLimit(out int tCur), $"{tCur} C");
             ReportNv("Util domains", gpu.TryGetUtilizationDomains(out int ug, out int uf, out int uv, out int ub),
                 $"gpu {ug}%, fb {uf}%, vid {uv}%, bus {ub}%");
+
+            var vfCurve = gpu.GetVfCurve();
+            Console.WriteLine($"  {"V/F curve",-26} {(vfCurve.Count > 0 ? "OK  " : "[unavailable]"),-24} {(vfCurve.Count > 0 ? $"{vfCurve.Count} points" : string.Empty)}");
+            if (vfCurve.Count > 0)
+            {
+                foreach (var point in vfCurve.Where((_, i) => i % Math.Max(1, vfCurve.Count / 8) == 0).Take(8))
+                {
+                    Console.WriteLine($"    {point.VoltageMv,7:F1} mV -> {point.ClockMHz,7:F0} MHz");
+                }
+            }
 
             var fanRc = gpu.TryGetFanStatus(out var fans);
             ReportNv("Fan coolers", fanRc, $"{fans.Count} fans");

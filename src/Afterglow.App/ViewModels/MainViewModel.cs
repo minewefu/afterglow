@@ -22,6 +22,8 @@ public partial class MainViewModel : ObservableObject
 
     public MetricsViewModel Metrics { get; }
 
+    public VfCurveViewModel VfCurve { get; }
+
     public StabilityViewModel Stability { get; }
 
     public ProfilesViewModel Profiles { get; }
@@ -67,6 +69,7 @@ public partial class MainViewModel : ObservableObject
         Tuning = new TuningViewModel(services);
         Fans = new FansViewModel(services);
         Metrics = new MetricsViewModel(services);
+        VfCurve = new VfCurveViewModel(services);
         Stability = new StabilityViewModel(services);
         Profiles = new ProfilesViewModel(services, Tuning, Fans, p => ApplyProfileFull(p));
         Settings = new SettingsViewModel(services);
@@ -429,6 +432,7 @@ public partial class MainViewModel : ObservableObject
             "tuning" => Tuning,
             "fans" => Fans,
             "metrics" => Metrics,
+            "vfcurve" => VfCurve,
             "stability" => Stability,
             "profiles" => Profiles,
             "settings" => Settings,

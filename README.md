@@ -48,6 +48,11 @@ Afterglow is a from-scratch, MIT-licensed answer:
 - **Clock-lock undervolting** — the documented-API method that works on RTX 50: cap the boost
   clock while a positive offset shifts the V/F curve, hitting the same clock at lower voltage.
   One-click presets in the undervolt wizard
+- **Measured V/F curve** — NVIDIA blocks the curve interfaces on RTX 50, so Afterglow maps
+  the real curve instead: a ~1-minute probe locks each clock step under load and records the
+  voltage the driver selects (plus continuous passive recording while you game). Pick any
+  point on the measured curve and Afterglow computes the exact offset + lock that holds that
+  clock at that voltage
 - Knob-by-knob apply results: every slider reports applied / clamped / failed individually
 
 **Fans**
@@ -109,7 +114,7 @@ Afterglow is a from-scratch, MIT-licensed answer:
 | Open source | **MIT** | No | No | No |
 | Kernel driver | **None** | RTCore64.sys (CVE history) | None | Yes (vendor) |
 | Manual core/mem offsets | Yes, driver-validated | Yes | **No** | Yes |
-| Undervolting on RTX 50 | **Lock+offset wizard** | Curve editor (driver-limited on 50-series) | No | V/F tuner |
+| Undervolting on RTX 50 | **Measured V/F curve + pick-point undervolt** | Curve editor (driver-limited on 50-series) | No | V/F tuner |
 | Per-fan control incl. 0% | Yes (sync + single-fan) | Sync only (stock) | Fan target only | Yes |
 | Fan curve hysteresis both ways | **Yes** | Falling only | No | Yes |
 | Fan temp source (mem junction) | **Yes** | Core only | No | No |

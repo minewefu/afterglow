@@ -4,6 +4,16 @@
 
 Initial release.
 
+- V/F Curve page: the GPU's real voltage/frequency map, measured — a ~1-minute
+  active probe (lock each clock step under load, record the selected voltage)
+  plus continuous passive recording; pick a point to compute the exact
+  offset + clock-lock undervolt. Works on RTX 50, where NVIDIA blocks the
+  curve interfaces.
+- Agent-native: `afterglow-cli mcp` (Model Context Protocol server) and
+  `--json` CLI output for autonomous tuning loops.
+- Burn test loads FP32 pipes, INT pipe, and the memory controller
+  (~95% of TGP measured on RTX 5090), with live sensors on the page.
+
 > Note for anyone who ran pre-release development builds: profiles saved by those
 > builds stored a placeholder fan-curve sentinel; re-save your profiles once (they
 > now capture your real fan configuration).

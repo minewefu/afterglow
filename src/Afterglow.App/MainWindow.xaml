@@ -30,6 +30,9 @@
         <DataTemplate DataType="{x:Type vm:MetricsViewModel}">
             <views:MetricsView />
         </DataTemplate>
+        <DataTemplate DataType="{x:Type vm:VfCurveViewModel}">
+            <views:VfCurveView />
+        </DataTemplate>
         <DataTemplate DataType="{x:Type vm:StabilityViewModel}">
             <views:StabilityView />
         </DataTemplate>
@@ -142,6 +145,8 @@
                                  IsChecked="{Binding CurrentPageName, Mode=OneWay, Converter={x:Static views:PageMatchConverter.Instance}, ConverterParameter=fans}" Command="{Binding NavigateToCommand}" CommandParameter="fans" />
                     <RadioButton Style="{StaticResource NavButton}" Content="FPS &amp; Frametimes" Tag="&#xEC4A;"
                                  IsChecked="{Binding CurrentPageName, Mode=OneWay, Converter={x:Static views:PageMatchConverter.Instance}, ConverterParameter=metrics}" Command="{Binding NavigateToCommand}" CommandParameter="metrics" />
+                    <RadioButton Style="{StaticResource NavButton}" Content="V/F Curve" Tag="&#xE9D9;"
+                                 IsChecked="{Binding CurrentPageName, Mode=OneWay, Converter={x:Static views:PageMatchConverter.Instance}, ConverterParameter=vfcurve}" Command="{Binding NavigateToCommand}" CommandParameter="vfcurve" />
                     <RadioButton Style="{StaticResource NavButton}" Content="Stability" Tag="&#xEA80;"
                                  IsChecked="{Binding CurrentPageName, Mode=OneWay, Converter={x:Static views:PageMatchConverter.Instance}, ConverterParameter=stability}" Command="{Binding NavigateToCommand}" CommandParameter="stability" />
                     <RadioButton Style="{StaticResource NavButton}" Content="Profiles" Tag="&#xE74E;"

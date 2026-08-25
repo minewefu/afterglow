@@ -438,6 +438,24 @@ public sealed class GpuTuner
     }
 
     /// <summary>
+    /// Pins the core clock to an exact frequency for V/F curve probing (both ends
+    /// of the range equal, unlike the tuning lock which allows idle downclocking).
+    /// </summary>
+    public NvmlReturn LockClockForProbe(uint clockMHz)
+    {
+        lock (_applyLock)
+        {
+            var rc = _nvml.TrySetGpuLockedClocks(clockMHz, clockMHz);
+            if (rc == NvmlReturn.Success)
+            {
+                _appliedLockMHz = clockMHz;
+            }
+
+            return rc;
+        }
+    }
+
+    /// <summary>
     /// Explicitly releases any driver-level clock lock, even when Afterglow has no
     /// record of one (a lock can outlive a crashed session until reboot).
     /// </summary>

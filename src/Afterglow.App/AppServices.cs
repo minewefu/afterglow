@@ -41,6 +41,9 @@ public sealed class AppServices : IDisposable
 
     public required TdrWatchdog TdrWatchdog { get; init; }
 
+    /// <summary>Measured voltage/frequency curve, fed continuously from telemetry.</summary>
+    public required Core.Tuning.VfCurveRecorder VfCurve { get; init; }
+
     private AppSettings _settings = new();
 
     public AppSettings Settings => _settings;
@@ -77,6 +80,14 @@ public sealed class AppServices : IDisposable
             var demoTelemetry = new TelemetryService([demoSource], TimeSpan.FromSeconds(1));
             demoSource.Backfill(demoTelemetry.HistoryFor(0), 600);
             demoTelemetry.Start();
+            var demoCurve = new Core.Tuning.VfCurveRecorder();
+            foreach (var snapshot in demoTelemetry.HistoryFor(0).GetAll())
+            {
+                demoCurve.Add(snapshot);
+            }
+
+            demoTelemetry.SnapshotTaken += demoCurve.Add;
+
             var demoServices = new AppServices
             {
                 DemoMode = true,
@@ -89,6 +100,7 @@ public sealed class AppServices : IDisposable
                 DriverVersion = "demo",
                 GameWatcher = new GameWatcher(),
                 TdrWatchdog = new TdrWatchdog(),
+                VfCurve = demoCurve,
             };
             demoServices.InitializeSettings(new AppSettings());
             return demoServices;
@@ -113,9 +125,13 @@ public sealed class AppServices : IDisposable
             }
         };
 
-        telemetry.Start();
-
         AppPaths.EnsureCreated();
+
+        var vfCurve = new Core.Tuning.VfCurveRecorder();
+        vfCurve.Load();
+        telemetry.SnapshotTaken += vfCurve.Add;
+
+        telemetry.Start();
 
         var services = new AppServices
         {
@@ -130,6 +146,7 @@ public sealed class AppServices : IDisposable
             DriverVersion = manager.DriverVersion ?? "—",
             GameWatcher = new GameWatcher(),
             TdrWatchdog = new TdrWatchdog(),
+            VfCurve = vfCurve,
         };
         services.InitializeSettings(SettingsStore.Load());
         services.GameWatcher.Start();
@@ -139,6 +156,11 @@ public sealed class AppServices : IDisposable
 
     public void Dispose()
     {
+        if (!DemoMode)
+        {
+            VfCurve.Save();
+        }
+
         GameWatcher.Dispose();
         TdrWatchdog.Dispose();
         foreach (var fans in FanControl.Values)

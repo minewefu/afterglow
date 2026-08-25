@@ -74,6 +74,7 @@ public sealed class NvapiGpu
     private readonly NvapiNative.ThermalPoliciesStatusDelegate? _thermalPoliciesSetStatus;
     private readonly NvapiNative.VoltageBoostDelegate? _getVoltageBoost;
     private readonly NvapiNative.VoltageBoostDelegate? _setVoltageBoost;
+    private readonly NvapiNative.GetVfpCurveDelegate? _getVfpCurve;
 
     private uint _thermalSensorsMask;
     private bool _thermalMaskProbed;
@@ -99,6 +100,7 @@ public sealed class NvapiGpu
         _thermalPoliciesSetStatus = NvapiNative.GetDelegate<NvapiNative.ThermalPoliciesStatusDelegate>(NvapiIds.GpuClientThermalPoliciesSetStatus);
         _getVoltageBoost = NvapiNative.GetDelegate<NvapiNative.VoltageBoostDelegate>(NvapiIds.GpuGetCoreVoltageBoostPercent);
         _setVoltageBoost = NvapiNative.GetDelegate<NvapiNative.VoltageBoostDelegate>(NvapiIds.GpuSetCoreVoltageBoostPercent);
+        _getVfpCurve = NvapiNative.GetDelegate<NvapiNative.GetVfpCurveDelegate>(NvapiIds.GpuGetVfpCurve);
     }
 
     public unsafe string? GetName()
@@ -381,6 +383,59 @@ public sealed class NvapiGpu
             Reserved = new uint[8],
         };
         return _setVoltageBoost(_handle, ref boost);
+    }
+
+    // --- Voltage/frequency curve (read-only) -------------------------------------
+
+    /// <summary>One point of the GPU's voltage/frequency curve.</summary>
+    public readonly record struct VfPoint(double VoltageMv, double ClockMHz);
+
+    /// <summary>
+    /// Reads the driver's boost (V/F) curve for the core domain. Read-only:
+    /// per-point curve writes are rejected by the driver on RTX 50, so Afterglow
+    /// visualizes the curve and undervolts through the documented lock+offset APIs.
+    /// Returns an empty list when the interface is unavailable.
+    /// </summary>
+    public IReadOnlyList<VfPoint> GetVfCurve()
+    {
+        if (_getVfpCurve is null)
+        {
+            return [];
+        }
+
+        var curve = new NvVfpCurve
+        {
+            Version = NvapiNative.MakeVersion<NvVfpCurve>(1),
+            Masks = new uint[4],
+            Unknown1 = new uint[12],
+            GpuCurveEntries = new NvVfpCurveEntry[80],
+            MemoryCurveEntries = new NvVfpCurveEntry[23],
+            Unknown2 = new uint[1064],
+        };
+
+        if (_getVfpCurve(_handle, ref curve) != NvapiStatus.Ok)
+        {
+            return [];
+        }
+
+        var points = new List<VfPoint>();
+        foreach (var entry in curve.GpuCurveEntries)
+        {
+            if (entry.FrequencyKHz == 0 || entry.VoltageMicroV == 0)
+            {
+                continue;
+            }
+
+            double mv = entry.VoltageMicroV / 1000.0;
+            double mhz = entry.FrequencyKHz / 1000.0;
+            if (mv is > 300 and < 1600 && mhz is > 100 and < 4500)
+            {
+                points.Add(new VfPoint(Math.Round(mv, 1), Math.Round(mhz, 1)));
+            }
+        }
+
+        points.Sort((a, b) => a.VoltageMv.CompareTo(b.VoltageMv));
+        return points;
     }
 
     // --- Temperature limit (thermal policies) -----------------------------------

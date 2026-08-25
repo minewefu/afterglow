@@ -48,6 +48,7 @@ internal static class NvapiIds
     public const uint GpuClientThermalPoliciesSetStatus = 0x34C0B13D;
     public const uint GpuGetCoreVoltageBoostPercent = 0x9DF23CA1;
     public const uint GpuSetCoreVoltageBoostPercent = 0xB9306D9B;
+    public const uint GpuGetVfpCurve = 0x21537AD4;
 }
 
 #pragma warning disable CS0649 // fields assigned by native code
@@ -270,6 +271,44 @@ internal struct NvVoltageBoostPercent
     public uint[] Reserved;
 }
 
+/// <summary>One point of the driver's voltage/frequency curve.</summary>
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+internal struct NvVfpCurveEntry
+{
+    public uint Unknown1;
+    public uint FrequencyKHz;
+    public uint VoltageMicroV;
+    public uint Unknown2;
+    public uint Unknown3;
+    public uint Unknown4;
+    public uint Unknown5;
+}
+
+/// <summary>
+/// GPU boost (V/F) curve: 80 core points and 23 memory points.
+/// Read-only in Afterglow — the driver rejects curve writes on Blackwell.
+/// </summary>
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+internal struct NvVfpCurve
+{
+    public uint Version;
+
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)]
+    public uint[] Masks;
+
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 12)]
+    public uint[] Unknown1;
+
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 80)]
+    public NvVfpCurveEntry[] GpuCurveEntries;
+
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 23)]
+    public NvVfpCurveEntry[] MemoryCurveEntries;
+
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 1064)]
+    public uint[] Unknown2;
+}
+
 #pragma warning restore CS0649
 
 /// <summary>
@@ -357,4 +396,7 @@ internal static class NvapiNative
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate NvapiStatus VoltageBoostDelegate(nint gpu, ref NvVoltageBoostPercent boost);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate NvapiStatus GetVfpCurveDelegate(nint gpu, ref NvVfpCurve curve);
 }

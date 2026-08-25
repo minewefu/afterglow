@@ -95,7 +95,31 @@ periodic bit-exact readback comparisons (all matched), and clean stop/teardown. 
 compute cannot exercise the raster/ROP power domains, so a few percent below TGP is the
 honest ceiling for an anticheat-safe, non-graphical burn.
 
-## 5. Known Blackwell gaps (verified, by design)
+## 5. V/F curve probe — measured on the RTX 5090
+
+NVIDIA removed the curve query interface and rejects per-point curve writes on RTX 50
+(both verified: the private VFP-curve read returns unavailable on driver 610.88). Afterglow
+maps the curve anyway by measurement: `afterglow-cli vfcurve --probe` locks the core clock
+at each step under a compute load and records the voltage the driver selects, then restores
+the previous state. Full sweep, ~80 s, run elevated:
+
+```text
+step  1/18: lock   600 MHz ->   592 MHz @  800.0 mV     (voltage floor)
+step  8/18: lock  1650 MHz ->  1642 MHz @  865.0 mV
+step 12/18: lock  2250 MHz ->  2242 MHz @  910.0 mV
+step 15/18: lock  2700 MHz ->  2692 MHz @  940.0 mV
+step 16/18: lock  2850 MHz ->  2842 MHz @  985.0 mV     (the knee begins)
+step 17/18: lock  3000 MHz ->  2992 MHz @ 1040.0 mV
+step 18/18: lock  3090 MHz ->  3080 MHz @ 1090.0 mV
+17 voltage points recorded; post-probe state: clock lock restored to none.
+```
+
+A classic Blackwell curve: ~10–15 mV per 150 MHz until ~2700 MHz, then ~50 mV per
+150 MHz — the knee that makes undervolting worthwhile. The V/F Curve page renders this
+measured map, and picking a point computes the lock+offset pair that holds that clock at
+that voltage.
+
+## 6. Known Blackwell gaps (verified, by design)
 
 - Hot spot: blocked by NVIDIA in all public APIs on RTX 50 — Afterglow reports
   "unavailable" instead of a fake value. (Kernel-register workarounds exist in other tools;
