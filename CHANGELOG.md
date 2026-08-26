@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.2 — 2026-08-26
 
 - Start with Windows now runs through a Task Scheduler entry that launches
   Afterglow elevated with no UAC prompt at logon: new Settings toggle, the
