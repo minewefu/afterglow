@@ -40,6 +40,15 @@ public partial class App : Application
             return;
         }
 
+        // Installer hook: register the elevated no-UAC logon task and exit.
+        // The installer's post-install step runs elevated, so this succeeds
+        // without any prompt of its own.
+        if (args.Contains("--register-startup"))
+        {
+            Shutdown(AppServices.CheckElevated() && StartupTaskService.Enable() ? 0 : 1);
+            return;
+        }
+
         bool demo = args.Contains("--demo");
         string? screenshotPath = GetArgValue(e.Args, "--screenshot");
         string? page = GetArgValue(e.Args, "--page");

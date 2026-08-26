@@ -57,6 +57,11 @@
                     <CheckBox Style="{StaticResource ToggleSwitch}" Content="Start minimized to tray"
                               IsChecked="{Binding StartMinimizedToTray}" Margin="0,10,0,0" />
                     <CheckBox Style="{StaticResource ToggleSwitch}"
+                              Content="Start with Windows (elevated via Task Scheduler — no UAC prompt at logon)"
+                              IsChecked="{Binding StartWithWindows}" Margin="0,10,0,0" />
+                    <TextBlock Text="{Binding StartWithWindowsNote}" FontSize="11.5" Foreground="{StaticResource Warn}"
+                               TextWrapping="Wrap" Margin="0,6,0,0" />
+                    <CheckBox Style="{StaticResource ToggleSwitch}"
                               Content="Auto-reset tuning if a GPU driver crash (TDR) is detected"
                               IsChecked="{Binding ResetOnDriverCrash}" Margin="0,10,0,0" />
                     <TextBlock Text="{Binding HotkeysText}" FontSize="11.5" Foreground="{StaticResource TextFaint}"

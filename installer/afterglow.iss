@@ -36,11 +36,16 @@ Name: "{autodesktop}\Afterglow"; Filename: "{app}\Afterglow.exe"; Tasks: desktop
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"
-Name: "startup"; Description: "Start Afterglow with Windows (minimized to tray)"; GroupDescription: "Startup:"; Flags: unchecked
+Name: "startup"; Description: "Start Afterglow with Windows (elevated via Task Scheduler, no UAC prompt at logon)"; GroupDescription: "Startup:"; Flags: unchecked
 
 [Registry]
-Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Afterglow"; \
-    ValueData: """{app}\Afterglow.exe"" --minimized"; Flags: uninsdeletevalue; Tasks: startup
+; Pre-1.0.2 installs used a Run-key autostart (unelevated, prompted at every
+; boot). Delete it unconditionally so upgrades never double-start.
+Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "Afterglow"; Flags: deletevalue
 
 [Run]
+Filename: "{app}\Afterglow.exe"; Parameters: "--register-startup"; Tasks: startup; Flags: runhidden waituntilterminated
 Filename: "{app}\Afterglow.exe"; Description: "Launch Afterglow"; Flags: nowait postinstall skipifsilent
+
+[UninstallRun]
+Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""Afterglow"" /F"; RunOnceId: "RemoveStartupTask"; Flags: runhidden

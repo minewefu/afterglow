@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Start with Windows now runs through a Task Scheduler entry that launches
+  Afterglow elevated with no UAC prompt at logon: new Settings toggle, the
+  installer checkbox uses the same mechanism, uninstall removes the task, and
+  upgrades clean up the old Run-key autostart (which prompted every boot)
+
 ## 1.0.1 — 2026-08-26
 
 - V/F chart: axis unit no longer collides with the last tick label; the

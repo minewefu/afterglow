@@ -23,6 +23,9 @@ public partial class SettingsViewModel : ObservableObject
     [ObservableProperty] private bool _startMinimizedToTray;
     [ObservableProperty] private bool _resetOnDriverCrash;
 
+    [ObservableProperty] private bool _startWithWindows;
+    [ObservableProperty] private string _startWithWindowsNote = string.Empty;
+
     [ObservableProperty] private double _alertGpuTemp;
     [ObservableProperty] private double _alertMemTemp;
 
@@ -79,6 +82,40 @@ public partial class SettingsViewModel : ObservableObject
         }
     }
 
+    partial void OnStartWithWindowsChanged(bool value)
+    {
+        if (_loading)
+        {
+            return;
+        }
+
+        if (!_services.IsElevated)
+        {
+            StartWithWindowsNote = "Changing autostart needs the elevated app — restart Afterglow and accept the UAC prompt first.";
+            RevertStartWithWindows(!value);
+            return;
+        }
+
+        bool ok = value ? Services.StartupTaskService.Enable() : Services.StartupTaskService.Disable();
+        if (!ok)
+        {
+            StartWithWindowsNote = value
+                ? "Couldn't create the startup task (Task Scheduler refused)."
+                : "Couldn't remove the startup task.";
+            RevertStartWithWindows(!value);
+            return;
+        }
+
+        StartWithWindowsNote = string.Empty;
+    }
+
+    private void RevertStartWithWindows(bool actual)
+    {
+        _loading = true;
+        StartWithWindows = actual;
+        _loading = false;
+    }
+
     partial void OnSelectedStartupProfileChanged(string value)
     {
         if (_loading)
@@ -106,6 +143,7 @@ public partial class SettingsViewModel : ObservableObject
     {
         _loading = true;
         PollingIntervalMs = s.PollingIntervalMs;
+        StartWithWindows = Services.StartupTaskService.IsEnabled();
         CloseToTray = s.CloseToTray;
         StartMinimizedToTray = s.StartMinimizedToTray;
         ResetOnDriverCrash = s.ResetOnDriverCrash;
