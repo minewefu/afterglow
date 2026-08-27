@@ -95,12 +95,23 @@ public sealed class GpuTuner
 
     public TuningCapabilities Capabilities { get; }
 
+    private readonly string? _gpuUuid;
+
     public GpuTuner(NvmlDevice nvml, NvapiGpu? nvapi)
     {
         _nvml = nvml;
         _nvapi = nvapi;
+        _gpuUuid = nvml.GetUuid();
         Capabilities = DiscoverCapabilities();
-        _appliedLockMHz = AppliedStateStore.Load()?.LockedCoreClockMHz;
+
+        // Restore the tracked lock only when the persisted record belongs to
+        // THIS GPU (or predates UUID stamping) — on a multi-GPU system, a lock
+        // applied to another card must not be adopted here.
+        var state = AppliedStateStore.Load();
+        if (state is not null && (state.GpuUuid is null || state.GpuUuid == _gpuUuid))
+        {
+            _appliedLockMHz = state.LockedCoreClockMHz;
+        }
     }
 
     /// <summary>
@@ -232,7 +243,7 @@ public sealed class GpuTuner
             ApplyLockedClock(profile.LockedCoreClockMHz, results);
 
             bool all = results.All(r => r.Applied);
-            AppliedStateStore.Record(profile, all, _appliedLockMHz);
+            AppliedStateStore.Record(profile, all, _appliedLockMHz, _gpuUuid);
             Log.Info($"Apply '{profile.Name}': {(all ? "ok" : "PARTIAL")} — {string.Join("; ", results.Select(r => $"{r.Knob}={(r.Applied ? "ok" : "fail")}"))}");
             return new ApplyResult(all, results);
         }
@@ -313,15 +324,19 @@ public sealed class GpuTuner
             : $"{clamped} MHz";
 
         var rc = _nvml.TrySetClockOffset(type, clamped);
-        if (rc == NvmlReturn.Success &&
-            _nvml.TryGetClockOffset(type, out var readback) == NvmlReturn.Success &&
-            readback.ClockOffsetMHz != clamped)
+        if (rc == NvmlReturn.Success && _nvml.TryGetClockOffset(type, out var readback) == NvmlReturn.Success)
         {
-            results.Add(KnobResult.Fail(knob, $"driver accepted the call but readback shows {readback.ClockOffsetMHz} MHz"));
-            return;
+            if (readback.ClockOffsetMHz != clamped)
+            {
+                results.Add(KnobResult.Fail(knob, $"driver accepted the call but readback shows {readback.ClockOffsetMHz} MHz"));
+                return;
+            }
+
+            // "(verified)" only when the readback actually happened and matched.
+            detail += " (verified)";
         }
 
-        Report(results, knob, rc, detail + " (verified)");
+        Report(results, knob, rc, detail);
     }
 
     private void ApplyPowerLimit(TuningProfile profile, List<KnobResult> results)
@@ -409,18 +424,29 @@ public sealed class GpuTuner
         ReportNv(results, "voltage boost", rc, detail);
     }
 
+    /// <summary>
+    /// Idle floor for range locks. A P8-style value, not driver-derived — NVML
+    /// exposes no queryable minimum. If a GPU rejects it, the failure message
+    /// says so explicitly instead of failing opaquely.
+    /// </summary>
+    private const uint RangeLockFloorMHz = 210;
+
     private void ApplyLockedClock(uint? target, List<KnobResult> results)
     {
         if (target is uint lockMHz)
         {
-            // Allow idle downclocking: lock the range from the P8-style floor to the target.
-            var rc = _nvml.TrySetGpuLockedClocks(210, lockMHz);
+            // Allow idle downclocking: lock the range from the idle floor to the target.
+            var rc = _nvml.TrySetGpuLockedClocks(RangeLockFloorMHz, lockMHz);
             if (rc == NvmlReturn.Success)
             {
                 _appliedLockMHz = lockMHz;
             }
 
-            Report(results, "locked core clock", rc, $"210..{lockMHz} MHz (Afterglow-tracked; driver has no getter)");
+            string detail = rc == NvmlReturn.InvalidArgument
+                ? $"{RangeLockFloorMHz}..{lockMHz} MHz — the driver rejected this range; this GPU may " +
+                  $"require a higher idle floor than {RangeLockFloorMHz} MHz (please report your model)"
+                : $"{RangeLockFloorMHz}..{lockMHz} MHz (Afterglow-tracked; driver has no getter)";
+            Report(results, "locked core clock", rc, detail);
             return;
         }
 
@@ -433,7 +459,27 @@ public sealed class GpuTuner
                 _appliedLockMHz = null;
             }
 
-            Report(results, "clock lock", rc, $"removed (was 210..{previous} MHz)");
+            Report(results, "clock lock", rc, $"removed (was {RangeLockFloorMHz}..{previous} MHz)");
+        }
+    }
+
+    /// <summary>
+    /// Re-applies the tuning-style RANGE lock (idle floor .. target) — the form
+    /// profiles use, which still allows idle downclocking. The probe restore
+    /// path must use this, not <see cref="LockClockForProbe"/>: restoring a
+    /// range lock as an exact pin would hold the GPU at full clocks at idle.
+    /// </summary>
+    public NvmlReturn RestoreTuningLock(uint lockMHz)
+    {
+        lock (_applyLock)
+        {
+            var rc = _nvml.TrySetGpuLockedClocks(RangeLockFloorMHz, lockMHz);
+            if (rc == NvmlReturn.Success)
+            {
+                _appliedLockMHz = lockMHz;
+            }
+
+            return rc;
         }
     }
 
@@ -493,7 +539,7 @@ public sealed class GpuTuner
         var worst = NvmlReturn.Success;
         for (uint f = 0; f < fans; f++)
         {
-            var rc = _nvml.TrySetFanSpeed(f, Math.Max(dutyPct, dutyPct == 0 ? 0 : Capabilities.FanMinDutyPct));
+            var rc = _nvml.TrySetFanSpeed(f, dutyPct == 0 ? 0 : Math.Clamp(dutyPct, Capabilities.FanMinDutyPct, 100));
             if (rc != NvmlReturn.Success)
             {
                 worst = rc;
@@ -582,7 +628,8 @@ public static class AppliedStateStore
         uint? LockedCoreClockMHz = null,
         string? FanMode = null,
         uint? FanDuty = null,
-        bool Pending = false);
+        bool Pending = false,
+        string? GpuUuid = null);
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly object Lock = new();
@@ -599,7 +646,7 @@ public static class AppliedStateStore
         });
     }
 
-    public static void Record(TuningProfile profile, bool allSucceeded, uint? lockedClock)
+    public static void Record(TuningProfile profile, bool allSucceeded, uint? lockedClock, string? gpuUuid = null)
     {
         Mutate(state => (state ?? Empty(profile.Name)) with
         {
@@ -609,6 +656,7 @@ public static class AppliedStateStore
             CleanShutdown = false,
             LockedCoreClockMHz = lockedClock,
             Pending = false,
+            GpuUuid = gpuUuid,
         });
     }
 

@@ -67,6 +67,29 @@ public static class ThrottleDescriber
             chips.Add(new("Display setting", "A display-related clock constraint is active.", ThrottleSeverity.Info));
         }
 
+        // Newer drivers report bits this build does not know yet (616.xx sets
+        // 0x400 in ordinary operation). An unknown reason must never be
+        // indistinguishable from "not throttling" — surface it raw instead.
+        const NvmlClocksEventReasons known =
+            NvmlClocksEventReasons.GpuIdle |
+            NvmlClocksEventReasons.ApplicationsClocksSetting |
+            NvmlClocksEventReasons.SwPowerCap |
+            NvmlClocksEventReasons.HwSlowdown |
+            NvmlClocksEventReasons.SyncBoost |
+            NvmlClocksEventReasons.SwThermalSlowdown |
+            NvmlClocksEventReasons.HwThermalSlowdown |
+            NvmlClocksEventReasons.HwPowerBrakeSlowdown |
+            NvmlClocksEventReasons.DisplayClockSetting;
+        var unknown = reasons & ~known;
+        if (unknown != 0)
+        {
+            chips.Add(new(
+                $"Driver-reported (0x{(ulong)unknown:X})",
+                $"The driver reports an additional clock-event reason (bitmask 0x{(ulong)unknown:X}) that this " +
+                "Afterglow build does not decode yet. Shown raw rather than hidden.",
+                ThrottleSeverity.Info));
+        }
+
         return chips;
     }
 }

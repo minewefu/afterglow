@@ -15,6 +15,9 @@ public enum FanControlMode
 /// Continuous fan control for one GPU: feeds telemetry temperatures through the
 /// curve evaluator and commands the fans when the desired duty changes.
 /// Restores firmware control on dispose and on mode change back to Auto.
+/// Driver calls happen outside <c>_lock</c> (a slow kernel transition must not
+/// block the telemetry poller or the UI thread), and <see cref="CommandFailed"/>
+/// is raised outside it too.
 /// </summary>
 public sealed class FanControlService : IDisposable
 {
@@ -55,31 +58,47 @@ public sealed class FanControlService : IDisposable
         }
     }
 
-    /// <summary>Raised when a fan command fails (e.g., lost elevation).</summary>
+    /// <summary>Raised (outside the internal lock) when a fan command fails, e.g. lost elevation.</summary>
     public event Action<NvmlReturn>? CommandFailed;
 
     public void SetAuto()
     {
+        bool release;
         lock (_lock)
         {
             _mode = FanControlMode.Auto;
             _evaluator = null;
-            ReleaseControl();
-            Tuning.AppliedStateStore.RecordFans(null, null);
+            release = _weControlFans;
+            _weControlFans = false;
+            _lastCommandedDuty = -1;
         }
+
+        if (release)
+        {
+            _ = _tuner.RestoreAutoFansRaw();
+        }
+
+        AppliedStateStore.RecordFans(null, null);
     }
 
     public void SetFixed(uint dutyPct)
     {
+        uint duty;
         lock (_lock)
         {
             _mode = FanControlMode.Fixed;
             _evaluator = null;
 
             // 0 = stop; anything between 1 and the hardware minimum rounds up.
-            uint duty = Tuning.TuningMath.NormalizeFixedFanDuty(dutyPct, _tuner.Capabilities.FanMinDutyPct);
-            Command(duty);
-            Tuning.AppliedStateStore.RecordFans("fixed", duty);
+            duty = TuningMath.NormalizeFixedFanDuty(dutyPct, _tuner.Capabilities.FanMinDutyPct);
+        }
+
+        // Record manual control only when the command actually landed — a
+        // failed command (e.g. not elevated) must not persist a claim that
+        // Afterglow took the fans over.
+        if (Command(duty))
+        {
+            AppliedStateStore.RecordFans("fixed", duty);
         }
     }
 
@@ -96,13 +115,15 @@ public sealed class FanControlService : IDisposable
             _tempSource = config.TempSource;
             _evaluator = new FanCurveEvaluator(config);
             _lastCommandedDuty = -1;
-            Tuning.AppliedStateStore.RecordFans("curve", null);
         }
+
+        AppliedStateStore.RecordFans("curve", null);
     }
 
     /// <summary>Feed one telemetry snapshot (called on the polling thread).</summary>
     public void OnSnapshot(GpuSnapshot snapshot)
     {
+        double duty;
         lock (_lock)
         {
             if (_mode != FanControlMode.Curve || _evaluator is null)
@@ -122,44 +143,49 @@ public sealed class FanControlService : IDisposable
                 return;
             }
 
-            double duty = _evaluator.Step(t);
-            if (Math.Abs(duty - _lastCommandedDuty) >= 1)
+            duty = _evaluator.Step(t);
+            if (Math.Abs(duty - _lastCommandedDuty) < 1)
             {
-                Command(duty);
+                return;
             }
         }
+
+        _ = Command(duty);
     }
 
-    private void Command(double duty)
+    /// <summary>Issues the driver command outside the lock; updates state under it.</summary>
+    private bool Command(double duty)
     {
         var rc = _tuner.SetAllFansRaw((uint)Math.Round(duty));
         if (rc == NvmlReturn.Success)
         {
-            _lastCommandedDuty = duty;
-            _weControlFans = true;
-        }
-        else
-        {
-            Diagnostics.Log.Warn($"Fan command {duty:F0}% failed: {rc}");
-            CommandFailed?.Invoke(rc);
-        }
-    }
+            lock (_lock)
+            {
+                _lastCommandedDuty = duty;
+                _weControlFans = true;
+            }
 
-    private void ReleaseControl()
-    {
-        if (_weControlFans)
-        {
-            _weControlFans = false;
-            _lastCommandedDuty = -1;
-            _ = _tuner.RestoreAutoFansRaw();
+            return true;
         }
+
+        Diagnostics.Log.Warn($"Fan command {duty:F0}% failed: {rc}");
+        CommandFailed?.Invoke(rc);
+        return false;
     }
 
     public void Dispose()
     {
+        bool release;
         lock (_lock)
         {
-            ReleaseControl();
+            release = _weControlFans;
+            _weControlFans = false;
+            _lastCommandedDuty = -1;
+        }
+
+        if (release)
+        {
+            _ = _tuner.RestoreAutoFansRaw();
         }
     }
 }

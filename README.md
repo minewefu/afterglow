@@ -89,9 +89,10 @@ Afterglow is a from-scratch, MIT-licensed answer:
   modes today; legacy exclusive-fullscreen is documented as not covered — no injection, by design)
 
 **Stability lab**
-- Built-in **burn test with bit-exact error detection**: a deterministic compute workload is
-  verified result-for-result — a single flipped bit reports "unstable" instead of hoping you
-  notice artifacts. Driver resets (TDR) during load are caught and reported
+- Built-in **burn test with bit-exact error detection**: a deterministic compute workload whose
+  full output is re-verified byte-for-byte through a rotating window (a 256 KiB slice every
+  ~2 s, covering the entire output each cycle) — a single flipped bit reports "unstable"
+  instead of hoping you notice artifacts. Driver resets (TDR) during load are caught and reported
 - **Stress patterns for the crashes other tools can't catch**: *Transition cycling* forces
   P-state/memory-clock switches and re-verifies VRAM retention across every transition
   (memory offsets that pass sustained burns routinely fail exactly there), and *Boost
@@ -121,8 +122,9 @@ Afterglow is a from-scratch, MIT-licensed answer:
 
 **Agent-native (AI integration)**
 - `afterglow-cli mcp` runs a **Model Context Protocol server**, so AI agents can monitor,
-  tune, and stability-test the GPU with typed tools — including a fully autonomous
-  find-my-best-clocks loop built on the error-checked burn test as ground truth
+  tune, and stability-test the GPU with typed tools — including `find_stable_offset`, the
+  guided stepper as a single autonomous call, plus the primitives (apply → stress → verify)
+  for building custom tuning loops on the error-checked burn test as ground truth
 - `--json` output on the read commands for shell-driving agents
 - Same safety envelope as the UI: agents can only apply driver-validated values, and every
   result is reported truthfully — see [docs/agent-integration.md](docs/agent-integration.md)
@@ -185,6 +187,8 @@ Corrections welcome.)*
   borderless/windowed/fullscreen-optimized — i.e., almost everything modern — works.
 - The **temperature-limit slider** isn't exposed on current Blackwell drivers through public
   interfaces; use the power limit and fan curve instead (Afterglow says this in-app too).
+- **The GUI drives one GPU** (the first NVIDIA card). Multi-GPU systems can tune secondary
+  cards through the CLI (`--gpu N`), but the pages, overlay, and tray show GPU 0 only.
 - Writes need administrator rights (true for every tool in this category). Afterglow launches
   with a UAC prompt; declining it leaves you in monitoring-only mode instead of exiting.
 

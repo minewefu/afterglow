@@ -144,10 +144,12 @@ public sealed class VfCurveProbe
         {
             load.StopAndWait(TimeSpan.FromSeconds(5));
 
-            // Restore whatever lock state existed before the probe.
+            // Restore whatever lock state existed before the probe — as the
+            // RANGE lock profiles apply, never as an exact pin (which would
+            // hold full clocks at idle).
             if (previousLock is uint restore)
             {
-                _ = _tuner.LockClockForProbe(restore);
+                _ = _tuner.RestoreTuningLock(restore);
             }
             else
             {

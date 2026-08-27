@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Independent defect review (docs/REVIEW-2026-08-28.md): all 22 findings and
+  4 README-claim gaps addressed. Highlights: offset apply no longer claims
+  "(verified)" unless the readback actually happened and matched; unknown
+  driver throttle bits are surfaced raw instead of hidden (616.xx reports
+  0x400); burn/VRAM tests bind explicitly to the NVIDIA adapter instead of
+  trusting DXGI adapter order; burn verification now rotates across the
+  entire output instead of a fixed slice; the V/F undervolt planner refuses
+  unplannable targets, validates persisted curve data, and requires
+  well-populated bins before offering a hardware write; the V/F probe
+  restores range locks as range locks; the stepper ships as the
+  `find_stable_offset` MCP tool and MCP `isError` now agrees with the result
+  body; applied-state is stamped with the GPU UUID; plus tray-alert thread
+  marshaling, fan-command failure surfacing, and interop cleanup
+
 - Stress patterns: alongside the sustained burn, **Transition cycling** forces
   P-state and memory-clock switches with bit-exact VRAM retention checks across
   every transition, and **Boost excursions** rides the boost overshoot through

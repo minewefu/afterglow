@@ -95,13 +95,14 @@ public partial class VfCurveViewModel : ObservableObject
         TargetClock = Math.Round(clockMHz / 15) * 15;
 
         int currentOffset = _gpu?.Tuner.ReadCurrent().CoreOffsetMHz ?? 0;
-        _plan = _services.VfCurve.PlanUndervolt(TargetVoltage, TargetClock, currentOffset);
+        _plan = _services.VfCurve.PlanUndervolt(TargetVoltage, TargetClock, currentOffset, _gpu?.Tuner.Capabilities);
 
         if (_plan is null)
         {
             HasPlan = false;
-            PlanText = $"No measured data near {TargetVoltage:F0} mV yet — run the GPU at that voltage first " +
-                       "(the burn test at a lower power limit is a quick way to fill in the low-voltage end).";
+            PlanText = $"No plan for {TargetVoltage:F0} mV / {TargetClock:F0} MHz — either the curve has too " +
+                       "few samples near that voltage yet (keep gaming or run the probe), or the required " +
+                       "offset/lock would fall outside what this GPU's driver accepts.";
             return;
         }
 

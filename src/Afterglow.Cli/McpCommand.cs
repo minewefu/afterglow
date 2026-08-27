@@ -142,6 +142,24 @@ internal static class McpCommand
             isError = true;
         }
 
+        string payload = JsonSerializer.Serialize(outcome, Json);
+
+        // The MCP-standard flag must agree with the body: an agent checking
+        // only isError must not conclude a failed apply succeeded.
+        if (!isError)
+        {
+            try
+            {
+                var body = JsonNode.Parse(payload);
+                isError = body?["error"] is not null ||
+                          body?["allSucceeded"]?.GetValue<bool>() == false ||
+                          body?["all_succeeded"]?.GetValue<bool>() == false;
+            }
+            catch (JsonException)
+            {
+            }
+        }
+
         WriteResult(id, new JsonObject
         {
             ["content"] = new JsonArray
@@ -149,7 +167,7 @@ internal static class McpCommand
                 new JsonObject
                 {
                     ["type"] = "text",
-                    ["text"] = JsonSerializer.Serialize(outcome, Json),
+                    ["text"] = payload,
                 },
             },
             ["isError"] = isError,
@@ -255,6 +273,18 @@ internal static class McpCommand
                 args => gpu is null ? RequireGpu() : RunStress(gpu, args)),
 
             new ToolDef(
+                "find_stable_offset",
+                "The guided stability stepper as one autonomous call: steps the core offset up, burn-testing " +
+                "each step with bit-exact verification, backs off on the first failure, and runs a longer " +
+                "confirmation burn. BLOCKS until finished (typically several minutes). Requires elevation. " +
+                "The confirmed stable offset is left applied and returned with the step-by-step log.",
+                Schema(
+                    ("step_mhz", "integer", "MHz added per step, 5-60 (default 30)", false),
+                    ("seconds_per_step", "integer", "Burn seconds per step, 30-300 (default 60)", false),
+                    ("max_offset_mhz", "integer", "Highest offset to try, 50-600 (default 300)", false)),
+                args => gpu is null ? RequireGpu() : RunStepper(gpu, args)),
+
+            new ToolDef(
                 "run_vram_test",
                 "Full-capacity VRAM test: fills as much of the card's memory as the OS safely allows with a " +
                 "deterministic pattern and verifies every element on the GPU (alternate rounds invert the " +
@@ -337,6 +367,24 @@ internal static class McpCommand
                 : args?["lock_clock_mhz"]?.GetValue<uint>() ?? current.LockedCoreClockMHz,
         };
 
+        // Schema validation errors cite generic sanity bounds; report the
+        // ranges that actually matter — this GPU's — alongside them.
+        if (profile.Validate() is string validationError)
+        {
+            var caps = gpu.Tuner.Capabilities;
+            return new
+            {
+                all_succeeded = false,
+                error = validationError,
+                driver_ranges_for_this_gpu = new
+                {
+                    core_offset_mhz = $"{caps.CoreOffsetMinMHz}..{caps.CoreOffsetMaxMHz}",
+                    mem_offset_mhz = $"{caps.MemOffsetMinMHz}..{caps.MemOffsetMaxMHz}",
+                    power_limit_w = $"{caps.PowerLimitMinW:F0}..{caps.PowerLimitMaxW:F0}",
+                },
+            };
+        }
+
         var result = gpu.Tuner.Apply(profile);
         var knobs = new List<KnobResult>(result.Results);
 
@@ -382,6 +430,39 @@ internal static class McpCommand
             power_limit_w = power,
             voltage_boost_pct = boost,
             lock_clock_mhz = lockMhz,
+        };
+    }
+
+    private static object RunStepper(GpuContext gpu, JsonObject? args)
+    {
+        var options = new StepperOptions
+        {
+            StepMHz = Math.Clamp(args?["step_mhz"]?.GetValue<int>() ?? 30, 5, 60),
+            SecondsPerStep = Math.Clamp(args?["seconds_per_step"]?.GetValue<int>() ?? 60, 30, 300),
+            MaxOffsetMHz = Math.Clamp(args?["max_offset_mhz"]?.GetValue<int>() ?? 300, 50, 600),
+        };
+
+        var stepper = new StabilityStepper(gpu.Tuner);
+        var done = new ManualResetEventSlim(false);
+        StepperStatus? final = null;
+        stepper.StatusChanged += status =>
+        {
+            if (!status.Running)
+            {
+                final = status;
+                done.Set();
+            }
+        };
+
+        stepper.Start(options);
+        done.Wait();
+
+        return new
+        {
+            all_succeeded = final?.Phase == "done",
+            phase = final?.Phase,
+            stable_core_offset_mhz = final?.ResultOffsetMHz,
+            log = final?.Log ?? [],
         };
     }
 

@@ -37,15 +37,12 @@ internal static class NvapiIds
     public const uint GpuGetFullName = 0xCEEE8E9F;
     public const uint GpuGetBusId = 0x1BE0B8E5;
     public const uint GpuGetTachReading = 0x5F608315;
-    public const uint GpuGetThermalSettings = 0xE3640A56;
     public const uint GpuGetThermalSensors = 0x65FE3AAD;
     public const uint GpuGetDynamicPstatesInfoEx = 0x60DED2ED;
     public const uint GpuClientFanCoolersGetStatus = 0x35AED5E8;
     public const uint GpuClientFanCoolersGetControl = 0x814B209F;
     public const uint GpuClientFanCoolersSetControl = 0xA58971A5;
     public const uint GpuRestoreCoolerSettings = 0x8F6ED0FB;
-    public const uint GpuGetCoolerSettings = 0xDA141340;
-    public const uint GpuSetCoolerLevels = 0x891FA0AE;
     public const uint GpuClientVoltRailsGetStatus = 0x465F9BCF;
     public const uint GpuClientThermalPoliciesGetInfo = 0x0D258BB5;
     public const uint GpuClientThermalPoliciesGetStatus = 0xE9C425A1;
@@ -56,26 +53,6 @@ internal static class NvapiIds
 }
 
 #pragma warning disable CS0649 // fields assigned by native code
-
-[StructLayout(LayoutKind.Sequential, Pack = 8)]
-internal struct NvThermalSensor
-{
-    public int Controller;
-    public uint DefaultMinTemp;
-    public uint DefaultMaxTemp;
-    public uint CurrentTemp;
-    public int Target;
-}
-
-[StructLayout(LayoutKind.Sequential, Pack = 8)]
-internal struct NvThermalSettings
-{
-    public uint Version;
-    public uint Count;
-
-    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 3)]
-    public NvThermalSensor[] Sensor;
-}
 
 /// <summary>Private thermal sensor block: temperatures are fixed-point °C × 256.</summary>
 [StructLayout(LayoutKind.Sequential, Pack = 8)]
@@ -145,51 +122,6 @@ internal struct NvFanCoolerControl
     public NvFanCoolerControlItem[] Items;
 }
 
-[StructLayout(LayoutKind.Sequential, Pack = 8)]
-internal struct NvCooler
-{
-    public int Type;
-    public int Controller;
-    public int DefaultMin;
-    public int DefaultMax;
-    public int CurrentMin;
-    public int CurrentMax;
-    public int CurrentLevel;
-    public int DefaultPolicy;
-    public int CurrentPolicy;
-    public int Target;
-    public int ControlType;
-    public int Active;
-}
-
-[StructLayout(LayoutKind.Sequential, Pack = 8)]
-internal struct NvCoolerSettings
-{
-    public uint Version;
-    public uint Count;
-
-    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 20)]
-    public NvCooler[] Cooler;
-}
-
-[StructLayout(LayoutKind.Sequential, Pack = 8)]
-internal struct NvCoolerLevel
-{
-    public int Level;
-
-    /// <summary>1 = manual, 32 = auto.</summary>
-    public uint Policy;
-}
-
-[StructLayout(LayoutKind.Sequential, Pack = 8)]
-internal struct NvCoolerLevels
-{
-    public uint Version;
-
-    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 20)]
-    public NvCoolerLevel[] Levels;
-}
-
 /// <summary>Core voltage rail status; explicit layout, size 0x4C, core µV at 0x28.</summary>
 [StructLayout(LayoutKind.Explicit, Size = 0x4C)]
 internal struct NvVoltRailsStatus
@@ -200,8 +132,12 @@ internal struct NvVoltRailsStatus
     [FieldOffset(0x28)]
     public uint CoreMicrovolts;
 
+    /// <summary>
+    /// Reserved in published layouts; kept only to document the byte at 0x2C.
+    /// Nothing reads it — do not use without independent verification.
+    /// </summary>
     [FieldOffset(0x2C)]
-    public uint CoreMicrovoltsHigh;
+    public uint ReservedAfterCoreMicrovolts;
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 8)]
@@ -366,9 +302,6 @@ internal static class NvapiNative
     internal delegate NvapiStatus GetTachReadingDelegate(nint gpu, out int rpm);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    internal delegate NvapiStatus GetThermalSettingsDelegate(nint gpu, int sensorIndex, ref NvThermalSettings settings);
-
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate NvapiStatus GetThermalSensorsDelegate(nint gpu, ref NvThermalSensors sensors);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
@@ -382,12 +315,6 @@ internal static class NvapiNative
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate NvapiStatus RestoreCoolerSettingsDelegate(nint gpu, nint coolerIndexes, uint indexCount);
-
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    internal delegate NvapiStatus GetCoolerSettingsDelegate(nint gpu, int coolerTarget, ref NvCoolerSettings settings);
-
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    internal delegate NvapiStatus SetCoolerLevelsDelegate(nint gpu, int coolerIndex, ref NvCoolerLevels levels);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate NvapiStatus VoltRailsGetStatusDelegate(nint gpu, ref NvVoltRailsStatus status);

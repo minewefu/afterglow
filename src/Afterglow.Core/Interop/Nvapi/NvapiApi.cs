@@ -79,7 +79,12 @@ public sealed class NvapiGpu
     private uint _thermalSensorsMask;
     private bool _thermalMaskProbed;
 
-    /// <summary>NVML architecture value used to map private thermal channels (10 = Blackwell, 8 = Ada).</summary>
+    /// <summary>
+    /// NVML architecture value used to map private thermal channels (10 =
+    /// Blackwell, 8 = Ada). Must be assigned before thermal reads;
+    /// <see cref="GetPrivateThermals"/> returns nothing while it is 0 rather
+    /// than guessing a channel map.
+    /// </summary>
     public uint Architecture { get; set; }
 
     internal NvapiGpu(nint handle)
@@ -191,6 +196,14 @@ public sealed class NvapiGpu
     /// </summary>
     public (double? HotSpotC, double? MemJunctionC) GetPrivateThermals()
     {
+        // The channel map depends on Architecture; until a caller has set it
+        // (GpuManager does, from NVML), refusing is safer than silently using
+        // the pre-Ada mapping and reporting the wrong sensor as hot spot.
+        if (Architecture == 0)
+        {
+            return (null, null);
+        }
+
         uint mask = ProbeThermalSensorMask();
         if (mask == 0 || _getThermalSensors is null)
         {

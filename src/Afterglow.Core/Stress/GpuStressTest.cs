@@ -178,7 +178,10 @@ public sealed class GpuStressTest : IDisposable
 
     public void Start()
     {
-        if (IsRunning)
+        // Guard on thread liveness, not IsRunning: after Stop() the worker can
+        // still be winding down, and un-stopping it while spawning a second
+        // thread would run two burns against one device.
+        if (_thread is { IsAlive: true })
         {
             return;
         }
@@ -225,13 +228,22 @@ public sealed class GpuStressTest : IDisposable
 
         try
         {
+            using var targetAdapter = StressAdapter.SelectNvidia(out string adapterName);
+            if (targetAdapter is null)
+            {
+                Report(StressState.Failed, stopwatch.Elapsed, 0, 0, 0,
+                    "No NVIDIA adapter found — refusing to run the burn on a different GPU.");
+                return;
+            }
+
             var result = D3D11.D3D11CreateDevice(
-                null, DriverType.Hardware, DeviceCreationFlags.None,
+                targetAdapter, DriverType.Unknown, DeviceCreationFlags.None,
                 [FeatureLevel.Level_11_0],
                 out ID3D11Device? device, out ID3D11DeviceContext? context);
             if (result.Failure || device is null || context is null)
             {
-                Report(StressState.Failed, stopwatch.Elapsed, 0, 0, 0, $"D3D11 device creation failed: {result}");
+                Report(StressState.Failed, stopwatch.Elapsed, 0, 0, 0,
+                    $"D3D11 device creation failed on {adapterName}: {result}");
                 return;
             }
 
@@ -301,32 +313,43 @@ public sealed class GpuStressTest : IDisposable
                 context.CSSetUnorderedAccessView(0, dstUav);
                 context.CSSetConstantBuffer(0, burnConstants);
 
-                byte[] current = new byte[CheckElements * 16];
+                const int SliceBytes = CheckElements * 16;
+                const int SliceCount = ThreadCount / CheckElements;
+                byte[] current = new byte[SliceBytes];
+                int verifySlice = 0;
 
-                byte[] ReadSlice()
+                void ReadSlice(int sliceIndex, byte[] into, int intoOffset)
                 {
+                    int offset = sliceIndex * SliceBytes;
                     context.CopySubresourceRegion(staging, 0, 0, 0, 0, dstBuffer, 0,
-                        new Vortice.Mathematics.Box(0, 0, 0, CheckElements * 16, 1, 1));
+                        new Vortice.Mathematics.Box(offset, 0, 0, offset + SliceBytes, 1, 1));
                     var mapped = context.Map(staging, 0, MapMode.Read);
                     try
                     {
-                        fixed (byte* dest = current)
+                        fixed (byte* dest = into)
                         {
-                            System.Buffer.MemoryCopy((void*)mapped.DataPointer, dest, current.Length, current.Length);
+                            System.Buffer.MemoryCopy(
+                                (void*)mapped.DataPointer, dest + intoOffset, into.Length - intoOffset, SliceBytes);
                         }
                     }
                     finally
                     {
                         context.Unmap(staging, 0);
                     }
-
-                    return current;
                 }
 
-                // Reference pass.
+                // Reference pass: capture the ENTIRE 16 MiB output once, then
+                // verification walks a rotating 256 KiB window — every element
+                // is re-checked bit-for-bit across each 64-check cycle, not
+                // just a fixed slice at offset 0.
                 context.Dispatch(ThreadCount / ThreadsPerGroup, 1, 1);
                 context.Flush();
-                byte[] reference = (byte[])ReadSlice().Clone();
+                byte[] reference = new byte[ThreadCount * 16];
+                for (int slice = 0; slice < SliceCount; slice++)
+                {
+                    ReadSlice(slice, reference, slice * SliceBytes);
+                }
+
                 dispatches++;
 
                 var lastReport = TimeSpan.Zero;
@@ -344,8 +367,9 @@ public sealed class GpuStressTest : IDisposable
                 bool Verify(string failureDetail)
                 {
                     var elapsed = stopwatch.Elapsed;
-                    var slice = ReadSlice();
-                    if (!slice.AsSpan().SequenceEqual(reference))
+                    int slice = verifySlice++ % SliceCount;
+                    ReadSlice(slice, current, 0);
+                    if (!current.AsSpan().SequenceEqual(reference.AsSpan(slice * SliceBytes, SliceBytes)))
                     {
                         errors++;
                         Report(StressState.ArtifactDetected, elapsed,
@@ -529,6 +553,13 @@ public sealed class GpuStressTest : IDisposable
         catch (Exception ex) when (ex is InvalidOperationException or DllNotFoundException)
         {
             Report(StressState.Failed, stopwatch.Elapsed, 0, dispatches, errors, ex.Message);
+        }
+        catch (Exception ex)
+        {
+            // Last resort: an escape from a background thread would terminate
+            // the whole process, possibly while an overclock is applied.
+            Report(StressState.Failed, stopwatch.Elapsed, 0, dispatches, errors,
+                $"Unexpected failure: {ex.GetType().Name}: {ex.Message}");
         }
     }
 

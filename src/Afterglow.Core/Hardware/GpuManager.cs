@@ -48,15 +48,29 @@ public sealed class GpuManager : IDisposable
 
         DriverVersion = _nvml.GetDriverVersion();
 
+        // NVAPI exposes only the PCI bus number, so pairing with NVML is keyed
+        // on it. Two GPUs sharing a bus number (different PCI domains) would
+        // make the pairing ambiguous — in that case pair NEITHER rather than
+        // silently attaching one card's NVAPI handle to the other's tuner.
         var nvapiByBus = new Dictionary<uint, NvapiGpu>();
+        var ambiguousBuses = new HashSet<uint>();
         if (nvapi is not null)
         {
             foreach (var gpu in nvapi.GetGpus())
             {
                 if (gpu.TryGetBusId(out uint busId) == NvapiStatus.Ok)
                 {
-                    nvapiByBus[busId] = gpu;
+                    if (!nvapiByBus.TryAdd(busId, gpu))
+                    {
+                        ambiguousBuses.Add(busId);
+                        Diagnostics.Log.Warn($"Two NVAPI GPUs report PCI bus {busId}; skipping NVAPI pairing for that bus.");
+                    }
                 }
+            }
+
+            foreach (uint bus in ambiguousBuses)
+            {
+                nvapiByBus.Remove(bus);
             }
         }
 

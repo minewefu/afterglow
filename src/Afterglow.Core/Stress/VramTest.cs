@@ -145,7 +145,9 @@ public sealed class VramTest : IDisposable
 
     public void Start()
     {
-        if (IsRunning)
+        // Liveness guard (see GpuStressTest.Start): never resurrect a stopping
+        // worker while spawning a second one.
+        if (_thread is { IsAlive: true })
         {
             return;
         }
@@ -190,14 +192,22 @@ public sealed class VramTest : IDisposable
 
         try
         {
+            using var targetAdapter = StressAdapter.SelectNvidia(out string adapterName);
+            if (targetAdapter is null)
+            {
+                Report(StressState.Failed, stopwatch.Elapsed, 0, 0, 0, 0, 0,
+                    "No NVIDIA adapter found — refusing to run the VRAM test on a different GPU.");
+                return;
+            }
+
             var result = D3D11.D3D11CreateDevice(
-                null, DriverType.Hardware, DeviceCreationFlags.None,
+                targetAdapter, DriverType.Unknown, DeviceCreationFlags.None,
                 [FeatureLevel.Level_11_0],
                 out ID3D11Device? device, out ID3D11DeviceContext? context);
             if (result.Failure || device is null || context is null)
             {
                 Report(StressState.Failed, stopwatch.Elapsed, 0, 0, 0, 0, 0,
-                    $"D3D11 device creation failed: {result}");
+                    $"D3D11 device creation failed on {adapterName}: {result}");
                 return;
             }
 
@@ -391,6 +401,13 @@ public sealed class VramTest : IDisposable
         catch (Exception ex) when (ex is InvalidOperationException or DllNotFoundException)
         {
             Report(StressState.Failed, stopwatch.Elapsed, planned, verified, rounds, errors, 0, ex.Message);
+        }
+        catch (Exception ex)
+        {
+            // Last resort — see GpuStressTest: never let a worker escape kill
+            // the process.
+            Report(StressState.Failed, stopwatch.Elapsed, planned, verified, rounds, errors, 0,
+                $"Unexpected failure: {ex.GetType().Name}: {ex.Message}");
         }
     }
 

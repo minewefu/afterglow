@@ -75,13 +75,21 @@ public sealed class VfCurveRecorder
         }
     }
 
+    /// <summary>
+    /// Minimum samples a bin needs before it may drive an undervolt plan.
+    /// Drawing the curve tolerates thin bins (>= 2); a hardware write does not:
+    /// a single transition-glitched sample (voltage and clock are read by
+    /// separate driver calls) can pair a low voltage with a high clock.
+    /// </summary>
+    public const long PlanMinBinSamples = 20;
+
     /// <summary>The measured curve, voltage-ascending.</summary>
-    public IReadOnlyList<VfBin> GetCurve()
+    public IReadOnlyList<VfBin> GetCurve(long minSamples = 2)
     {
         lock (_lock)
         {
             return _bins
-                .Where(kv => kv.Value.Samples >= 2)
+                .Where(kv => kv.Value.Samples >= minSamples)
                 .Select(kv => new VfBin(
                     kv.Key * BinMv,
                     kv.Value.MaxClock,
@@ -113,9 +121,12 @@ public sealed class VfCurveRecorder
     /// Interpolates the measured max clock at a voltage. Returns null when the
     /// curve has no coverage near that voltage (never observed there).
     /// </summary>
-    public double? ClockAt(double voltageMv)
+    public double? ClockAt(double voltageMv, long minSamples = 2) =>
+        ClockPointAt(voltageMv, minSamples)?.ClockMHz;
+
+    private (double ClockMHz, long Samples)? ClockPointAt(double voltageMv, long minSamples)
     {
-        var curve = GetCurve();
+        var curve = GetCurve(minSamples);
         if (curve.Count == 0)
         {
             return null;
@@ -123,7 +134,9 @@ public sealed class VfCurveRecorder
 
         if (voltageMv <= curve[0].VoltageMv)
         {
-            return voltageMv >= curve[0].VoltageMv - (BinMv * 3) ? curve[0].MaxClockMHz : null;
+            return voltageMv >= curve[0].VoltageMv - (BinMv * 3)
+                ? (curve[0].MaxClockMHz, curve[0].Samples)
+                : null;
         }
 
         for (int i = 1; i < curve.Count; i++)
@@ -133,11 +146,13 @@ public sealed class VfCurveRecorder
                 var a = curve[i - 1];
                 var b = curve[i];
                 double t = (voltageMv - a.VoltageMv) / (b.VoltageMv - a.VoltageMv);
-                return a.MaxClockMHz + (t * (b.MaxClockMHz - a.MaxClockMHz));
+                return (a.MaxClockMHz + (t * (b.MaxClockMHz - a.MaxClockMHz)), Math.Min(a.Samples, b.Samples));
             }
         }
 
-        return voltageMv <= curve[^1].VoltageMv + (BinMv * 3) ? curve[^1].MaxClockMHz : null;
+        return voltageMv <= curve[^1].VoltageMv + (BinMv * 3)
+            ? (curve[^1].MaxClockMHz, curve[^1].Samples)
+            : null;
     }
 
     /// <summary>
@@ -146,9 +161,12 @@ public sealed class VfCurveRecorder
     /// difference, plus a clock lock so the GPU never boosts past the target (which
     /// would require more voltage). Returns null when the curve lacks coverage.
     /// </summary>
-    public UndervoltPlan? PlanUndervolt(double targetVoltageMv, double targetClockMHz, int currentOffsetMHz)
+    public UndervoltPlan? PlanUndervolt(
+        double targetVoltageMv, double targetClockMHz, int currentOffsetMHz, TuningCapabilities? caps = null)
     {
-        if (ClockAt(targetVoltageMv) is not double measuredClock)
+        // Plans drive hardware writes, so they require well-populated bins
+        // (PlanMinBinSamples), unlike merely drawing the curve.
+        if (ClockPointAt(targetVoltageMv, PlanMinBinSamples) is not var (measuredClock, binSamples))
         {
             return null;
         }
@@ -156,12 +174,30 @@ public sealed class VfCurveRecorder
         // The measured curve already includes the current offset, so the delta is
         // added on top of it.
         int requiredOffset = (int)Math.Round(currentOffsetMHz + (targetClockMHz - measuredClock));
+        uint lockClock = (uint)Math.Round(Math.Max(0, targetClockMHz));
+
+        // Refuse plans that cannot be applied instead of describing nonsense
+        // in a confident tone. With driver capabilities, validate against the
+        // real ranges; without them, against the same schema bounds the
+        // profile validator enforces.
+        if (caps is { SupportsCoreOffset: true } &&
+            (requiredOffset < caps.CoreOffsetMinMHz || requiredOffset > caps.CoreOffsetMaxMHz))
+        {
+            return null;
+        }
+
+        if (requiredOffset is < -1500 or > 1500 || lockClock is < 210 or > 4500)
+        {
+            return null;
+        }
+
         return new UndervoltPlan(
             TargetVoltageMv: targetVoltageMv,
             TargetClockMHz: targetClockMHz,
             MeasuredClockAtVoltage: measuredClock,
             CoreOffsetMHz: requiredOffset,
-            LockClockMHz: (uint)Math.Round(targetClockMHz));
+            LockClockMHz: lockClock,
+            BinSamples: binSamples);
     }
 
     // --- Persistence ---------------------------------------------------------
@@ -206,12 +242,28 @@ public sealed class VfCurveRecorder
                 return;
             }
 
+            // Persisted bins get the same bounds Add() enforces — a corrupted
+            // or hand-edited file must not feed arbitrary clocks into
+            // PlanUndervolt (which turns them into hardware writes).
+            int dropped = 0;
             lock (_lock)
             {
                 _bins.Clear();
                 TotalSamples = 0;
                 foreach (var entry in data)
                 {
+                    double voltage = entry.Key * BinMv;
+                    double avg = entry.Samples > 0 ? entry.ClockSum / entry.Samples : 0;
+                    if (voltage is < MinVoltageMv or > MaxVoltageMv ||
+                        entry.Samples <= 0 ||
+                        entry.MaxClock is < 200 or > 5000 ||
+                        avg is < 200 or > 5000 ||
+                        avg > entry.MaxClock + 1)
+                    {
+                        dropped++;
+                        continue;
+                    }
+
                     _bins[entry.Key] = new Bin
                     {
                         MaxClock = entry.MaxClock,
@@ -220,6 +272,11 @@ public sealed class VfCurveRecorder
                     };
                     TotalSamples += entry.Samples;
                 }
+            }
+
+            if (dropped > 0)
+            {
+                Diagnostics.Log.Info($"V/F curve load: dropped {dropped} out-of-bounds bin(s) from {file}.");
             }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
@@ -234,10 +291,11 @@ public sealed record UndervoltPlan(
     double TargetClockMHz,
     double MeasuredClockAtVoltage,
     int CoreOffsetMHz,
-    uint LockClockMHz)
+    uint LockClockMHz,
+    long BinSamples)
 {
     public string Describe() =>
         $"Hold {TargetClockMHz:F0} MHz at ~{TargetVoltageMv:F0} mV: " +
         $"core offset {(CoreOffsetMHz >= 0 ? "+" : string.Empty)}{CoreOffsetMHz} MHz with the clock locked at {LockClockMHz} MHz " +
-        $"(measured {MeasuredClockAtVoltage:F0} MHz at that voltage today).";
+        $"(measured {MeasuredClockAtVoltage:F0} MHz at that voltage today, {BinSamples} samples in that bin).";
 }

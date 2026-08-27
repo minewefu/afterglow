@@ -119,7 +119,22 @@ public partial class MainViewModel : ObservableObject
             Application.Current?.Dispatcher.BeginInvoke(() => OnGameExited(rule));
         services.TdrWatchdog.DriverResetDetected += description =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnDriverReset(description));
-        services.Telemetry.SnapshotTaken += CheckAlerts;
+        // Alerts end in a WinForms NotifyIcon balloon, which is not
+        // thread-safe — marshal off the telemetry polling thread like every
+        // other cross-thread handler here.
+        services.Telemetry.SnapshotTaken += snapshot =>
+            Application.Current?.Dispatcher.BeginInvoke(() => CheckAlerts(snapshot));
+
+        // A failing fan command (lost elevation, driver refusal) must reach
+        // the user, not just the log.
+        foreach (var fans in services.FanControl.Values)
+        {
+            fans.CommandFailed += rc =>
+                Application.Current?.Dispatcher.BeginInvoke(() =>
+                    TrayAlert?.Invoke(
+                        "Fan command failed",
+                        $"The driver refused a fan command ({rc}). Fan control may need administrator rights."));
+        }
     }
 
     /// <summary>Raised for tray balloon alerts (title, message).</summary>
