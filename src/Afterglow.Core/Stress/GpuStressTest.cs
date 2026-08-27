@@ -17,13 +17,37 @@ public enum StressState
     Failed,
 }
 
+public enum StressPattern
+{
+    /// <summary>Continuous full load — the classic burn for sustained-clock validation.</summary>
+    Sustained,
+
+    /// <summary>
+    /// Load/idle cycling that forces P-state and memory-clock transitions — the
+    /// regime where marginal memory offsets fail even though they pass any
+    /// sustained burn. VRAM retention is re-verified across every transition.
+    /// </summary>
+    Transitions,
+
+    /// <summary>
+    /// Short saturating bursts with idle gaps: each burst rides the boost
+    /// overshoot up through the top clock bins before power management clamps,
+    /// then falls back to idle — sweeping the whole clock range dozens of
+    /// times a minute. This is the bursty desktop regime behind "passed the
+    /// stress test, crashed on the desktop".
+    /// </summary>
+    BoostExcursions,
+}
+
 public sealed record StressProgress(
     StressState State,
     TimeSpan Elapsed,
     double DispatchesPerSecond,
     long TotalDispatches,
     long ErrorCount,
-    string? Detail);
+    string? Detail,
+    string? Phase = null,
+    long Transitions = 0);
 
 /// <summary>
 /// Compute burn test with bit-exact error detection, designed to load both the
@@ -134,6 +158,9 @@ public sealed class GpuStressTest : IDisposable
     /// <summary>Source-buffer size in MiB (streamed working set; clamped to VRAM/6).</summary>
     public uint WorkingSetMiB { get; set; } = 512;
 
+    /// <summary>Load shape — sustained burn, transition cycling, or boost excursions.</summary>
+    public StressPattern Pattern { get; set; } = StressPattern.Sustained;
+
     public event Action<StressProgress>? ProgressChanged;
 
     public StressProgress Progress
@@ -177,9 +204,11 @@ public sealed class GpuStressTest : IDisposable
         _thread?.Join(timeout);
     }
 
-    private void Report(StressState state, TimeSpan elapsed, double dps, long dispatches, long errors, string? detail = null)
+    private void Report(
+        StressState state, TimeSpan elapsed, double dps, long dispatches, long errors,
+        string? detail = null, string? phase = null, long transitions = 0)
     {
-        var progress = new StressProgress(state, elapsed, dps, dispatches, errors, detail);
+        var progress = new StressProgress(state, elapsed, dps, dispatches, errors, detail, phase, transitions);
         lock (_lock)
         {
             _progress = progress;
@@ -303,53 +332,190 @@ public sealed class GpuStressTest : IDisposable
                 var lastReport = TimeSpan.Zero;
                 var lastCheck = TimeSpan.Zero;
                 long dispatchesAtLastReport = 0;
+                long transitions = 0;
+                bool healthy = true;
 
-                while (!_stop)
+                const string MismatchUnderLoad =
+                    "Computation mismatch — the GPU returned different results for identical work. " +
+                    "The current clocks are unstable.";
+
+                // Shared verification: bit-exact slice compare + device-removed check.
+                // Reports and flips `healthy` on failure so pattern loops can exit.
+                bool Verify(string failureDetail)
                 {
-                    for (int i = 0; i < 4 && !_stop; i++)
+                    var elapsed = stopwatch.Elapsed;
+                    var slice = ReadSlice();
+                    if (!slice.AsSpan().SequenceEqual(reference))
+                    {
+                        errors++;
+                        Report(StressState.ArtifactDetected, elapsed,
+                            Rate(dispatches, dispatchesAtLastReport, elapsed, lastReport), dispatches, errors,
+                            failureDetail, transitions: transitions);
+                        healthy = false;
+                        return false;
+                    }
+
+                    var reason = device.DeviceRemovedReason;
+                    if (reason.Failure)
+                    {
+                        Report(StressState.DeviceLost, elapsed, 0, dispatches, errors,
+                            $"The GPU device was removed/reset (0x{reason.Code:X8}) — driver TDR. " +
+                            "The current clocks are unstable.", transitions: transitions);
+                        healthy = false;
+                        return false;
+                    }
+
+                    return true;
+                }
+
+                void Tick(string? phase)
+                {
+                    var elapsed = stopwatch.Elapsed;
+                    if ((elapsed - lastReport).TotalSeconds >= 1)
+                    {
+                        Report(StressState.Running, elapsed,
+                            Rate(dispatches, dispatchesAtLastReport, elapsed, lastReport), dispatches, errors,
+                            phase: phase, transitions: transitions);
+                        dispatchesAtLastReport = dispatches;
+                        lastReport = elapsed;
+                    }
+                }
+
+                void DispatchBatch(int count)
+                {
+                    for (int i = 0; i < count && !_stop; i++)
                     {
                         context.Dispatch(ThreadCount / ThreadsPerGroup, 1, 1);
                         dispatches++;
                     }
 
                     context.Flush();
-
-                    var elapsed = stopwatch.Elapsed;
-
-                    if ((elapsed - lastCheck).TotalSeconds >= 2)
-                    {
-                        lastCheck = elapsed;
-                        var slice = ReadSlice();
-                        if (!slice.AsSpan().SequenceEqual(reference))
-                        {
-                            errors++;
-                            Report(StressState.ArtifactDetected, elapsed,
-                                Rate(dispatches, dispatchesAtLastReport, elapsed, lastReport), dispatches, errors,
-                                "Computation mismatch — the GPU returned different results for identical work. " +
-                                "The current clocks are unstable.");
-                            return;
-                        }
-
-                        var reason = device.DeviceRemovedReason;
-                        if (reason.Failure)
-                        {
-                            Report(StressState.DeviceLost, elapsed, 0, dispatches, errors,
-                                $"The GPU device was removed/reset under load (0x{reason.Code:X8}) — driver TDR. " +
-                                "The current clocks are unstable.");
-                            return;
-                        }
-                    }
-
-                    if ((elapsed - lastReport).TotalSeconds >= 1)
-                    {
-                        Report(StressState.Running, elapsed,
-                            Rate(dispatches, dispatchesAtLastReport, elapsed, lastReport), dispatches, errors);
-                        dispatchesAtLastReport = dispatches;
-                        lastReport = elapsed;
-                    }
                 }
 
-                Report(StressState.Stopped, stopwatch.Elapsed, 0, dispatches, errors);
+                bool VerifyDue(string failureDetail)
+                {
+                    var elapsed = stopwatch.Elapsed;
+                    if ((elapsed - lastCheck).TotalSeconds < 2)
+                    {
+                        return true;
+                    }
+
+                    lastCheck = elapsed;
+                    return Verify(failureDetail);
+                }
+
+                switch (Pattern)
+                {
+                    case StressPattern.Transitions:
+                        // Deterministic, slightly irregular cycle lengths exercise
+                        // different retraining timings. Idle phases are long enough
+                        // for the driver to drop P-states and memory clocks.
+                        int[] loadSeconds = [10, 8, 14, 9, 12];
+                        int[] idleSeconds = [14, 18, 12, 20, 16];
+                        int phaseIndex = 0;
+                        while (!_stop && healthy)
+                        {
+                            var loadEnd = stopwatch.Elapsed +
+                                TimeSpan.FromSeconds(loadSeconds[phaseIndex % loadSeconds.Length]);
+                            while (!_stop && healthy && stopwatch.Elapsed < loadEnd)
+                            {
+                                DispatchBatch(4);
+                                if (!VerifyDue(MismatchUnderLoad))
+                                {
+                                    return;
+                                }
+
+                                Tick("load");
+                            }
+
+                            if (_stop || !healthy || !Verify(MismatchUnderLoad))
+                            {
+                                break;
+                            }
+
+                            var idleEnd = stopwatch.Elapsed +
+                                TimeSpan.FromSeconds(idleSeconds[phaseIndex % idleSeconds.Length]);
+                            while (!_stop && stopwatch.Elapsed < idleEnd)
+                            {
+                                Thread.Sleep(200);
+                                Tick("idle");
+                            }
+
+                            if (_stop)
+                            {
+                                break;
+                            }
+
+                            transitions++;
+
+                            // No new work has run since before the idle phase: a
+                            // mismatch here means VRAM contents changed while the
+                            // memory clock switched down and back.
+                            if (!Verify(
+                                "Results changed across an idle transition with no new GPU work — VRAM contents " +
+                                "were corrupted while the memory clock switched. The memory offset is unstable " +
+                                "at clock transitions."))
+                            {
+                                break;
+                            }
+
+                            phaseIndex++;
+                        }
+
+                        break;
+
+                    case StressPattern.BoostExcursions:
+                        // Steady light load never reaches max boost — the driver
+                        // parks it in efficient mid bins (measured on Blackwell).
+                        // What does reach the top bins is the boost OVERSHOOT: the
+                        // first few hundred ms of a saturating burst run at maximum
+                        // clocks before power management clamps down. Short bursts
+                        // with idle gaps ride that overshoot over and over — the
+                        // exact excursion behind "passed the burn, crashed on the
+                        // desktop" — and sweep every clock bin in between.
+                        while (!_stop && healthy)
+                        {
+                            var burstEnd = stopwatch.Elapsed + TimeSpan.FromMilliseconds(250);
+                            while (!_stop && stopwatch.Elapsed < burstEnd)
+                            {
+                                DispatchBatch(2);
+                            }
+
+                            if (!VerifyDue(
+                                "Computation mismatch during a boost excursion — the GPU miscalculates at " +
+                                "its top boost clocks. This core offset is unsafe even if heavy loads pass."))
+                            {
+                                return;
+                            }
+
+                            transitions++;
+                            Tick("burst");
+                            Thread.Sleep(1250);
+                        }
+
+                        break;
+
+                    default:
+                        while (!_stop && healthy)
+                        {
+                            DispatchBatch(4);
+                            if (!VerifyDue(MismatchUnderLoad))
+                            {
+                                return;
+                            }
+
+                            Tick(null);
+                        }
+
+                        break;
+                }
+
+                if (!healthy)
+                {
+                    return;
+                }
+
+                Report(StressState.Stopped, stopwatch.Elapsed, 0, dispatches, errors, transitions: transitions);
             }
         }
         catch (SharpGenException ex)

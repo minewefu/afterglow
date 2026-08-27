@@ -18,6 +18,9 @@ public static class AppPaths
     /// <summary>Written while tuning values are applied; consulted on startup for crash recovery.</summary>
     public static string AppliedStateFile => Path.Combine(Root, "applied-state.json");
 
+    /// <summary>Flight-recorder telemetry ring and crash-forensics reports.</summary>
+    public static string FlightDir => Path.Combine(Root, "flight");
+
     public static void EnsureCreated()
     {
         Directory.CreateDirectory(Root);

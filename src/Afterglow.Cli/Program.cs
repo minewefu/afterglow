@@ -44,6 +44,7 @@ internal static class Program
               reset [--gpu N]               Restore all driver defaults.
               fps [--seconds N]             Capture FPS/frametimes for all presenting apps.
               stress [--seconds N]          Burn test with bit-exact error detection.
+                     [--pattern P]          sustained (default) | transitions | excursions
                      [--intensity N]
               vfcurve [--probe]             Record and print the measured voltage/frequency
                       [--seconds N]         curve. --probe locks each clock step under load

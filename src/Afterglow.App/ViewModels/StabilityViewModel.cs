@@ -20,6 +20,22 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
     [ObservableProperty] private string _stressElapsedText = string.Empty;
     [ObservableProperty] private double _intensity = 4096;
 
+    /// <summary>0 = sustained burn, 1 = transition cycling, 2 = boost excursions.</summary>
+    [ObservableProperty] private int _patternIndex;
+
+    public string PatternDescription => PatternIndex switch
+    {
+        1 => "Cycles between load and idle to force P-state and memory-clock transitions — the regime " +
+             "where memory offsets fail even though they pass sustained burns. VRAM contents are " +
+             "re-verified across every transition; a mismatch there is transition corruption, caught red-handed.",
+        2 => "Short saturating bursts with idle gaps: each burst rides the boost overshoot through the top " +
+             "clock bins before power management clamps, sweeping the full clock range dozens of times a " +
+             "minute — the bursty desktop regime where raw core offsets crash even after passing burns.",
+        _ => "Continuous full load with bit-exact verification — validates sustained clocks and power. " +
+             "Note: passing here does not validate light-load boost or clock transitions; run all three " +
+             "patterns before trusting a daily overclock.",
+    };
+
     [ObservableProperty] private bool _stepperRunning;
     [ObservableProperty] private string _stepperPhaseText = string.Empty;
     [ObservableProperty] private double _stepperProgress;
@@ -38,6 +54,23 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
 
     [ObservableProperty]
     private string _liveStatsText = string.Empty;
+
+    public bool HasCrashReport => _services.LastCrashReport is not null;
+
+    public string CrashReportHeadline => _services.LastCrashReport?.Headline ?? string.Empty;
+
+    public string CrashReportText => _services.LastCrashReport?.ReportText ??
+        "No crash captured. If a session ever ends in a hard reset, the flight recorder's last seconds " +
+        "are correlated with the Windows event log and the postmortem appears here.";
+
+    [RelayCommand]
+    private void CopyCrashReport()
+    {
+        if (_services.LastCrashReport is { } report)
+        {
+            Clipboard.SetText(report.ReportText);
+        }
+    }
 
     public StabilityViewModel(AppServices services)
     {
@@ -66,6 +99,15 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
 
     partial void OnIntensityChanged(double value) => OnPropertyChanged(nameof(IntensityLabel));
 
+    partial void OnPatternIndexChanged(int value) => OnPropertyChanged(nameof(PatternDescription));
+
+    private StressPattern SelectedPattern => PatternIndex switch
+    {
+        1 => StressPattern.Transitions,
+        2 => StressPattern.BoostExcursions,
+        _ => StressPattern.Sustained,
+    };
+
     [RelayCommand]
     private void ToggleStress()
     {
@@ -76,12 +118,13 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
         }
 
         _stress?.Dispose();
-        _stress = new GpuStressTest { IterationsPerDispatch = (uint)Intensity };
+        _stress = new GpuStressTest { IterationsPerDispatch = (uint)Intensity, Pattern = SelectedPattern };
         _stress.ProgressChanged += progress =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnStressProgress(progress));
         StressFailed = false;
         StressRunning = true;
         StressStatusText = "Burning…";
+        _services.Flight?.Marker($"stress-start pattern={SelectedPattern}");
         _stress.Start();
     }
 
@@ -95,11 +138,21 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
         switch (progress.State)
         {
             case StressState.Running:
-                StressStatusText = "Burning — all results verified correct so far.";
+                StressStatusText = progress.Phase switch
+                {
+                    "load" => $"Transition cycling — load phase. {progress.Transitions} transitions verified clean so far.",
+                    "idle" => $"Transition cycling — idle phase (clocks dropping). {progress.Transitions} transitions verified clean so far.",
+                    "burst" => $"Boost excursions — riding the boost overshoot into the top clock bins. " +
+                               $"{progress.Transitions} excursions verified clean so far.",
+                    _ => "Burning — all results verified correct so far.",
+                };
                 break;
             case StressState.Stopped:
                 StressRunning = false;
-                StressStatusText = $"Stopped after {progress.Elapsed:hh\\:mm\\:ss} with 0 errors — stable under this load.";
+                StressStatusText = progress.Transitions > 0
+                    ? $"Stopped after {progress.Elapsed:hh\\:mm\\:ss} with 0 errors across {progress.Transitions} " +
+                      "clock excursions — stable in this regime."
+                    : $"Stopped after {progress.Elapsed:hh\\:mm\\:ss} with 0 errors — stable under this load.";
                 break;
             case StressState.ArtifactDetected:
                 StressRunning = false;
@@ -118,6 +171,11 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
                 break;
             default:
                 break;
+        }
+
+        if (progress.State is not (StressState.Running or StressState.Idle))
+        {
+            _services.Flight?.Marker($"stress-end state={progress.State} transitions={progress.Transitions}");
         }
     }
 

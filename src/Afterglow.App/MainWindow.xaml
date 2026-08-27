@@ -108,24 +108,43 @@
             </StackPanel>
         </Grid>
 
-        <!-- Crash-recovery banner -->
-        <Border Grid.Row="1" Background="#2E1E12" BorderBrush="{StaticResource Warn}" BorderThickness="0,0,0,1"
-                Padding="16,10"
-                Visibility="{Binding ShowCrashBanner, Converter={x:Static views:Converters.BoolToVisibility}}">
-            <Grid>
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="Auto" />
-                    <ColumnDefinition Width="Auto" />
-                </Grid.ColumnDefinitions>
-                <TextBlock Text="{Binding CrashBannerText}" TextWrapping="Wrap" Foreground="{StaticResource Warn}"
-                           FontSize="12.5" VerticalAlignment="Center" />
-                <Button Grid.Column="1" Style="{StaticResource PrimaryButton}" Content="Reset to defaults"
-                        Command="{Binding ResetAfterCrashCommand}" Margin="12,0,0,0" />
-                <Button Grid.Column="2" Style="{StaticResource GhostButton}" Content="Keep settings"
-                        Command="{Binding DismissCrashBannerCommand}" Margin="8,0,0,0" />
-            </Grid>
-        </Border>
+        <!-- Crash-recovery + crash-forensics banners -->
+        <StackPanel Grid.Row="1">
+            <Border Background="#2E1E12" BorderBrush="{StaticResource Warn}" BorderThickness="0,0,0,1"
+                    Padding="16,10"
+                    Visibility="{Binding ShowCrashBanner, Converter={x:Static views:Converters.BoolToVisibility}}">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="{Binding CrashBannerText}" TextWrapping="Wrap" Foreground="{StaticResource Warn}"
+                               FontSize="12.5" VerticalAlignment="Center" />
+                    <Button Grid.Column="1" Style="{StaticResource PrimaryButton}" Content="Reset to defaults"
+                            Command="{Binding ResetAfterCrashCommand}" Margin="12,0,0,0" />
+                    <Button Grid.Column="2" Style="{StaticResource GhostButton}" Content="Keep settings"
+                            Command="{Binding DismissCrashBannerCommand}" Margin="8,0,0,0" />
+                </Grid>
+            </Border>
+            <Border Background="#2E1E12" BorderBrush="{StaticResource Warn}" BorderThickness="0,0,0,1"
+                    Padding="16,10"
+                    Visibility="{Binding ShowForensicsBanner, Converter={x:Static views:Converters.BoolToVisibility}}">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="{Binding ForensicsBannerText}" TextWrapping="Wrap" Foreground="{StaticResource Warn}"
+                               FontSize="12.5" VerticalAlignment="Center" />
+                    <Button Grid.Column="1" Style="{StaticResource PrimaryButton}" Content="View crash report"
+                            Command="{Binding ViewCrashReportCommand}" Margin="12,0,0,0" />
+                    <Button Grid.Column="2" Style="{StaticResource GhostButton}" Content="Dismiss"
+                            Command="{Binding DismissForensicsBannerCommand}" Margin="8,0,0,0" />
+                </Grid>
+            </Border>
+        </StackPanel>
 
         <!-- Body -->
         <Grid Grid.Row="2">

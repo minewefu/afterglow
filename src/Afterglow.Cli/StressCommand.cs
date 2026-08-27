@@ -10,6 +10,7 @@ internal static class StressCommand
     {
         int seconds = 30;
         uint intensity = 4096;
+        var pattern = StressPattern.Sustained;
         for (int i = 1; i < args.Length - 1; i++)
         {
             if (args[i] == "--seconds" &&
@@ -23,9 +24,19 @@ internal static class StressCommand
             {
                 intensity = Math.Clamp(n, 128, 16_384);
             }
+
+            if (args[i] == "--pattern")
+            {
+                pattern = args[i + 1].ToUpperInvariant() switch
+                {
+                    "TRANSITIONS" or "TRANSITION" => StressPattern.Transitions,
+                    "EXCURSIONS" or "EXCURSION" or "BURSTS" or "DWELL" => StressPattern.BoostExcursions,
+                    _ => StressPattern.Sustained,
+                };
+            }
         }
 
-        using var stress = new GpuStressTest { IterationsPerDispatch = intensity };
+        using var stress = new GpuStressTest { IterationsPerDispatch = intensity, Pattern = pattern };
         var done = new ManualResetEventSlim(false);
         StressProgress? final = null;
 
@@ -33,7 +44,10 @@ internal static class StressCommand
         {
             if (progress.State == StressState.Running)
             {
-                Console.Write($"\r  {progress.Elapsed:hh\\:mm\\:ss}  {progress.DispatchesPerSecond,7:F1} dispatches/s  " +
+                string phase = progress.Phase is { } p
+                    ? $"[{p}] transitions: {progress.Transitions}  "
+                    : string.Empty;
+                Console.Write($"\r  {progress.Elapsed:hh\\:mm\\:ss}  {phase}{progress.DispatchesPerSecond,7:F1} dispatches/s  " +
                               $"{progress.TotalDispatches,8} total  errors: {progress.ErrorCount}   ");
             }
             else
@@ -43,7 +57,9 @@ internal static class StressCommand
             }
         };
 
-        Console.WriteLine($"Burn test: {seconds} s at intensity {intensity} (bit-exact verification every ~2 s). Ctrl+C aborts.");
+        Console.WriteLine(
+            $"Burn test: {seconds} s at intensity {intensity}, pattern {pattern} " +
+            "(bit-exact verification every ~2 s). Ctrl+C aborts.");
         Console.CancelKeyPress += (_, e) =>
         {
             e.Cancel = true;
@@ -58,8 +74,11 @@ internal static class StressCommand
         }
 
         Console.WriteLine();
-        Console.WriteLine($"Result: {final!.State} after {final.Elapsed:hh\\:mm\\:ss}, " +
-                          $"{final.TotalDispatches} dispatches, {final.ErrorCount} errors.");
+        string transitionsNote = final!.Transitions > 0
+            ? $", {final.Transitions} clock transitions verified"
+            : string.Empty;
+        Console.WriteLine($"Result: {final.State} after {final.Elapsed:hh\\:mm\\:ss}, " +
+                          $"{final.TotalDispatches} dispatches, {final.ErrorCount} errors{transitionsNote}.");
         if (final.Detail is { } detail)
         {
             Console.WriteLine($"  {detail}");

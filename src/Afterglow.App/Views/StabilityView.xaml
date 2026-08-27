@@ -20,6 +20,23 @@
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="170" />
                             <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="Pattern" FontSize="12.5" VerticalAlignment="Center" />
+                        <ComboBox Grid.Column="1" SelectedIndex="{Binding PatternIndex}" MaxWidth="320"
+                                  HorizontalAlignment="Left"
+                                  IsEnabled="{Binding StressRunning, Converter={x:Static views:Converters.InverseBool}}">
+                            <ComboBoxItem Content="Sustained burn — full load" />
+                            <ComboBoxItem Content="Transition cycling — load/idle clock switches" />
+                            <ComboBoxItem Content="Boost excursions — bursty desktop-style load" />
+                        </ComboBox>
+                    </Grid>
+                    <TextBlock Text="{Binding PatternDescription}" FontSize="11.5" Foreground="{StaticResource TextFaint}"
+                               TextWrapping="Wrap" Margin="170,6,0,0" />
+
+                    <Grid Margin="0,12,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="170" />
+                            <ColumnDefinition Width="*" />
                             <ColumnDefinition Width="190" />
                         </Grid.ColumnDefinitions>
                         <TextBlock Text="Load intensity" FontSize="12.5" VerticalAlignment="Center" />
@@ -137,6 +154,28 @@
                     <Border Background="{StaticResource Bg1}" CornerRadius="7" Padding="10" Margin="0,10,0,0"
                             MinHeight="120">
                         <TextBlock Text="{Binding StepperLog}" FontFamily="{StaticResource MonoFont}" FontSize="11"
+                                   Foreground="{StaticResource TextMuted}" TextWrapping="Wrap" />
+                    </Border>
+                </StackPanel>
+            </Border>
+
+            <!-- Crash forensics -->
+            <Border Style="{StaticResource Card}" Margin="0,10,0,0">
+                <StackPanel>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="Crash forensics" FontWeight="SemiBold" FontSize="13.5" />
+                        <Button Grid.Column="1" Style="{StaticResource GhostButton}" Content="Copy report"
+                                Command="{Binding CopyCrashReportCommand}"
+                                Visibility="{Binding HasCrashReport, Converter={x:Static views:Converters.BoolToVisibility}}" />
+                    </Grid>
+                    <TextBlock Text="The flight recorder keeps the last minutes of telemetry on disk. When a session ends in a hard crash, its final seconds are correlated with the Windows event log and explained here in plain language."
+                               FontSize="11.5" Foreground="{StaticResource TextFaint}" TextWrapping="Wrap" Margin="0,2,0,0" />
+                    <Border Background="{StaticResource Bg1}" CornerRadius="7" Padding="12" Margin="0,10,0,0">
+                        <TextBlock Text="{Binding CrashReportText}" FontFamily="{StaticResource MonoFont}" FontSize="11"
                                    Foreground="{StaticResource TextMuted}" TextWrapping="Wrap" />
                     </Border>
                 </StackPanel>

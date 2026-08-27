@@ -243,7 +243,15 @@ internal static class McpCommand
                 "signal for an autonomous tuning loop: apply offset -> run_stress -> check state/errors -> step.",
                 Schema(
                     ("seconds", "integer", "Burn duration, 5-600 (default 30)", false),
-                    ("intensity", "integer", "Load knob 512-16384 (default 4096)", false)),
+                    ("intensity", "integer", "Load knob 512-16384 (default 4096)", false),
+                    ("pattern", "string",
+                        "Load shape: 'sustained' (default, full load), 'transitions' (load/idle cycling that " +
+                        "forces memory-clock transitions — catches memory offsets that pass sustained burns " +
+                        "but crash at the desktop; VRAM retention is verified across each transition), or " +
+                        "'excursions' (short saturating bursts riding the boost overshoot through the top " +
+                        "clock bins — the bursty desktop regime sustained burns never exercise). Validate " +
+                        "all three before trusting a daily config.",
+                        false)),
                 args => gpu is null ? RequireGpu() : RunStress(gpu, args)),
 
             new ToolDef(
@@ -372,8 +380,14 @@ internal static class McpCommand
     {
         int seconds = Math.Clamp(args?["seconds"]?.GetValue<int>() ?? 30, 5, 600);
         uint intensity = Math.Clamp(args?["intensity"]?.GetValue<uint>() ?? 4096, 512, 16384);
+        var pattern = (args?["pattern"]?.GetValue<string>()?.ToUpperInvariant()) switch
+        {
+            "TRANSITIONS" or "TRANSITION" => StressPattern.Transitions,
+            "EXCURSIONS" or "EXCURSION" or "BURSTS" or "DWELL" => StressPattern.BoostExcursions,
+            _ => StressPattern.Sustained,
+        };
 
-        using var stress = new GpuStressTest { IterationsPerDispatch = intensity };
+        using var stress = new GpuStressTest { IterationsPerDispatch = intensity, Pattern = pattern };
         var done = new ManualResetEventSlim(false);
         StressProgress? final = null;
         double rateSum = 0;
@@ -419,6 +433,8 @@ internal static class McpCommand
         {
             stable,
             state = final.State.ToString(),
+            pattern = pattern.ToString(),
+            transitions_verified = final.Transitions,
             seconds_run = final.Elapsed.TotalSeconds,
             error_count = final.ErrorCount,
             total_dispatches = final.TotalDispatches,

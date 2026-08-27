@@ -44,6 +44,12 @@ public sealed class AppServices : IDisposable
     /// <summary>Measured voltage/frequency curve, fed continuously from telemetry.</summary>
     public required Core.Tuning.VfCurveRecorder VfCurve { get; init; }
 
+    /// <summary>Always-on telemetry black box (null in demo mode).</summary>
+    public Core.Diagnostics.FlightRecorder? Flight { get; init; }
+
+    /// <summary>Postmortem of the previous session, when it ended in a crash.</summary>
+    public Core.Diagnostics.CrashReport? LastCrashReport { get; init; }
+
     private AppSettings _settings = new();
 
     public AppSettings Settings => _settings;
@@ -131,6 +137,35 @@ public sealed class AppServices : IDisposable
         vfCurve.Load();
         telemetry.SnapshotTaken += vfCurve.Add;
 
+        // Analyze the previous flight recording BEFORE the new recorder
+        // rotates it, then start this session's black box.
+        var crashReport = Core.Diagnostics.CrashForensics.AnalyzePreviousSession(AppPaths.FlightDir);
+        var flight = new Core.Diagnostics.FlightRecorder(AppPaths.FlightDir);
+        int flightTick = 0;
+        telemetry.SnapshotTaken += snapshot =>
+        {
+            if (snapshot.DeviceIndex != 0)
+            {
+                return;
+            }
+
+            flight.Record(snapshot);
+
+            // Offsets change rarely; sample once a minute so CLI-applied tuning
+            // is captured too (dedup happens inside the recorder).
+            if (flightTick++ % 60 == 0 && manager.Gpus.Count > 0)
+            {
+                try
+                {
+                    var current = manager.Gpus[0].Tuner.ReadCurrent();
+                    flight.RecordOffsets(current.CoreOffsetMHz, current.MemOffsetMHz);
+                }
+                catch (InvalidOperationException)
+                {
+                }
+            }
+        };
+
         telemetry.Start();
 
         var services = new AppServices
@@ -147,6 +182,8 @@ public sealed class AppServices : IDisposable
             GameWatcher = new GameWatcher(),
             TdrWatchdog = new TdrWatchdog(),
             VfCurve = vfCurve,
+            Flight = flight,
+            LastCrashReport = crashReport,
         };
         services.InitializeSettings(SettingsStore.Load());
         services.GameWatcher.Start();
@@ -171,6 +208,7 @@ public sealed class AppServices : IDisposable
         FrameMetrics.Dispose();
         ActiveCsvLogger?.Dispose();
         Telemetry.Dispose();
+        Flight?.Dispose();
         Manager?.Dispose();
     }
 }

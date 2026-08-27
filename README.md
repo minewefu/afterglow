@@ -92,6 +92,15 @@ Afterglow is a from-scratch, MIT-licensed answer:
 - Built-in **burn test with bit-exact error detection**: a deterministic compute workload is
   verified result-for-result — a single flipped bit reports "unstable" instead of hoping you
   notice artifacts. Driver resets (TDR) during load are caught and reported
+- **Stress patterns for the crashes other tools can't catch**: *Transition cycling* forces
+  P-state/memory-clock switches and re-verifies VRAM retention across every transition
+  (memory offsets that pass sustained burns routinely fail exactly there), and *Boost
+  excursions* rides the boost overshoot through the top clock bins — the bursty desktop
+  regime a power-limited burn never reaches
+- **Crash forensics**: an always-on flight recorder keeps recent telemetry on disk; after a
+  hard crash, the next launch correlates its final minutes with the Windows event log and
+  explains the failure in plain language ("hard reset 3 min after load ended with +2000 MHz
+  memory — matches transition instability"), instead of leaving you guessing
 - **Guided stability stepper**: walks your core offset up step by step, burn-testing each,
   backs off on the first failure and runs a confirmation pass — an open-method alternative
   to closed OC scanners

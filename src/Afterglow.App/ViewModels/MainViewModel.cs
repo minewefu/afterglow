@@ -42,6 +42,12 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty]
     private string _crashBannerText = string.Empty;
 
+    [ObservableProperty]
+    private bool _showForensicsBanner;
+
+    [ObservableProperty]
+    private string _forensicsBannerText = string.Empty;
+
     public string GpuName { get; }
 
     public string DriverText { get; }
@@ -77,6 +83,13 @@ public partial class MainViewModel : ObservableObject
         _currentPage = Dashboard;
 
         CheckCrashRecovery();
+
+        if (services.LastCrashReport is { } crash &&
+            DateTimeOffset.Now - crash.CrashedAt < TimeSpan.FromHours(72))
+        {
+            ShowForensicsBanner = true;
+            ForensicsBannerText = $"Last session ended in a crash. {crash.Headline}";
+        }
 
         services.GameWatcher.GameStarted += rule =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnGameStarted(rule));
@@ -422,6 +435,16 @@ public partial class MainViewModel : ObservableObject
         AppliedStateStore.MarkCleanShutdown();
         ShowCrashBanner = false;
     }
+
+    [RelayCommand]
+    private void ViewCrashReport()
+    {
+        ShowForensicsBanner = false;
+        NavigateTo("stability");
+    }
+
+    [RelayCommand]
+    private void DismissForensicsBanner() => ShowForensicsBanner = false;
 
     [RelayCommand]
     public void NavigateTo(string page)

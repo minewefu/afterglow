@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Stress patterns: alongside the sustained burn, **Transition cycling** forces
+  P-state and memory-clock switches with bit-exact VRAM retention checks across
+  every transition, and **Boost excursions** rides the boost overshoot through
+  the top clock bins — the two regimes where daily overclocks fail after
+  passing every conventional stress test (`--pattern` in the CLI, `pattern`
+  on the MCP `run_stress` tool)
+- Crash forensics: an always-on flight recorder keeps recent telemetry and
+  applied-offset markers on disk; after a hard crash, the next launch
+  correlates the final minutes with the Windows event log (Kernel-Power 41,
+  unexpected shutdown, WHEA, TDR, nvlddmkm) and explains the failure in plain
+  language — banner on launch, full report on the Stability page
+
 ## 1.0.2 — 2026-08-26
 
 - Start with Windows now runs through a Task Scheduler entry that launches
