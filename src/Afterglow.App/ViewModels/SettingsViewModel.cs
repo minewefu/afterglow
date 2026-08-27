@@ -26,6 +26,64 @@ public partial class SettingsViewModel : ObservableObject
     [ObservableProperty] private bool _startWithWindows;
     [ObservableProperty] private string _startWithWindowsNote = string.Empty;
 
+    public System.Collections.ObjectModel.ObservableCollection<AutomationRule> AutomationRules { get; } = [];
+
+    [ObservableProperty] private int _newAutoMetricIndex;
+    [ObservableProperty] private string _newAutoThreshold = "94";
+    [ObservableProperty] private string _newAutoSeconds = "30";
+    [ObservableProperty] private int _newAutoActionIndex;
+    [ObservableProperty] private string _newAutoFanPct = "85";
+    [ObservableProperty] private string _newAutoProfile = string.Empty;
+
+    [RelayCommand]
+    private void AddAutomationRule()
+    {
+        if (!double.TryParse(NewAutoThreshold, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out double threshold) ||
+            !int.TryParse(NewAutoSeconds, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out int seconds))
+        {
+            return;
+        }
+
+        string action = NewAutoActionIndex switch { 1 => "profile", 2 => "reset", _ => "fans" };
+        if (action == "profile" && (NewAutoProfile.Length == 0 || NewAutoProfile == "(none)"))
+        {
+            return;
+        }
+
+        uint fanPct = uint.TryParse(NewAutoFanPct, System.Globalization.NumberStyles.Integer,
+            System.Globalization.CultureInfo.InvariantCulture, out uint pct)
+            ? Math.Clamp(pct, 30u, 100u)
+            : 85u;
+
+        AutomationRules.Add(new AutomationRule
+        {
+            Metric = NewAutoMetricIndex switch { 1 => "memjunction", 2 => "power", _ => "gpu" },
+            Threshold = threshold,
+            ForSeconds = Math.Clamp(seconds, 5, 3600),
+            Action = action,
+            ActionProfile = action == "profile" ? NewAutoProfile : null,
+            ActionFanPct = fanPct,
+        });
+        PersistAutomationRules();
+    }
+
+    [RelayCommand]
+    private void RemoveAutomationRule(AutomationRule? rule)
+    {
+        if (rule is not null && AutomationRules.Remove(rule))
+        {
+            PersistAutomationRules();
+        }
+    }
+
+    private void PersistAutomationRules()
+    {
+        var rules = AutomationRules.ToArray();
+        _services.UpdateSettings(s => s with { AutomationRules = rules });
+    }
+
     [ObservableProperty] private double _alertGpuTemp;
     [ObservableProperty] private double _alertMemTemp;
 
@@ -144,6 +202,12 @@ public partial class SettingsViewModel : ObservableObject
         _loading = true;
         PollingIntervalMs = s.PollingIntervalMs;
         StartWithWindows = Services.StartupTaskService.IsEnabled();
+        AutomationRules.Clear();
+        foreach (var rule in s.AutomationRules)
+        {
+            AutomationRules.Add(rule);
+        }
+
         CloseToTray = s.CloseToTray;
         StartMinimizedToTray = s.StartMinimizedToTray;
         ResetOnDriverCrash = s.ResetOnDriverCrash;

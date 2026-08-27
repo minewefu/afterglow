@@ -170,8 +170,8 @@
 
             <Border Style="{StaticResource Card}" Margin="0,10,0,0">
                 <StackPanel>
-                    <TextBlock Text="Per-game auto profiles" FontWeight="SemiBold" FontSize="13.5" />
-                    <TextBlock Text="When the game launches, its profile is applied automatically; your previous tuning is restored when it exits. Select a profile above, enter the game's exe, and add."
+                    <TextBlock Text="Per-game auto profiles + driver settings" FontWeight="SemiBold" FontSize="13.5" />
+                    <TextBlock Text="When the game launches, its profile is applied automatically; your previous tuning is restored when it exits. Optionally set the NVIDIA driver's own per-game knobs for the exe — frame cap, vsync, low latency — written to the same store the NVIDIA Control Panel edits (persistent, no injection, active even when Afterglow isn't running)."
                                FontSize="11.5" Foreground="{StaticResource TextFaint}" TextWrapping="Wrap" Margin="0,2,0,0" />
                     <Grid Margin="0,10,0,0">
                         <Grid.ColumnDefinitions>
@@ -182,6 +182,19 @@
                         <Button Grid.Column="1" Style="{StaticResource PrimaryButton}" Content="Add rule"
                                 Command="{Binding AddRuleCommand}" Margin="10,0,0,0" />
                     </Grid>
+                    <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                        <TextBlock Text="FPS cap" FontSize="12" Foreground="{StaticResource TextMuted}" VerticalAlignment="Center" />
+                        <TextBox Text="{Binding NewRuleCapFps, UpdateSourceTrigger=PropertyChanged}" Width="60"
+                                 FontSize="12.5" Margin="6,0,0,0" ToolTip="Driver frame-rate limiter; empty or 0 = off" />
+                        <TextBlock Text="Vsync" FontSize="12" Foreground="{StaticResource TextMuted}" VerticalAlignment="Center" Margin="14,0,0,0" />
+                        <ComboBox SelectedIndex="{Binding NewRuleVsyncIndex}" Width="120" Margin="6,0,0,0">
+                            <ComboBoxItem Content="Driver default" />
+                            <ComboBoxItem Content="Force on" />
+                            <ComboBoxItem Content="Force off" />
+                        </ComboBox>
+                        <CheckBox Content="Low latency (pre-rendered frames = 1)" IsChecked="{Binding NewRuleLowLatency}"
+                                  FontSize="12" VerticalAlignment="Center" Margin="14,0,0,0" />
+                    </StackPanel>
                     <ItemsControl ItemsSource="{Binding GameRules}" Margin="0,10,0,0">
                         <ItemsControl.ItemTemplate>
                             <DataTemplate>

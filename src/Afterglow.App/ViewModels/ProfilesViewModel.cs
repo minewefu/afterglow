@@ -21,6 +21,37 @@ public partial class ProfilesViewModel : ObservableObject
     [ObservableProperty]
     private string _newRuleExe = string.Empty;
 
+    [ObservableProperty] private string _newRuleCapFps = string.Empty;
+    [ObservableProperty] private int _newRuleVsyncIndex;
+    [ObservableProperty] private bool _newRuleLowLatency;
+
+    private Core.Interop.Nvapi.DrsApi? _drs;
+    private bool _drsTried;
+
+    private Core.Interop.Nvapi.DrsApi? Drs
+    {
+        get
+        {
+            if (!_drsTried)
+            {
+                _drsTried = true;
+                if (!_services.DemoMode)
+                {
+                    _drs = Core.Interop.Nvapi.DrsApi.TryCreate(out _);
+                }
+            }
+
+            return _drs;
+        }
+    }
+
+    private static Core.Interop.Nvapi.GameDriverSettings ToDriverSettings(GameRule rule) => new()
+    {
+        FrameCapFps = rule.FrameCapFps,
+        Vsync = rule.DriverVsync,
+        LowLatency = rule.LowLatency,
+    };
+
     [ObservableProperty]
     private GameRule? _selectedRule;
 
@@ -171,11 +202,56 @@ public partial class ProfilesViewModel : ObservableObject
             exe += ".exe";
         }
 
-        var rule = new GameRule { ExecutableName = exe, ProfileName = Selected.Name };
+        int capFps = int.TryParse(NewRuleCapFps.Trim(),
+            System.Globalization.NumberStyles.Integer,
+            System.Globalization.CultureInfo.InvariantCulture, out int cap)
+            ? Math.Clamp(cap, 0, 1000)
+            : 0;
+        var rule = new GameRule
+        {
+            ExecutableName = exe,
+            ProfileName = Selected.Name,
+            FrameCapFps = capFps,
+            DriverVsync = NewRuleVsyncIndex switch { 1 => "on", 2 => "off", _ => "default" },
+            LowLatency = NewRuleLowLatency,
+        };
         GameRules.Add(rule);
         PersistRules();
         NewRuleExe = string.Empty;
-        StatusText = $"When {exe} runs, '{rule.ProfileName}' will be applied automatically (reverted on exit).";
+        NewRuleCapFps = string.Empty;
+        NewRuleVsyncIndex = 0;
+        NewRuleLowLatency = false;
+
+        string drsNote = string.Empty;
+        if (ToDriverSettings(rule).AnythingSet)
+        {
+            drsNote = ApplyRuleDriverSettings(rule);
+        }
+
+        StatusText = $"When {exe} runs, '{rule.ProfileName}' will be applied automatically (reverted on exit).{drsNote}";
+    }
+
+    private string ApplyRuleDriverSettings(GameRule rule)
+    {
+        if (Drs is not { } drs)
+        {
+            return " Driver settings NOT applied — DRS unavailable on this system.";
+        }
+
+        var rc = drs.ApplySettings(rule.ExecutableName, ToDriverSettings(rule), out string note);
+        if (rc == Core.Interop.Nvapi.NvapiStatus.Ok)
+        {
+            return $" Driver settings applied and {note} (persist in the driver, active whenever the game runs).";
+        }
+
+        if (rc is Core.Interop.Nvapi.NvapiStatus.ExecutableNotFound or Core.Interop.Nvapi.NvapiStatus.ProfileNameInUse)
+        {
+            return $" Driver settings NOT applied: the driver has no profile for {rule.ExecutableName} and " +
+                   "current NVIDIA drivers reject creating one via NVAPI. Add the game once in NVIDIA Control " +
+                   "Panel (Manage 3D settings → Program Settings), then re-add this rule.";
+        }
+
+        return $" Driver settings NOT applied ({rc} {note}).";
     }
 
     [RelayCommand]
@@ -187,7 +263,15 @@ public partial class ProfilesViewModel : ObservableObject
         }
 
         PersistRules();
-        StatusText = "Rule removed.";
+        string drsNote = string.Empty;
+        if (ToDriverSettings(rule).AnythingSet && Drs is { } drs)
+        {
+            drsNote = drs.ClearSettings(rule.ExecutableName) == Core.Interop.Nvapi.NvapiStatus.Ok
+                ? " Driver settings cleared."
+                : " Driver settings could not be cleared.";
+        }
+
+        StatusText = $"Rule removed.{drsNote}";
     }
 
     private void PersistRules()

@@ -22,6 +22,23 @@
   the tested offsets; all four passes mark it stable, a failure resets the
   GPU to driver defaults — Profiles page (with per-mode badges and a
   CERTIFIED chip) and `afterglow-cli certify`
+- Per-game NVIDIA driver settings: game rules can now set the driver's own
+  frame-rate limiter, vsync, and low-latency (pre-rendered frames = 1) for
+  the exe — written to the same DRS store the NVIDIA Control Panel edits,
+  verified by readback, persistent with no injection and nothing resident;
+  also `afterglow-cli drs`. Current drivers reject creating brand-new app
+  profiles via NVAPI, so unknown exes need one-time registration in NVCP
+  (games the driver already knows — effectively all of them — just work)
+- Automation rules: "if GPU temp / memory junction / board power stays at or
+  above X for Y seconds → apply a profile, pin the fans, or reset to
+  defaults", with a 5-minute re-arm cooldown, tray notifications, and
+  flight-recorder markers (Settings page)
+- Session history: every FPS capture of 30 s or more is recorded with the
+  offsets that were applied — before/after tuning comparisons per game on the
+  FPS page, exportable as a Markdown table
+- The flight recorder no longer blocks a second Afterglow instance from
+  starting (screenshot/demo runs skip it; failures degrade to
+  monitoring-without-black-box instead of an error dialog)
 
 ## 1.0.2 — 2026-08-26
 

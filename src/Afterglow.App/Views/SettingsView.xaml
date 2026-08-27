@@ -69,6 +69,60 @@
                 </StackPanel>
             </Border>
 
+            <!-- Automation rules -->
+            <Border Style="{StaticResource Card}" Margin="0,10,0,0">
+                <StackPanel>
+                    <TextBlock Text="Automation rules" FontWeight="SemiBold" FontSize="13.5" />
+                    <TextBlock Text="When a metric stays at or above a threshold for the given time, act: switch to a profile, pin the fans, or reset to defaults. Rules re-arm after a 5-minute cooldown; every firing raises a tray notification and is logged."
+                               FontSize="11.5" Foreground="{StaticResource TextFaint}" TextWrapping="Wrap" Margin="0,2,0,0" />
+
+                    <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                        <ComboBox SelectedIndex="{Binding NewAutoMetricIndex}" Width="140">
+                            <ComboBoxItem Content="GPU temp (°C)" />
+                            <ComboBoxItem Content="Mem junction (°C)" />
+                            <ComboBoxItem Content="Board power (W)" />
+                        </ComboBox>
+                        <TextBlock Text="≥" FontSize="13" VerticalAlignment="Center" Margin="8,0,0,0" />
+                        <TextBox Text="{Binding NewAutoThreshold, UpdateSourceTrigger=PropertyChanged}" Width="55"
+                                 FontSize="12.5" Margin="6,0,0,0" />
+                        <TextBlock Text="for" FontSize="12" Foreground="{StaticResource TextMuted}"
+                                   VerticalAlignment="Center" Margin="8,0,0,0" />
+                        <TextBox Text="{Binding NewAutoSeconds, UpdateSourceTrigger=PropertyChanged}" Width="45"
+                                 FontSize="12.5" Margin="6,0,0,0" />
+                        <TextBlock Text="s →" FontSize="12" Foreground="{StaticResource TextMuted}"
+                                   VerticalAlignment="Center" Margin="6,0,0,0" />
+                        <ComboBox SelectedIndex="{Binding NewAutoActionIndex}" Width="140" Margin="8,0,0,0">
+                            <ComboBoxItem Content="Set fans fixed %" />
+                            <ComboBoxItem Content="Apply profile" />
+                            <ComboBoxItem Content="Reset to defaults" />
+                        </ComboBox>
+                        <TextBox Text="{Binding NewAutoFanPct, UpdateSourceTrigger=PropertyChanged}" Width="45"
+                                 FontSize="12.5" Margin="8,0,0,0" ToolTip="Fan duty % (for the fan action)" />
+                        <ComboBox ItemsSource="{Binding StartupProfileOptions}" SelectedItem="{Binding NewAutoProfile}"
+                                  Width="140" Margin="8,0,0,0" ToolTip="Profile (for the profile action)" />
+                        <Button Style="{StaticResource PrimaryButton}" Content="Add" Margin="10,0,0,0"
+                                Command="{Binding AddAutomationRuleCommand}" />
+                    </StackPanel>
+
+                    <ItemsControl ItemsSource="{Binding AutomationRules}" Margin="0,10,0,0">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Border Background="{StaticResource Bg3}" CornerRadius="7" Padding="10,7" Margin="0,3">
+                                    <Grid>
+                                        <TextBlock FontSize="12.5" VerticalAlignment="Center">
+                                            <Run Text="{Binding Metric, Mode=OneWay}" /><Run Text=" ≥ " /><Run Text="{Binding Threshold, Mode=OneWay, StringFormat=F0}" /><Run Text=" for " /><Run Text="{Binding ForSeconds, Mode=OneWay}" /><Run Text=" s → " /><Run Text="{Binding Action, Mode=OneWay}" FontWeight="SemiBold" /><Run Text=" " /><Run Text="{Binding ActionProfile, Mode=OneWay}" />
+                                        </TextBlock>
+                                        <Button Style="{StaticResource GhostButton}" Content="Remove" HorizontalAlignment="Right"
+                                                Command="{Binding DataContext.RemoveAutomationRuleCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                                CommandParameter="{Binding}" />
+                                    </Grid>
+                                </Border>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
+            </Border>
+
             <Border Style="{StaticResource Card}" Margin="0,10,0,0">
                 <StackPanel>
                     <TextBlock Text="Overlay" FontWeight="SemiBold" FontSize="13.5" />

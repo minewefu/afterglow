@@ -63,6 +63,34 @@ public sealed record GameRule
 
     /// <summary>Restore the previous tuning when the game exits.</summary>
     public bool RevertOnExit { get; init; } = true;
+
+    /// <summary>Driver frame-rate limiter for this game (DRS); 0 = off.</summary>
+    public int FrameCapFps { get; init; }
+
+    /// <summary>Driver vsync for this game: "default", "on", or "off".</summary>
+    public string DriverVsync { get; init; } = "default";
+
+    /// <summary>Cap the game's pre-rendered frames at 1 (driver low-latency).</summary>
+    public bool LowLatency { get; init; }
+}
+
+/// <summary>Sustained-condition automation: when a metric breaches for long enough, act.</summary>
+public sealed record AutomationRule
+{
+    /// <summary>"gpu" (core temp), "memjunction", or "power".</summary>
+    public required string Metric { get; init; }
+
+    public required double Threshold { get; init; }
+
+    /// <summary>The breach must persist this long before the action fires.</summary>
+    public int ForSeconds { get; init; } = 30;
+
+    /// <summary>"profile" (apply ActionProfile), "fans" (fixed ActionFanPct), or "reset".</summary>
+    public required string Action { get; init; }
+
+    public string? ActionProfile { get; init; }
+
+    public uint ActionFanPct { get; init; } = 80;
 }
 
 public sealed record AppSettings
@@ -91,6 +119,9 @@ public sealed record AppSettings
 
     /// <summary>Alert above this hot-spot/memory-junction temperature (0 = off).</summary>
     public int AlertMemJunctionTempC { get; init; }
+
+    /// <summary>Sustained-condition automation rules (temperature/power watchdogs with actions).</summary>
+    public IReadOnlyList<AutomationRule> AutomationRules { get; init; } = [];
 }
 
 /// <summary>Atomic JSON persistence for <see cref="AppSettings"/>.</summary>

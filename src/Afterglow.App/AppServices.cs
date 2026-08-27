@@ -54,6 +54,9 @@ public sealed class AppServices : IDisposable
 
     public AppSettings Settings => _settings;
 
+    /// <summary>Raised after settings are mutated and persisted.</summary>
+    public event Action<AppSettings>? SettingsChanged;
+
     /// <summary>Mutates and persists settings; side effects (interval, rules) are applied.</summary>
     public void UpdateSettings(Func<AppSettings, AppSettings> mutate)
     {
@@ -61,6 +64,7 @@ public sealed class AppServices : IDisposable
         SettingsStore.Save(_settings);
         Telemetry.Interval = TimeSpan.FromMilliseconds(_settings.PollingIntervalMs);
         GameWatcher.UpdateRules(_settings.GameRules);
+        SettingsChanged?.Invoke(_settings);
     }
 
     internal void InitializeSettings(AppSettings settings)
@@ -76,7 +80,7 @@ public sealed class AppServices : IDisposable
         return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
     }
 
-    public static AppServices Create(bool demoMode)
+    public static AppServices Create(bool demoMode, bool enableBlackBox = true)
     {
         bool elevated = CheckElevated();
 
@@ -138,33 +142,54 @@ public sealed class AppServices : IDisposable
         telemetry.SnapshotTaken += vfCurve.Add;
 
         // Analyze the previous flight recording BEFORE the new recorder
-        // rotates it, then start this session's black box.
-        var crashReport = Core.Diagnostics.CrashForensics.AnalyzePreviousSession(AppPaths.FlightDir);
-        var flight = new Core.Diagnostics.FlightRecorder(AppPaths.FlightDir);
-        int flightTick = 0;
-        telemetry.SnapshotTaken += snapshot =>
+        // rotates it, then start this session's black box. Only the resident
+        // instance records (screenshot/demo runs pass enableBlackBox false —
+        // they'd fight the resident instance over the file), and a recorder
+        // failure degrades to "no black box" — diagnostics must never be the
+        // reason the app can't start.
+        Core.Diagnostics.CrashReport? crashReport = null;
+        Core.Diagnostics.FlightRecorder? flight = null;
+        if (enableBlackBox)
         {
-            if (snapshot.DeviceIndex != 0)
+            try
             {
-                return;
+                crashReport = Core.Diagnostics.CrashForensics.AnalyzePreviousSession(AppPaths.FlightDir);
+                flight = new Core.Diagnostics.FlightRecorder(AppPaths.FlightDir);
             }
-
-            flight.Record(snapshot);
-
-            // Offsets change rarely; sample once a minute so CLI-applied tuning
-            // is captured too (dedup happens inside the recorder).
-            if (flightTick++ % 60 == 0 && manager.Gpus.Count > 0)
+            catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException)
             {
-                try
-                {
-                    var current = manager.Gpus[0].Tuner.ReadCurrent();
-                    flight.RecordOffsets(current.CoreOffsetMHz, current.MemOffsetMHz);
-                }
-                catch (InvalidOperationException)
-                {
-                }
+                Core.Diagnostics.Log.Info($"Flight recorder disabled for this session: {ex.Message}");
+                flight = null;
             }
-        };
+        }
+
+        if (flight is { } recorder)
+        {
+            int flightTick = 0;
+            telemetry.SnapshotTaken += snapshot =>
+            {
+                if (snapshot.DeviceIndex != 0)
+                {
+                    return;
+                }
+
+                recorder.Record(snapshot);
+
+                // Offsets change rarely; sample once a minute so CLI-applied
+                // tuning is captured too (dedup happens inside the recorder).
+                if (flightTick++ % 60 == 0 && manager.Gpus.Count > 0)
+                {
+                    try
+                    {
+                        var current = manager.Gpus[0].Tuner.ReadCurrent();
+                        recorder.RecordOffsets(current.CoreOffsetMHz, current.MemOffsetMHz);
+                    }
+                    catch (InvalidOperationException)
+                    {
+                    }
+                }
+            };
+        }
 
         telemetry.Start();
 

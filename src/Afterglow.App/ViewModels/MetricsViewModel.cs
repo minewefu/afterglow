@@ -37,6 +37,95 @@ public partial class MetricsViewModel : ObservableObject
     private readonly Random _demoRandom = new(7);
     private readonly List<double> _demoFrametimes = [];
 
+    private readonly SessionReportStore _sessionStore = new();
+    private DateTimeOffset _captureStartedAt;
+    private (string App, FrameWindowStats Stats)? _lastTargetStats;
+
+    public System.Collections.ObjectModel.ObservableCollection<SessionReport> SessionHistory { get; } = [];
+
+    public string SessionHistoryNote { get; } =
+        "Every capture of 30 s or more is recorded here with the offsets that were applied — run the same " +
+        "game before and after a tuning change and the comparison writes itself. FPS numbers are the trailing " +
+        "30 s window at capture end; power/temps are averaged over the session.";
+
+    [RelayCommand]
+    private void CopySessionHistory()
+    {
+        if (SessionHistory.Count > 0)
+        {
+            Clipboard.SetText(SessionReportStore.ToMarkdown([.. SessionHistory]));
+        }
+    }
+
+    private void LoadSessionHistory()
+    {
+        SessionHistory.Clear();
+        foreach (var report in _sessionStore.LoadAll().Reverse())
+        {
+            SessionHistory.Add(report);
+        }
+    }
+
+    private void RecordSession()
+    {
+        int duration = (int)(DateTimeOffset.Now - _captureStartedAt).TotalSeconds;
+        if (duration < 30 || _lastTargetStats is not { } last || last.Stats.FrameCount < 100)
+        {
+            return;
+        }
+
+        double power = 0;
+        double gpuTemp = 0;
+        double memTemp = 0;
+        int samples = 0;
+        foreach (var snapshot in _services.Telemetry.HistoryFor(0).GetAll())
+        {
+            if (snapshot.Timestamp < _captureStartedAt)
+            {
+                continue;
+            }
+
+            power += snapshot.PowerW ?? 0;
+            gpuTemp += snapshot.GpuTempC ?? 0;
+            memTemp += snapshot.MemJunctionTempC ?? 0;
+            samples++;
+        }
+
+        int core = 0;
+        int mem = 0;
+        if (_services.Gpus.Count > 0)
+        {
+            try
+            {
+                var current = _services.Gpus[0].Tuner.ReadCurrent();
+                core = current.CoreOffsetMHz;
+                mem = current.MemOffsetMHz;
+            }
+            catch (InvalidOperationException)
+            {
+            }
+        }
+
+        var report = new SessionReport
+        {
+            Application = last.App,
+            StartedAt = _captureStartedAt,
+            DurationSeconds = duration,
+            AvgFps = last.Stats.AverageFps,
+            Low1Fps = last.Stats.Low1Fps,
+            P1Fps = last.Stats.P1Fps,
+            Frames = last.Stats.FrameCount,
+            AvgPowerW = samples > 0 ? power / samples : 0,
+            AvgGpuTempC = samples > 0 ? gpuTemp / samples : 0,
+            AvgMemJunctionC = samples > 0 ? memTemp / samples : 0,
+            CoreOffsetMHz = core,
+            MemOffsetMHz = mem,
+        };
+        _sessionStore.Append(report);
+        SessionHistory.Insert(0, report);
+        _services.Flight?.Marker($"session-recorded app={report.Application} fps={report.AvgFps:F1}");
+    }
+
     public MetricsViewModel(AppServices services)
     {
         _services = services;
@@ -56,6 +145,8 @@ public partial class MetricsViewModel : ObservableObject
         _refresh.Tick += (_, _) => Refresh();
         _refresh.Start();
 
+        LoadSessionHistory();
+
         _foregroundPoll = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
         _foregroundPoll.Tick += (_, _) =>
             _services.FrameMetrics.ForegroundProcessId = ForegroundProcess.GetForegroundProcessId();
@@ -67,6 +158,7 @@ public partial class MetricsViewModel : ObservableObject
     {
         if (CaptureRunning)
         {
+            RecordSession();
             _services.FrameMetrics.Session.Dispose();
             CaptureRunning = false;
             CaptureStatusText = "Capture stopped.";
@@ -76,6 +168,8 @@ public partial class MetricsViewModel : ObservableObject
         if (_services.FrameMetrics.Start())
         {
             CaptureRunning = true;
+            _captureStartedAt = DateTimeOffset.Now;
+            _lastTargetStats = null;
             CaptureStatusText = "Capturing present events for all processes (ETW).";
         }
         else
@@ -114,6 +208,7 @@ public partial class MetricsViewModel : ObservableObject
         }
 
         var (app, s) = stats.Value;
+        _lastTargetStats = (app.Application, s);
         AppText = $"{app.Application} (PID {app.ProcessId})";
         PresentModeText = app.PresentMode;
         AvgFpsText = s.AverageFps.ToString("F1");

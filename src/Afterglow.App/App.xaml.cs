@@ -84,7 +84,9 @@ public partial class App : Application
 
         try
         {
-            _services = AppServices.Create(demo);
+            // Screenshot runs are ephemeral: no black box (it belongs to the
+            // resident instance, which holds the flight file).
+            _services = AppServices.Create(demo, enableBlackBox: screenshotPath is null);
         }
         catch (Exception ex)
         {

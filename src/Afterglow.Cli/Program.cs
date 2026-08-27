@@ -21,6 +21,7 @@ internal static class Program
             "stress" => StressCommand.Run(args),
             "vram" => VramCommand.Run(args),
             "certify" => CertifyCommand.Run(args),
+            "drs" => DrsCommand.Run(args),
             "vfcurve" => VfCurveCommand.Run(args),
             "mcp" => McpCommand.Run(),
             "help" or "--help" or "-h" => Help(),

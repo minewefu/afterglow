@@ -91,6 +91,28 @@ public partial class MainViewModel : ObservableObject
             ForensicsBannerText = $"Last session ended in a crash. {crash.Headline}";
         }
 
+        _automation.UpdateRules(services.Settings.AutomationRules);
+        services.SettingsChanged += updated => _automation.UpdateRules(updated.AutomationRules);
+        services.Telemetry.SnapshotTaken += snapshot =>
+        {
+            if (snapshot.DeviceIndex != 0)
+            {
+                return;
+            }
+
+            var fired = _automation.Evaluate(snapshot, DateTimeOffset.Now);
+            if (fired.Count > 0)
+            {
+                Application.Current?.Dispatcher.BeginInvoke(() =>
+                {
+                    foreach (var automationEvent in fired)
+                    {
+                        ExecuteAutomation(automationEvent);
+                    }
+                });
+            }
+        };
+
         services.GameWatcher.GameStarted += rule =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnGameStarted(rule));
         services.GameWatcher.GameExited += rule =>
@@ -434,6 +456,56 @@ public partial class MainViewModel : ObservableObject
         // survive at the driver level); just stop treating it as a crash.
         AppliedStateStore.MarkCleanShutdown();
         ShowCrashBanner = false;
+    }
+
+    private readonly Core.Services.AutomationEngine _automation = new();
+
+    private void ExecuteAutomation(Core.Services.AutomationEvent fired)
+    {
+        var rule = fired.Rule;
+        string metricLabel = rule.Metric switch
+        {
+            "gpu" => "GPU temperature",
+            "memjunction" => "Memory junction",
+            "power" => "Board power",
+            _ => rule.Metric,
+        };
+
+        string action;
+        if (!_services.IsElevated)
+        {
+            action = "no action taken — Afterglow is running without administrator rights";
+        }
+        else
+        {
+            switch (rule.Action)
+            {
+                case "profile" when rule.ActionProfile is { } name && _services.Profiles.Load(name) is { } profile:
+                    _ = ApplyProfileFull(profile);
+                    action = $"applied profile '{name}'";
+                    break;
+                case "fans" when _services.Gpus.Count > 0 &&
+                    _services.FanControl.TryGetValue(_services.Gpus[0].Index, out var fans):
+                    fans.SetFixed(rule.ActionFanPct);
+                    action = $"fans set to fixed {rule.ActionFanPct}%";
+                    break;
+                case "reset":
+                    PanicReset();
+                    action = "all tuning reset to driver defaults";
+                    break;
+                default:
+                    action = "no action taken (rule misconfigured)";
+                    break;
+            }
+        }
+
+        _services.Flight?.Marker(
+            $"automation metric={rule.Metric} value={fired.Value:F0} action={rule.Action}");
+        Core.Diagnostics.Log.Info(
+            $"Automation: {metricLabel} {fired.Value:F0} >= {rule.Threshold:F0} for {rule.ForSeconds}s -> {action}");
+        TrayAlert?.Invoke(
+            "Automation rule fired",
+            $"{metricLabel} hit {fired.Value:F0} (threshold {rule.Threshold:F0} for {rule.ForSeconds} s) — {action}.");
     }
 
     [RelayCommand]

@@ -130,6 +130,13 @@ Afterglow is a from-scratch, MIT-licensed answer:
 **Automation & safety**
 - **Per-game auto profiles**: apply a profile when a game launches, restore your previous
   tuning when it exits (Afterburner has never had this)
+- **Per-game driver settings without opening NVIDIA Control Panel**: frame-rate cap, vsync,
+  and low latency per exe, written to the driver's own settings store — persistent, no
+  injection, active even when Afterglow isn't running (this replaces RTSS's frame limiter)
+- **Automation rules**: "memory junction ≥ 94 °C for 30 s → pin fans to 90%" — sustained-condition
+  watchdogs that apply a profile, fix the fans, or reset to defaults, with cooldown and alerts
+- **Session history**: every FPS capture is recorded with the offsets that were applied —
+  before/after comparisons per game, exportable as Markdown
 - Global hotkeys: overlay toggle, profile slots, and a **panic key** (Ctrl+Alt+R) that resets
   everything to driver defaults
 - **TDR watchdog**: if Windows logs a display-driver reset while your tuning is applied,
@@ -206,6 +213,7 @@ afterglow-cli fps             capture FPS/frametimes for all presenting apps
 afterglow-cli stress          burn test (--pattern sustained|transitions|excursions)
 afterglow-cli vram            full-capacity VRAM test with GPU-side verification
 afterglow-cli certify         run all four stability modes against a saved profile (admin)
+afterglow-cli drs             per-game driver settings (--exe game.exe --cap 120 --vsync off)
 ```
 
 ## Building from source

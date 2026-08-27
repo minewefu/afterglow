@@ -19,6 +19,10 @@ public enum NvapiStatus
     NotSupported = -104,
     DataNotFound = -121,
     FunctionNotFound = -136,
+    SettingNotFound = -160,
+    ProfileNotFound = -163,
+    ProfileNameInUse = -164,
+    ExecutableNotFound = -166,
 }
 
 /// <summary>
