@@ -69,6 +69,12 @@
                                                     Visibility="{Binding MarkedStable, Converter={x:Static views:Converters.BoolToVisibility}}">
                                                 <TextBlock Text="STABLE" FontSize="9.5" Foreground="{StaticResource Good}" />
                                             </Border>
+                                            <Border Background="#2EE8B33C" CornerRadius="5" Padding="6,1" Margin="6,0,0,0"
+                                                    VerticalAlignment="Center"
+                                                    Visibility="{Binding FullyCertified, Converter={x:Static views:Converters.BoolToVisibility}}"
+                                                    ToolTip="Passed all four stability modes (sustained, transitions, excursions, VRAM) at these offsets.">
+                                                <TextBlock Text="CERTIFIED" FontSize="9.5" Foreground="{StaticResource Warn}" />
+                                            </Border>
                                         </StackPanel>
                                         <TextBlock FontSize="11.5" Foreground="{StaticResource TextMuted}">
                                             <Run Text="core " /><Run Text="{Binding CoreOffsetMHz, Mode=OneWay}" /><Run Text=" MHz · mem " /><Run Text="{Binding MemOffsetMHz, Mode=OneWay}" /><Run Text=" MHz · power " /><Run Text="{Binding PowerLimitW, Mode=OneWay, StringFormat=F0}" /><Run Text=" W · fans " /><Run Text="{Binding FanMode, Mode=OneWay}" />
@@ -95,6 +101,70 @@
                     </StackPanel>
                     <TextBlock Text="{Binding StatusText}" FontSize="12" Foreground="{StaticResource TextMuted}"
                                Margin="0,10,0,0" TextWrapping="Wrap" />
+                </StackPanel>
+            </Border>
+
+            <!-- Certification wizard -->
+            <Border Style="{StaticResource Card}" Margin="0,10,0,0">
+                <StackPanel>
+                    <TextBlock Text="Certify a profile" FontWeight="SemiBold" FontSize="13.5" />
+                    <TextBlock Text="Applies the selected profile and runs all four stability modes against it in sequence — sustained burn, transition cycling, boost excursions, and the full-VRAM test. Each pass is stamped into the profile (tied to its exact offsets; editing them invalidates the stamps). Passing all four marks it stable. A failure stops the run and resets the GPU to driver defaults."
+                               FontSize="11.5" Foreground="{StaticResource TextFaint}" TextWrapping="Wrap" Margin="0,2,0,0" />
+
+                    <Border Background="#33E8B33C" CornerRadius="8" Padding="12,8" Margin="0,10,0,0"
+                            Visibility="{Binding CanCertify, Converter={x:Static views:Converters.InverseBoolToVisibility}}">
+                        <TextBlock Text="{Binding CertifyGateText}" Foreground="{StaticResource Warn}" FontSize="12" TextWrapping="Wrap" />
+                    </Border>
+
+                    <TextBlock Text="{Binding SelectedCertificationText}" FontSize="12" Margin="0,10,0,0"
+                               FontFamily="{StaticResource MonoFont}" Foreground="{StaticResource TextMuted}" />
+
+                    <Grid Margin="0,10,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="170" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="150" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="Time per mode" FontSize="12.5" VerticalAlignment="Center" />
+                        <Slider Grid.Column="1" Style="{StaticResource TuneSlider}" Minimum="45" Maximum="300"
+                                Value="{Binding CertifySeconds}" TickFrequency="15" IsSnapToTickEnabled="True"
+                                VerticalAlignment="Center"
+                                IsEnabled="{Binding CertifyRunning, Converter={x:Static views:Converters.InverseBool}}" />
+                        <TextBlock Grid.Column="2" Text="{Binding CertifySecondsLabel}" FontSize="12.5"
+                                   HorizontalAlignment="Right" VerticalAlignment="Center"
+                                   Foreground="{StaticResource TextMuted}" />
+                    </Grid>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                        <Button Style="{StaticResource PrimaryButton}" MinWidth="180"
+                                Command="{Binding ToggleCertifyCommand}" IsEnabled="{Binding CanCertify}">
+                            <Button.Content>
+                                <TextBlock>
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Text" Value="Certify selected profile" />
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding CertifyRunning}" Value="True">
+                                                    <Setter Property="Text" Value="Cancel certification" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
+                            </Button.Content>
+                        </Button>
+                        <TextBlock Text="{Binding CertifyPhaseText}" FontSize="12.5" VerticalAlignment="Center"
+                                   Margin="14,0,0,0" TextWrapping="Wrap" />
+                    </StackPanel>
+
+                    <ProgressBar Value="{Binding CertifyProgress, Mode=OneWay}" Maximum="1" Height="5" Margin="0,10,0,0"
+                                 Background="{StaticResource Bg3}" Foreground="{StaticResource Accent}" BorderThickness="0" />
+
+                    <Border Background="{StaticResource Bg1}" CornerRadius="7" Padding="10" Margin="0,10,0,0"
+                            MinHeight="90">
+                        <TextBlock Text="{Binding CertifyLog}" FontFamily="{StaticResource MonoFont}" FontSize="11"
+                                   Foreground="{StaticResource TextMuted}" TextWrapping="Wrap" />
+                    </Border>
                 </StackPanel>
             </Border>
 

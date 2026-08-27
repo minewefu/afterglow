@@ -255,6 +255,15 @@ internal static class McpCommand
                 args => gpu is null ? RequireGpu() : RunStress(gpu, args)),
 
             new ToolDef(
+                "run_vram_test",
+                "Full-capacity VRAM test: fills as much of the card's memory as the OS safely allows with a " +
+                "deterministic pattern and verifies every element on the GPU (alternate rounds invert the " +
+                "pattern). Catches memory-offset errors the bandwidth burn can't. Returns coverage, rounds, " +
+                "and errors; any error means the current memory clocks are unstable.",
+                Schema(("seconds", "integer", "Test window, 15-1800 (default 90); always completes at least one full round", false)),
+                args => gpu is null ? RequireGpu() : RunVramTest(gpu, args)),
+
+            new ToolDef(
                 "list_profiles",
                 "Saved tuning profiles.",
                 Schema(),
@@ -373,6 +382,58 @@ internal static class McpCommand
             power_limit_w = power,
             voltage_boost_pct = boost,
             lock_clock_mhz = lockMhz,
+        };
+    }
+
+    private static object RunVramTest(GpuContext gpu, JsonObject? args)
+    {
+        int seconds = Math.Clamp(args?["seconds"]?.GetValue<int>() ?? 90, 15, 1800);
+
+        using var vram = new VramTest();
+        var done = new ManualResetEventSlim(false);
+        vram.ProgressChanged += progress =>
+        {
+            if (progress.State is not StressState.Running)
+            {
+                done.Set();
+            }
+        };
+
+        double peakMemJunction = 0;
+        vram.Start();
+        var start = DateTime.UtcNow;
+        while (!done.IsSet)
+        {
+            if (done.Wait(TimeSpan.FromMilliseconds(500)))
+            {
+                break;
+            }
+
+            var snapshot = gpu.Poller.Poll();
+            peakMemJunction = Math.Max(peakMemJunction, snapshot.MemJunctionTempC ?? 0);
+
+            var p = vram.Progress;
+            double elapsed = (DateTime.UtcNow - start).TotalSeconds;
+            if ((elapsed >= seconds && p.Rounds >= 1) || elapsed >= seconds * 3)
+            {
+                break;
+            }
+        }
+
+        vram.StopAndWait(TimeSpan.FromSeconds(10));
+        var final = vram.Progress;
+
+        bool stable = final.State is StressState.Stopped or StressState.Running && final.Rounds >= 1;
+        return new
+        {
+            stable,
+            state = final.State.ToString(),
+            covered_gib = final.PlannedBytes / (double)(1L << 30),
+            full_rounds = final.Rounds,
+            error_count = final.ErrorCount,
+            seconds_run = final.Elapsed.TotalSeconds,
+            peak_mem_junction_c = peakMemJunction,
+            detail = final.Detail,
         };
     }
 

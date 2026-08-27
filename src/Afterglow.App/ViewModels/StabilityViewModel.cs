@@ -36,6 +36,72 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
              "patterns before trusting a daily overclock.",
     };
 
+    private VramTest? _vram;
+
+    [ObservableProperty] private bool _vramRunning;
+    [ObservableProperty] private bool _vramFailed;
+    [ObservableProperty] private string _vramStatusText =
+        "Idle. Fills as much VRAM as the OS safely allows with a deterministic pattern and verifies " +
+        "every element on the GPU; alternate rounds invert the pattern so every bit is exercised both ways.";
+    [ObservableProperty] private string _vramStatsText = string.Empty;
+
+    [RelayCommand]
+    private void ToggleVram()
+    {
+        if (VramRunning)
+        {
+            _vram?.Stop();
+            return;
+        }
+
+        _vram?.Dispose();
+        _vram = new VramTest();
+        _vram.ProgressChanged += progress =>
+            Application.Current?.Dispatcher.BeginInvoke(() => OnVramProgress(progress));
+        VramFailed = false;
+        VramRunning = true;
+        VramStatusText = "Allocating…";
+        _services.Flight?.Marker("vram-start");
+        _vram.Start();
+    }
+
+    private void OnVramProgress(VramProgress progress)
+    {
+        double gib = progress.PlannedBytes / (double)(1L << 30);
+        VramStatsText = progress.State == StressState.Running
+            ? $"{gib:F1} GiB · round {progress.Rounds + 1} · {progress.GiBPerSecond:F0} GiB/s verified"
+            : string.Empty;
+
+        switch (progress.State)
+        {
+            case StressState.Running:
+                VramStatusText = "Testing — every element is written and read back on the GPU.";
+                break;
+            case StressState.Stopped:
+                VramRunning = false;
+                VramStatusText = progress.Rounds >= 1
+                    ? $"Stopped after {progress.Elapsed:hh\\:mm\\:ss}: {gib:F1} GiB × {progress.Rounds} full " +
+                      "rounds, 0 errors — VRAM is stable at the current memory clocks."
+                    : $"Stopped after {progress.Elapsed:hh\\:mm\\:ss} before a full round completed — run " +
+                      "longer for a verdict.";
+                break;
+            case StressState.ArtifactDetected:
+            case StressState.DeviceLost:
+            case StressState.Failed:
+                VramRunning = false;
+                VramFailed = true;
+                VramStatusText = progress.Detail ?? "VRAM test failed.";
+                break;
+            default:
+                break;
+        }
+
+        if (progress.State is not (StressState.Running or StressState.Idle))
+        {
+            _services.Flight?.Marker($"vram-end state={progress.State} rounds={progress.Rounds}");
+        }
+    }
+
     [ObservableProperty] private bool _stepperRunning;
     [ObservableProperty] private string _stepperPhaseText = string.Empty;
     [ObservableProperty] private double _stepperProgress;
@@ -210,6 +276,7 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
         GC.SuppressFinalize(this);
         _stepper?.Cancel();
         _stress?.Dispose();
+        _vram?.Dispose();
     }
 
     private void OnStepperStatus(StepperStatus status)

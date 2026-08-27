@@ -101,6 +101,13 @@ Afterglow is a from-scratch, MIT-licensed answer:
   hard crash, the next launch correlates its final minutes with the Windows event log and
   explains the failure in plain language ("hard reset 3 min after load ended with +2000 MHz
   memory — matches transition instability"), instead of leaving you guessing
+- **Full-VRAM test**: fills as much of the card's memory as the OS safely allows (29 GiB on a
+  32 GiB card, verified at 100+ GiB/s on the GPU itself) with deterministic patterns, alternate
+  rounds bit-inverted — catches memory-offset errors the bandwidth burn can't
+- **Profile certification**: one click applies a saved profile and runs all four modes against
+  it in sequence; each pass is stamped into the profile, pinned to the exact offsets tested
+  (editing them invalidates the stamps), and passing all four marks it stable. A failure stops
+  the run and resets the GPU to driver defaults
 - **Guided stability stepper**: walks your core offset up step by step, burn-testing each,
   backs off on the first failure and runs a confirmation pass — an open-method alternative
   to closed OC scanners
@@ -196,6 +203,9 @@ afterglow-cli set             --core-offset 150 --mem-offset 500 --power-limit 5
                               --lock-clock 2650 --fan 60 ... (admin)
 afterglow-cli reset           restore all driver defaults
 afterglow-cli fps             capture FPS/frametimes for all presenting apps
+afterglow-cli stress          burn test (--pattern sustained|transitions|excursions)
+afterglow-cli vram            full-capacity VRAM test with GPU-side verification
+afterglow-cli certify         run all four stability modes against a saved profile (admin)
 ```
 
 ## Building from source

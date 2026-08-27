@@ -37,6 +37,86 @@ public partial class ProfilesViewModel : ObservableObject
     [ObservableProperty]
     private string _statusText = string.Empty;
 
+    private ProfileCertifier? _certifier;
+
+    [ObservableProperty] private bool _certifyRunning;
+    [ObservableProperty] private string _certifyPhaseText = string.Empty;
+    [ObservableProperty] private double _certifyProgress;
+    [ObservableProperty] private string _certifyLog = string.Empty;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(CertifySecondsLabel))]
+    private double _certifySeconds = 90;
+
+    public bool CanCertify => !_services.DemoMode && _services.IsElevated && _services.Gpus.Count > 0;
+
+    public string CertifyGateText => CanCertify
+        ? string.Empty
+        : "Certification applies the profile and stress-tests it, so it needs a real GPU and administrator rights.";
+
+    public string CertifySecondsLabel => $"{CertifySeconds:F0} s per mode";
+
+    public string SelectedCertificationText => Selected is not { } p
+        ? string.Empty
+        : string.Join("   ", CertificationModes.All.Select(mode =>
+            p.ValidCertification(mode) is { } cert
+                ? $"{mode} ✓ {cert.PassedAt:MM-dd}"
+                : $"{mode} —"));
+
+    partial void OnSelectedChanged(TuningProfile? value) =>
+        OnPropertyChanged(nameof(SelectedCertificationText));
+
+    [RelayCommand]
+    private void ToggleCertify()
+    {
+        if (CertifyRunning)
+        {
+            _certifier?.Cancel();
+            return;
+        }
+
+        if (Selected is null || _services.Gpus.Count == 0)
+        {
+            StatusText = "Select a profile to certify.";
+            return;
+        }
+
+        var profile = Selected;
+        _certifier = new ProfileCertifier(_services.Gpus[0].Tuner, _services.Profiles);
+        _certifier.StatusChanged += status =>
+            System.Windows.Application.Current?.Dispatcher.BeginInvoke(() => OnCertifierStatus(status));
+        CertifyRunning = true;
+        _services.Flight?.Marker($"certify-start profile={profile.Name}");
+        _certifier.Start(profile, new CertifierOptions { SecondsPerMode = (int)CertifySeconds });
+    }
+
+    private void OnCertifierStatus(CertifierStatus status)
+    {
+        CertifyRunning = status.Running;
+        CertifyPhaseText = status.Running
+            ? $"[{status.ModeIndex + 1}/{status.ModeCount}] {status.Phase} — {status.ModeElapsed:mm\\:ss} / {status.ModeDuration:mm\\:ss}"
+            : status.Passed == true
+                ? "Certified across all four modes — marked stable."
+                : status.FailedMode is { } failed
+                    ? $"Failed during {failed} — the GPU was reset to driver defaults."
+                    : status.Phase;
+        CertifyProgress = status.Running && status.ModeDuration.TotalSeconds > 0
+            ? Math.Clamp(
+                (status.ModeIndex + status.ModeElapsed.TotalSeconds / status.ModeDuration.TotalSeconds) /
+                status.ModeCount, 0, 1)
+            : status.Passed == true ? 1 : 0;
+        CertifyLog = string.Join(Environment.NewLine, status.Log.TakeLast(10));
+
+        if (!status.Running)
+        {
+            _services.Flight?.Marker($"certify-end passed={status.Passed}");
+            string? name = Selected?.Name;
+            Reload();
+            Selected = Profiles.FirstOrDefault(p => p.Name == name);
+            OnPropertyChanged(nameof(SelectedCertificationText));
+        }
+    }
+
     public ProfilesViewModel(
         AppServices services,
         TuningViewModel tuning,

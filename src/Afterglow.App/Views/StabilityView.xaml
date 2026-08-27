@@ -90,6 +90,51 @@
                 </StackPanel>
             </Border>
 
+            <!-- VRAM test -->
+            <Border Style="{StaticResource Card}" Margin="0,10,0,0">
+                <StackPanel>
+                    <TextBlock Text="VRAM test" FontWeight="SemiBold" FontSize="13.5" />
+                    <TextBlock Text="Fills as much of the card's memory as the OS safely allows (staying inside the DXGI budget, so nothing is silently paged out) and verifies every element on the GPU. Any error means the memory offset is unstable — this catches what the bandwidth burn can't."
+                               FontSize="11.5" Foreground="{StaticResource TextFaint}" TextWrapping="Wrap" Margin="0,2,0,0" />
+
+                    <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                        <Button Style="{StaticResource PrimaryButton}" MinWidth="150" Command="{Binding ToggleVramCommand}">
+                            <Button.Content>
+                                <TextBlock>
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Text" Value="Start VRAM test" />
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding VramRunning}" Value="True">
+                                                    <Setter Property="Text" Value="Stop VRAM test" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
+                            </Button.Content>
+                        </Button>
+                        <TextBlock Text="{Binding VramStatsText}" FontSize="12.5" VerticalAlignment="Center"
+                                   Margin="16,0,0,0" FontFamily="{StaticResource MonoFont}"
+                                   Foreground="{StaticResource SeriesFps}" />
+                    </StackPanel>
+
+                    <TextBlock Text="{Binding VramStatusText}" FontSize="12.5" Margin="0,10,0,0" TextWrapping="Wrap">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock" BasedOn="{StaticResource {x:Type TextBlock}}">
+                                <Setter Property="Foreground" Value="{StaticResource TextMuted}" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding VramFailed}" Value="True">
+                                        <Setter Property="Foreground" Value="{StaticResource Bad}" />
+                                        <Setter Property="FontWeight" Value="SemiBold" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                </StackPanel>
+            </Border>
+
             <!-- Stepper -->
             <Border Style="{StaticResource Card}" Margin="0,10,0,0">
                 <StackPanel>

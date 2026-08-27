@@ -13,6 +13,15 @@
   correlates the final minutes with the Windows event log (Kernel-Power 41,
   unexpected shutdown, WHEA, TDR, nvlddmkm) and explains the failure in plain
   language — banner on launch, full report on the Stability page
+- Full-VRAM test: fills the card's memory up to the DXGI budget with
+  deterministic patterns (alternate rounds bit-inverted) and verifies every
+  element on the GPU — Stability page, `afterglow-cli vram`, and the MCP
+  `run_vram_test` tool
+- Profile certification: applies a saved profile and runs all four stability
+  modes against it in sequence, stamping each pass into the profile pinned to
+  the tested offsets; all four passes mark it stable, a failure resets the
+  GPU to driver defaults — Profiles page (with per-mode badges and a
+  CERTIFIED chip) and `afterglow-cli certify`
 
 ## 1.0.2 — 2026-08-26
 

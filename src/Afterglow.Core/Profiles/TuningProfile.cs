@@ -60,6 +60,17 @@ public sealed record TuningProfile
     /// <summary>Set once the user (or the stability stepper) has validated this profile under load.</summary>
     public bool MarkedStable { get; init; }
 
+    /// <summary>
+    /// Stability modes this profile has passed (see <see cref="CertificationModes"/>).
+    /// A certification only counts while the profile's offsets still match the
+    /// values it was earned at.
+    /// </summary>
+    public IReadOnlyList<ProfileCertification> Certifications { get; init; } = [];
+
+    /// <summary>All four modes passed at the current offsets (display convenience).</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool FullyCertified => this.IsFullyCertified();
+
     /// <summary>Free-form user notes.</summary>
     public string Notes { get; init; } = string.Empty;
 

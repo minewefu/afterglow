@@ -19,6 +19,8 @@ internal static class Program
             "reset" => TuneCommands.Reset(args),
             "fps" => FpsCommand.Run(args),
             "stress" => StressCommand.Run(args),
+            "vram" => VramCommand.Run(args),
+            "certify" => CertifyCommand.Run(args),
             "vfcurve" => VfCurveCommand.Run(args),
             "mcp" => McpCommand.Run(),
             "help" or "--help" or "-h" => Help(),
@@ -46,6 +48,11 @@ internal static class Program
               stress [--seconds N]          Burn test with bit-exact error detection.
                      [--pattern P]          sustained (default) | transitions | excursions
                      [--intensity N]
+              vram [--seconds N]            Full-capacity VRAM test: fills and verifies as
+                                            much of the card as the OS safely allows.
+              certify --profile NAME        Apply a saved profile, then run all four
+                      [--seconds N]         stability modes against it; each pass is stamped
+                                            into the profile, all four = marked stable (admin).
               vfcurve [--probe]             Record and print the measured voltage/frequency
                       [--seconds N]         curve. --probe locks each clock step under load
                       [--load] [--fresh]    and maps the full curve in ~1 min (admin).
