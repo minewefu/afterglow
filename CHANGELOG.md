@@ -53,6 +53,20 @@
 - The flight recorder no longer blocks a second Afterglow instance from
   starting (screenshot/demo runs skip it; failures degrade to
   monitoring-without-black-box instead of an error dialog)
+- Certifications are now pinned to the NVIDIA driver version they were earned
+  on as well as the offsets — a driver update marks them "⚠ driver changed"
+  (re-certify to confirm the tune still holds on the new driver's clock
+  management). Certifications from older Afterglow builds carry no driver
+  stamp and stay valid.
+- Session comparison: Ctrl+click two recorded sessions on the FPS page for an
+  A/B delta — avg FPS, 1% lows, board power, temperatures, and FPS-per-watt,
+  each as newer-minus-older with percentages — copyable as a Markdown table.
+  Comparing different applications is flagged as not comparable instead of
+  silently diffed.
+- Opt-in update check (off by default): one anonymous request to the GitHub
+  Releases API at startup, a tray note if a newer version exists, and a
+  "Check now" button in Settings → About. Nothing is downloaded or uploaded;
+  failures are silent.
 
 ## 1.0.2 — 2026-08-26
 

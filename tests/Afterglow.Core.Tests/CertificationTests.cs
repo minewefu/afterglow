@@ -73,6 +73,52 @@ public class CertificationTests
         Assert.NotNull(valid);
         Assert.Equal(100, valid.CoreOffsetMHz);
     }
+
+    [Fact]
+    public void Driver_update_invalidates_driver_pinned_certifications()
+    {
+        string? saved = CertificationModes.CurrentDriverVersion;
+        try
+        {
+            CertificationModes.CurrentDriverVersion = "616.56";
+            var profile = Profile(100, 500,
+                Cert(CertificationModes.Sustained, 100, 500) with { DriverVersion = "610.88" });
+
+            Assert.Null(profile.ValidCertification(CertificationModes.Sustained));
+            // ...but the UI can still tell "driver changed" apart from "never certified".
+            Assert.NotNull(profile.OffsetMatchedCertification(CertificationModes.Sustained));
+
+            CertificationModes.CurrentDriverVersion = "610.88";
+            Assert.NotNull(profile.ValidCertification(CertificationModes.Sustained));
+        }
+        finally
+        {
+            CertificationModes.CurrentDriverVersion = saved;
+        }
+    }
+
+    [Fact]
+    public void Legacy_certifications_without_a_driver_version_stay_valid()
+    {
+        string? saved = CertificationModes.CurrentDriverVersion;
+        try
+        {
+            CertificationModes.CurrentDriverVersion = "616.56";
+            var legacy = Profile(100, 500, Cert(CertificationModes.Sustained, 100, 500));
+
+            Assert.NotNull(legacy.ValidCertification(CertificationModes.Sustained));
+
+            // No known current driver (demo mode) never invalidates anything either.
+            CertificationModes.CurrentDriverVersion = null;
+            var pinned = Profile(100, 500,
+                Cert(CertificationModes.Sustained, 100, 500) with { DriverVersion = "610.88" });
+            Assert.NotNull(pinned.ValidCertification(CertificationModes.Sustained));
+        }
+        finally
+        {
+            CertificationModes.CurrentDriverVersion = saved;
+        }
+    }
 }
 
 public class VramPlanTests

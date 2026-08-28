@@ -47,6 +47,7 @@ public sealed class GpuManager : IDisposable
         }
 
         DriverVersion = _nvml.GetDriverVersion();
+        Profiles.CertificationModes.CurrentDriverVersion = DriverVersion;
 
         // NVAPI exposes only the PCI bus number, so pairing with NVML is keyed
         // on it. Two GPUs sharing a bus number (different PCI domains) would

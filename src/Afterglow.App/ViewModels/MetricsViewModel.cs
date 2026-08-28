@@ -44,9 +44,45 @@ public partial class MetricsViewModel : ObservableObject
     public System.Collections.ObjectModel.ObservableCollection<SessionReport> SessionHistory { get; } = [];
 
     public string SessionHistoryNote { get; } =
-        "Every capture of 30 s or more is recorded here with the offsets that were applied — run the same " +
-        "game before and after a tuning change and the comparison writes itself. FPS numbers are the trailing " +
-        "30 s window at capture end; power/temps are averaged over the session.";
+        "Every capture of 30 s or more is recorded here with the offsets that were applied. Ctrl+click two " +
+        "sessions to compare them. FPS numbers are the trailing 30 s window at capture end; power/temps are " +
+        "averaged over the session.";
+
+    [ObservableProperty] private string _compareText = string.Empty;
+
+    public bool HasComparison => CompareText.Length > 0;
+
+    partial void OnCompareTextChanged(string value) => OnPropertyChanged(nameof(HasComparison));
+
+    private SessionReport? _compareA;
+    private SessionReport? _compareB;
+
+    /// <summary>Called from the view when the session list selection changes.</summary>
+    public void OnSessionSelectionChanged(IReadOnlyList<SessionReport> selected)
+    {
+        if (selected.Count != 2)
+        {
+            _compareA = null;
+            _compareB = null;
+            CompareText = selected.Count > 2
+                ? "Select exactly two sessions to compare."
+                : string.Empty;
+            return;
+        }
+
+        _compareA = selected[0];
+        _compareB = selected[1];
+        CompareText = SessionCompare.Describe(_compareA, _compareB);
+    }
+
+    [RelayCommand]
+    private void CopyComparison()
+    {
+        if (_compareA is { } a && _compareB is { } b)
+        {
+            Clipboard.SetText(SessionCompare.ToMarkdown(a, b));
+        }
+    }
 
     [RelayCommand]
     private void CopySessionHistory()

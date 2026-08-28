@@ -122,6 +122,12 @@ public sealed record AppSettings
 
     /// <summary>Sustained-condition automation rules (temperature/power watchdogs with actions).</summary>
     public IReadOnlyList<AutomationRule> AutomationRules { get; init; } = [];
+
+    /// <summary>
+    /// Opt-in (default off): at startup, one anonymous request to the GitHub
+    /// Releases API to see whether a newer version exists. Nothing is uploaded.
+    /// </summary>
+    public bool UpdateCheckEnabled { get; init; }
 }
 
 /// <summary>Atomic JSON persistence for <see cref="AppSettings"/>.</summary>

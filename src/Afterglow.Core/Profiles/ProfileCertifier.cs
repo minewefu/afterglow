@@ -288,6 +288,7 @@ public sealed class ProfileCertifier
                 CoreOffsetMHz = profile.CoreOffsetMHz,
                 MemOffsetMHz = profile.MemOffsetMHz,
                 Evidence = evidence,
+                DriverVersion = CertificationModes.CurrentDriverVersion,
             });
             _store.Save(stored with { Certifications = kept, ModifiedAt = DateTimeOffset.Now });
         }

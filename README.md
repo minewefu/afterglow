@@ -35,7 +35,9 @@ Afterglow is a from-scratch, MIT-licensed answer:
   approach used by NVIDIA FrameView and CapFrameX), and the overlay is a composited window —
   no DLLs are placed into your games.
 - **No telemetry, no login, no auto-updater phoning home.** Settings and profiles are plain
-  JSON on your disk.
+  JSON on your disk. The only network code in the app is an **opt-in, off-by-default** update
+  check (one anonymous request to the GitHub Releases API at startup; it downloads nothing
+  and uploads nothing).
 - **Honest engineering.** Every tuning range is read from the driver; offsets, power limit,
   and voltage boost are verified by reading the applied value back (the clock lock has no
   driver getter, so Afterglow tracks it and says so); and anything a GPU generation doesn't

@@ -22,6 +22,8 @@ public partial class SettingsViewModel : ObservableObject
     [ObservableProperty] private bool _closeToTray;
     [ObservableProperty] private bool _startMinimizedToTray;
     [ObservableProperty] private bool _resetOnDriverCrash;
+    [ObservableProperty] private bool _updateCheckEnabled;
+    [ObservableProperty] private string _updateStatusText = string.Empty;
 
     [ObservableProperty] private bool _startWithWindows;
     [ObservableProperty] private string _startWithWindowsNote = string.Empty;
@@ -211,6 +213,7 @@ public partial class SettingsViewModel : ObservableObject
         CloseToTray = s.CloseToTray;
         StartMinimizedToTray = s.StartMinimizedToTray;
         ResetOnDriverCrash = s.ResetOnDriverCrash;
+        UpdateCheckEnabled = s.UpdateCheckEnabled;
         AlertGpuTemp = s.AlertGpuTempC == 0 ? 49 : s.AlertGpuTempC;
         AlertMemTemp = s.AlertMemJunctionTempC == 0 ? 49 : s.AlertMemJunctionTempC;
         OverlayCornerIndex = (int)s.Overlay.Corner;
@@ -243,6 +246,7 @@ public partial class SettingsViewModel : ObservableObject
             CloseToTray = CloseToTray,
             StartMinimizedToTray = StartMinimizedToTray,
             ResetOnDriverCrash = ResetOnDriverCrash,
+            UpdateCheckEnabled = UpdateCheckEnabled,
             AlertGpuTempC = AlertGpuTemp < 50 ? 0 : (int)AlertGpuTemp,
             AlertMemJunctionTempC = AlertMemTemp < 50 ? 0 : (int)AlertMemTemp,
             Overlay = s.Overlay with
@@ -267,6 +271,38 @@ public partial class SettingsViewModel : ObservableObject
     partial void OnStartMinimizedToTrayChanged(bool value) => Persist();
 
     partial void OnResetOnDriverCrashChanged(bool value) => Persist();
+
+    partial void OnUpdateCheckEnabledChanged(bool value) => Persist();
+
+    [RelayCommand]
+    private async Task CheckForUpdatesNowAsync()
+    {
+        UpdateStatusText = "Checking…";
+        var current = Core.Services.UpdateChecker.CurrentVersion ?? new Version(0, 0, 0);
+        var result = await Core.Services.UpdateChecker.CheckAsync(current);
+        UpdateStatusText = result is null
+            ? "Check failed — no connection, or GitHub rate-limited the request. Nothing was retried."
+            : result.UpdateAvailable
+                ? $"{result.LatestTag} is available (you're on v{current.ToString(3)}) — use the Releases page button."
+                : $"Up to date (v{current.ToString(3)}).";
+    }
+
+    [RelayCommand]
+    private void OpenReleasesPage()
+    {
+        try
+        {
+            _ = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = Core.Services.UpdateChecker.ReleasesPageUrl,
+                UseShellExecute = true,
+            });
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or IOException)
+        {
+            UpdateStatusText = $"Could not open the browser: {ex.Message}";
+        }
+    }
 
     partial void OnAlertGpuTempChanged(double value) => Persist();
 

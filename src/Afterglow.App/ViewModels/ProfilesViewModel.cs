@@ -92,7 +92,9 @@ public partial class ProfilesViewModel : ObservableObject
         : string.Join("   ", CertificationModes.All.Select(mode =>
             p.ValidCertification(mode) is { } cert
                 ? $"{mode} ✓ {cert.PassedAt:MM-dd}"
-                : $"{mode} —"));
+                : p.OffsetMatchedCertification(mode) is not null
+                    ? $"{mode} ⚠ driver changed"
+                    : $"{mode} —"));
 
     partial void OnSelectedChanged(TuningProfile? value) =>
         OnPropertyChanged(nameof(SelectedCertificationText));

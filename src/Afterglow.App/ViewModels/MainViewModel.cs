@@ -135,7 +135,39 @@ public partial class MainViewModel : ObservableObject
                         "Fan command failed",
                         $"The driver refused a fan command ({rc}). Fan control may need administrator rights."));
         }
+
+        if (services.Settings.UpdateCheckEnabled && !services.DemoMode)
+        {
+            StartupUpdateCheck();
+        }
     }
+
+    /// <summary>
+    /// Fire-and-forget opt-in update check: waits out the startup burst, makes
+    /// one request, and only ever surfaces a tray balloon when something newer
+    /// exists. Every failure path is silent by design — an update check must
+    /// never produce an error the user has to deal with.
+    /// </summary>
+    private void StartupUpdateCheck() => _ = Task.Run(async () =>
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(10)).ConfigureAwait(false);
+            var current = Core.Services.UpdateChecker.CurrentVersion ?? new Version(0, 0, 0);
+            var result = await Core.Services.UpdateChecker.CheckAsync(current).ConfigureAwait(false);
+            if (result is { UpdateAvailable: true })
+            {
+                Application.Current?.Dispatcher.BeginInvoke(() =>
+                    TrayAlert?.Invoke(
+                        "Update available",
+                        $"Afterglow {result.LatestTag} is out (you're on v{current.ToString(3)}). " +
+                        "Settings → About has the Releases page."));
+            }
+        }
+        catch (Exception)
+        {
+        }
+    });
 
     /// <summary>Raised for tray balloon alerts (title, message).</summary>
     public event Action<string, string>? TrayAlert;
