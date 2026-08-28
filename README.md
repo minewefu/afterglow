@@ -105,8 +105,10 @@ Afterglow is a from-scratch, MIT-licensed answer:
   explains the failure in plain language ("hard reset 3 min after load ended with +2000 MHz
   memory — matches transition instability"), instead of leaving you guessing
 - **Full-VRAM test**: fills as much of the card's memory as the OS safely allows (29 GiB on a
-  32 GiB card, verified at 100+ GiB/s on the GPU itself) with deterministic patterns, alternate
-  rounds bit-inverted — catches memory-offset errors the bandwidth burn can't
+  32 GiB card) with deterministic patterns, alternate rounds bit-inverted, verified on the GPU
+  itself — 87 GiB/s measured over a 2-minute run on RTX 5090 with driver 616.56 (throughput
+  varies by driver; the tool prints its own live rate) — catches memory-offset errors the
+  bandwidth burn can't
 - **Profile certification**: one click applies a saved profile and runs all four modes against
   it in sequence; each pass is stamped into the profile, pinned to the exact offsets tested
   (editing them invalidates the stamps), and passing all four marks it stable. A failure stops

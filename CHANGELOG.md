@@ -67,6 +67,13 @@
   Releases API at startup, a tray note if a newer version exists, and a
   "Check now" button in Settings → About. Nothing is downloaded or uploaded;
   failures are silent.
+- Review round 2 (docs/REVIEW-2026-08-28.md): fan commands are serialized and
+  generation-checked so a mode change can never be undone by a slower
+  in-flight command from the previous mode; the MCP server survives tools
+  returning non-object JSON; `find_stable_offset` takes a `max_minutes`
+  budget and restores the starting offset on timeout; the VRAM bandwidth
+  claim re-measured honestly (87 GiB/s over 2 minutes on driver 616.56, not
+  the 100+ recorded on 610.88)
 
 ## 1.0.2 — 2026-08-26
 

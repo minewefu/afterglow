@@ -145,17 +145,21 @@ internal static class McpCommand
         string payload = JsonSerializer.Serialize(outcome, Json);
 
         // The MCP-standard flag must agree with the body: an agent checking
-        // only isError must not conclude a failed apply succeeded.
+        // only isError must not conclude a failed apply succeeded. Indexing is
+        // only valid on JSON objects — a tool returning an array or scalar
+        // must not take down the server's request loop.
         if (!isError)
         {
             try
             {
-                var body = JsonNode.Parse(payload);
-                isError = body?["error"] is not null ||
-                          body?["allSucceeded"]?.GetValue<bool>() == false ||
-                          body?["all_succeeded"]?.GetValue<bool>() == false;
+                if (JsonNode.Parse(payload) is JsonObject body)
+                {
+                    isError = body["error"] is not null ||
+                              body["allSucceeded"]?.GetValue<bool>() == false ||
+                              body["all_succeeded"]?.GetValue<bool>() == false;
+                }
             }
-            catch (JsonException)
+            catch (Exception ex) when (ex is JsonException or InvalidOperationException)
             {
             }
         }
@@ -281,7 +285,9 @@ internal static class McpCommand
                 Schema(
                     ("step_mhz", "integer", "MHz added per step, 5-60 (default 30)", false),
                     ("seconds_per_step", "integer", "Burn seconds per step, 30-300 (default 60)", false),
-                    ("max_offset_mhz", "integer", "Highest offset to try, 50-600 (default 300)", false)),
+                    ("max_offset_mhz", "integer", "Highest offset to try, 50-600 (default 300)", false),
+                    ("max_minutes", "integer",
+                        "Wall-clock budget, 5-120 (default 30); on expiry the run is cancelled and the starting offset restored", false)),
                 args => gpu is null ? RequireGpu() : RunStepper(gpu, args)),
 
             new ToolDef(
@@ -441,6 +447,7 @@ internal static class McpCommand
             SecondsPerStep = Math.Clamp(args?["seconds_per_step"]?.GetValue<int>() ?? 60, 30, 300),
             MaxOffsetMHz = Math.Clamp(args?["max_offset_mhz"]?.GetValue<int>() ?? 300, 50, 600),
         };
+        int maxMinutes = Math.Clamp(args?["max_minutes"]?.GetValue<int>() ?? 30, 5, 120);
 
         var stepper = new StabilityStepper(gpu.Tuner);
         var done = new ManualResetEventSlim(false);
@@ -455,7 +462,25 @@ internal static class McpCommand
         };
 
         stepper.Start(options);
-        done.Wait();
+        if (!done.Wait(TimeSpan.FromMinutes(maxMinutes)))
+        {
+            // Time budget exhausted: cancel (the stepper restores the starting
+            // offset on its cancel path) and give the restore a moment to land,
+            // so a client that timed out and walked away never leaves an
+            // untested offset applied.
+            stepper.Cancel();
+            bool restored = done.Wait(TimeSpan.FromSeconds(90));
+            return new
+            {
+                all_succeeded = false,
+                error = $"Stepping did not finish within max_minutes={maxMinutes}. " +
+                        (restored
+                            ? "The run was cancelled and the starting offset restored."
+                            : "Cancellation was requested but not yet confirmed — verify the applied offset."),
+                phase = final?.Phase ?? "timeout",
+                log = final?.Log ?? [],
+            };
+        }
 
         return new
         {

@@ -17,18 +17,24 @@ public enum FanControlMode
 /// Restores firmware control on dispose and on mode change back to Auto.
 /// Driver calls happen outside <c>_lock</c> (a slow kernel transition must not
 /// block the telemetry poller or the UI thread), and <see cref="CommandFailed"/>
-/// is raised outside it too.
+/// is raised outside it too. Because the calls run unlocked, they are
+/// serialised by <c>_commandLock</c> and stamped with a generation captured at
+/// decision time — a command whose generation is stale by the time it holds the
+/// command lock is dropped, so a mode change can never be overwritten by a
+/// slower in-flight command from the previous mode.
 /// </summary>
 public sealed class FanControlService : IDisposable
 {
     private readonly GpuTuner _tuner;
     private readonly object _lock = new();
+    private readonly object _commandLock = new();
 
     private FanControlMode _mode = FanControlMode.Auto;
     private FanCurveEvaluator? _evaluator;
     private FanTempSource _tempSource;
     private double _lastCommandedDuty = -1;
     private bool _weControlFans;
+    private long _generation;
 
     public FanControlService(GpuTuner tuner)
     {
@@ -58,12 +64,13 @@ public sealed class FanControlService : IDisposable
         }
     }
 
-    /// <summary>Raised (outside the internal lock) when a fan command fails, e.g. lost elevation.</summary>
+    /// <summary>Raised (outside the internal locks) when a fan command fails, e.g. lost elevation.</summary>
     public event Action<NvmlReturn>? CommandFailed;
 
     public void SetAuto()
     {
         bool release;
+        long generation;
         lock (_lock)
         {
             _mode = FanControlMode.Auto;
@@ -71,11 +78,18 @@ public sealed class FanControlService : IDisposable
             release = _weControlFans;
             _weControlFans = false;
             _lastCommandedDuty = -1;
+            generation = ++_generation;
         }
 
         if (release)
         {
-            _ = _tuner.RestoreAutoFansRaw();
+            lock (_commandLock)
+            {
+                if (IsCurrent(generation))
+                {
+                    _ = _tuner.RestoreAutoFansRaw();
+                }
+            }
         }
 
         AppliedStateStore.RecordFans(null, null);
@@ -84,10 +98,12 @@ public sealed class FanControlService : IDisposable
     public void SetFixed(uint dutyPct)
     {
         uint duty;
+        long generation;
         lock (_lock)
         {
             _mode = FanControlMode.Fixed;
             _evaluator = null;
+            generation = ++_generation;
 
             // 0 = stop; anything between 1 and the hardware minimum rounds up.
             duty = TuningMath.NormalizeFixedFanDuty(dutyPct, _tuner.Capabilities.FanMinDutyPct);
@@ -96,7 +112,7 @@ public sealed class FanControlService : IDisposable
         // Record manual control only when the command actually landed — a
         // failed command (e.g. not elevated) must not persist a claim that
         // Afterglow took the fans over.
-        if (Command(duty))
+        if (Command(duty, generation))
         {
             AppliedStateStore.RecordFans("fixed", duty);
         }
@@ -115,6 +131,7 @@ public sealed class FanControlService : IDisposable
             _tempSource = config.TempSource;
             _evaluator = new FanCurveEvaluator(config);
             _lastCommandedDuty = -1;
+            _generation++;
         }
 
         AppliedStateStore.RecordFans("curve", null);
@@ -124,6 +141,7 @@ public sealed class FanControlService : IDisposable
     public void OnSnapshot(GpuSnapshot snapshot)
     {
         double duty;
+        long generation;
         lock (_lock)
         {
             if (_mode != FanControlMode.Curve || _evaluator is null)
@@ -148,23 +166,49 @@ public sealed class FanControlService : IDisposable
             {
                 return;
             }
+
+            generation = _generation;
         }
 
-        _ = Command(duty);
+        _ = Command(duty, generation);
     }
 
-    /// <summary>Issues the driver command outside the lock; updates state under it.</summary>
-    private bool Command(double duty)
+    private bool IsCurrent(long generation)
     {
-        var rc = _tuner.SetAllFansRaw((uint)Math.Round(duty));
-        if (rc == NvmlReturn.Success)
+        lock (_lock)
         {
-            lock (_lock)
+            return _generation == generation;
+        }
+    }
+
+    /// <summary>
+    /// Issues the driver command, serialised and generation-checked so that a
+    /// stale command computed before a mode change is dropped instead of
+    /// landing after (and silently undoing) the newer command.
+    /// </summary>
+    private bool Command(double duty, long generation)
+    {
+        NvmlReturn rc;
+        lock (_commandLock)
+        {
+            if (!IsCurrent(generation))
             {
-                _lastCommandedDuty = duty;
-                _weControlFans = true;
+                return false;
             }
 
+            rc = _tuner.SetAllFansRaw((uint)Math.Round(duty));
+            if (rc == NvmlReturn.Success)
+            {
+                lock (_lock)
+                {
+                    _lastCommandedDuty = duty;
+                    _weControlFans = true;
+                }
+            }
+        }
+
+        if (rc == NvmlReturn.Success)
+        {
             return true;
         }
 
@@ -181,11 +225,15 @@ public sealed class FanControlService : IDisposable
             release = _weControlFans;
             _weControlFans = false;
             _lastCommandedDuty = -1;
+            _generation++;
         }
 
         if (release)
         {
-            _ = _tuner.RestoreAutoFansRaw();
+            lock (_commandLock)
+            {
+                _ = _tuner.RestoreAutoFansRaw();
+            }
         }
     }
 }
