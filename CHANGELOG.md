@@ -67,6 +67,18 @@
   Releases API at startup, a tray note if a newer version exists, and a
   "Check now" button in Settings → About. Nothing is downloaded or uploaded;
   failures are silent.
+- Graph inspection: every large dashboard graph shows a crosshair readout on
+  hover — the exact value under the mouse and how long ago it was sampled
+  (real snapshot timestamps, not an assumed polling rate); the temperatures
+  panel is one dual-series graph so a single hover reads GPU and memory
+  junction together; the V/F curve reads out the nearest measured bin (clock,
+  voltage, samples) on hover
+- Click any dashboard hero tile to expand it into a full-width hoverable
+  10-minute graph — VRAM, fans, and core voltage gain large views for the
+  first time
+- The automation-rules row in Settings no longer overflows: it wraps, the
+  numeric fields fit their values, and the fan-% / profile inputs appear only
+  for the action that uses them
 - Review round 2 (docs/REVIEW-2026-08-28.md): fan commands are serialized and
   generation-checked so a mode change can never be undone by a slower
   in-flight command from the previous mode; the MCP server survives tools
