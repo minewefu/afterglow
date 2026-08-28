@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 — 2026-08-28
 
 - Independent defect review (docs/REVIEW-2026-08-28.md): all 22 findings and
   4 README-claim gaps addressed. Highlights: offset apply no longer claims
