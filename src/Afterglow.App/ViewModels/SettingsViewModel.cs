@@ -37,6 +37,17 @@ public partial class SettingsViewModel : ObservableObject
     [ObservableProperty] private string _newAutoFanPct = "85";
     [ObservableProperty] private string _newAutoProfile = string.Empty;
 
+    /// <summary>The fan-% box only applies to the fan action; the profile picker only to the profile action.</summary>
+    public bool NewAutoActionIsFans => NewAutoActionIndex == 0;
+
+    public bool NewAutoActionIsProfile => NewAutoActionIndex == 1;
+
+    partial void OnNewAutoActionIndexChanged(int value)
+    {
+        OnPropertyChanged(nameof(NewAutoActionIsFans));
+        OnPropertyChanged(nameof(NewAutoActionIsProfile));
+    }
+
     [RelayCommand]
     private void AddAutomationRule()
     {

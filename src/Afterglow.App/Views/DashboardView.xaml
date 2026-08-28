@@ -30,9 +30,10 @@
                 </ItemsControl>
             </Grid>
 
-            <!-- Hero cards -->
+            <!-- Hero cards (click one to expand its 10-minute graph) -->
             <UniformGrid Columns="4" Margin="0,14,0,0">
-                <Border Style="{StaticResource Card}" Margin="0,0,10,10">
+                <Border Style="{StaticResource Card}" Margin="0,0,10,10" Tag="clock" Cursor="Hand"
+                        MouseLeftButtonUp="OnTileClick" ToolTip="Click to expand">
                     <StackPanel>
                         <TextBlock Text="CORE CLOCK" Style="{StaticResource CardTitle}" />
                         <StackPanel Orientation="Horizontal">
@@ -45,7 +46,8 @@
                     </StackPanel>
                 </Border>
 
-                <Border Style="{StaticResource Card}" Margin="0,0,10,10">
+                <Border Style="{StaticResource Card}" Margin="0,0,10,10" Tag="temp" Cursor="Hand"
+                        MouseLeftButtonUp="OnTileClick" ToolTip="Click to expand">
                     <StackPanel>
                         <TextBlock Text="TEMPERATURE" Style="{StaticResource CardTitle}" />
                         <StackPanel Orientation="Horizontal">
@@ -62,7 +64,8 @@
                     </StackPanel>
                 </Border>
 
-                <Border Style="{StaticResource Card}" Margin="0,0,10,10">
+                <Border Style="{StaticResource Card}" Margin="0,0,10,10" Tag="power" Cursor="Hand"
+                        MouseLeftButtonUp="OnTileClick" ToolTip="Click to expand">
                     <StackPanel>
                         <TextBlock Text="BOARD POWER" Style="{StaticResource CardTitle}" />
                         <StackPanel Orientation="Horizontal">
@@ -75,7 +78,8 @@
                     </StackPanel>
                 </Border>
 
-                <Border Style="{StaticResource Card}" Margin="0,0,0,10">
+                <Border Style="{StaticResource Card}" Margin="0,0,0,10" Tag="util" Cursor="Hand"
+                        MouseLeftButtonUp="OnTileClick" ToolTip="Click to expand">
                     <StackPanel>
                         <TextBlock Text="GPU LOAD" Style="{StaticResource CardTitle}" />
                         <StackPanel Orientation="Horizontal">
@@ -89,7 +93,8 @@
                     </StackPanel>
                 </Border>
 
-                <Border Style="{StaticResource Card}" Margin="0,0,10,0">
+                <Border Style="{StaticResource Card}" Margin="0,0,10,0" Tag="vram" Cursor="Hand"
+                        MouseLeftButtonUp="OnTileClick" ToolTip="Click to expand">
                     <StackPanel>
                         <TextBlock Text="VRAM" Style="{StaticResource CardTitle}" />
                         <TextBlock Text="{Binding VramText}" FontSize="19" FontWeight="SemiBold" Margin="0,3,0,3" />
@@ -101,7 +106,8 @@
                     </StackPanel>
                 </Border>
 
-                <Border Style="{StaticResource Card}" Margin="0,0,10,0">
+                <Border Style="{StaticResource Card}" Margin="0,0,10,0" Tag="fan" Cursor="Hand"
+                        MouseLeftButtonUp="OnTileClick" ToolTip="Click to expand">
                     <StackPanel>
                         <TextBlock Text="FANS" Style="{StaticResource CardTitle}" />
                         <StackPanel Orientation="Horizontal">
@@ -115,7 +121,8 @@
                     </StackPanel>
                 </Border>
 
-                <Border Style="{StaticResource Card}" Margin="0,0,10,0">
+                <Border Style="{StaticResource Card}" Margin="0,0,10,0" Tag="voltage" Cursor="Hand"
+                        MouseLeftButtonUp="OnTileClick" ToolTip="Click to expand">
                     <StackPanel>
                         <TextBlock Text="CORE VOLTAGE" Style="{StaticResource CardTitle}" />
                         <StackPanel Orientation="Horizontal">
@@ -128,7 +135,8 @@
                     </StackPanel>
                 </Border>
 
-                <Border Style="{StaticResource Card}"
+                <Border Style="{StaticResource Card}" Tag="fps" Cursor="Hand"
+                        MouseLeftButtonUp="OnTileClick" ToolTip="Click to expand"
                         Visibility="{Binding HasFps, Converter={x:Static views:Converters.BoolToVisibility}}">
                     <StackPanel>
                         <TextBlock Text="FPS" Style="{StaticResource CardTitle}" />
@@ -144,8 +152,37 @@
                 </Border>
             </UniformGrid>
 
-            <!-- Large graphs -->
-            <Grid Margin="0,8,0,0">
+            <!-- Expanded tile: one full-width hoverable graph for the clicked hero card -->
+            <Border Style="{StaticResource Card}" Margin="0,8,0,0"
+                    Visibility="{Binding IsExpanded, Converter={x:Static views:Converters.BoolToVisibility}}">
+                <StackPanel>
+                    <Grid>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="{Binding ExpandedTitle}" Style="{StaticResource CardTitle}" />
+                            <TextBlock Text="{Binding ExpandedLabel, StringFormat='  ● {0}'}" FontSize="10.5"
+                                       Foreground="{Binding ExpandedStroke}"
+                                       Visibility="{Binding HasExpandedSecondSeries, Converter={x:Static views:Converters.BoolToVisibility}}" />
+                            <TextBlock Text="{Binding ExpandedLabel2, StringFormat='  ● {0}'}" FontSize="10.5"
+                                       Foreground="{Binding ExpandedStroke2}"
+                                       Visibility="{Binding HasExpandedSecondSeries, Converter={x:Static views:Converters.BoolToVisibility}}" />
+                        </StackPanel>
+                        <Button Style="{StaticResource GhostButton}" Content="✕ Close" HorizontalAlignment="Right"
+                                Command="{Binding CloseExpandedCommand}" />
+                    </Grid>
+                    <controls:SparkGraph Values="{Binding ExpandedSeries}" Values2="{Binding ExpandedSeries2}"
+                                         Times="{Binding ExpandedTimes}"
+                                         Stroke="{Binding ExpandedStroke}" Stroke2="{Binding ExpandedStroke2}"
+                                         Unit="{Binding ExpandedUnit}"
+                                         Label="{Binding ExpandedLabel}" Label2="{Binding ExpandedLabel2}"
+                                         FixedMin="{Binding ExpandedFixedMin}" FixedMax="{Binding ExpandedFixedMax}"
+                                         Capacity="{Binding ExpandedCapacity}" HoverEnabled="True"
+                                         Height="240" Margin="0,8,0,0" />
+                </StackPanel>
+            </Border>
+
+            <!-- Large graphs (hidden while a tile is expanded) -->
+            <Grid Margin="0,8,0,0"
+                  Visibility="{Binding IsExpanded, Converter={x:Static views:Converters.InverseBoolToVisibility}}">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="*" />
@@ -159,6 +196,7 @@
                     <StackPanel>
                         <TextBlock Text="CORE CLOCK — 10 MIN" Style="{StaticResource CardTitle}" />
                         <controls:SparkGraph Values="{Binding CoreClockSeries}" Stroke="{StaticResource SeriesClock}"
+                                             Times="{Binding SeriesTimes}" HoverEnabled="True" Unit="MHz"
                                              Height="130" Margin="0,8,0,0" Capacity="600" />
                     </StackPanel>
                 </Border>
@@ -170,12 +208,12 @@
                             <TextBlock Text="  ● GPU" FontSize="10.5" Foreground="{StaticResource SeriesTemp}" />
                             <TextBlock Text="  ● memory junction" FontSize="10.5" Foreground="{StaticResource SeriesVram}" />
                         </StackPanel>
-                        <Grid Height="130" Margin="0,8,0,0">
-                            <controls:SparkGraph Values="{Binding TempSeries}" Stroke="{StaticResource SeriesTemp}"
-                                                 FixedMin="25" FixedMax="95" Capacity="600" />
-                            <controls:SparkGraph Values="{Binding MemJunctionSeries}" Stroke="{StaticResource SeriesVram}"
-                                                 FixedMin="25" FixedMax="95" ShowScale="False" Capacity="600" />
-                        </Grid>
+                        <controls:SparkGraph Values="{Binding TempSeries}" Values2="{Binding MemJunctionSeries}"
+                                             Stroke="{StaticResource SeriesTemp}" Stroke2="{StaticResource SeriesVram}"
+                                             Times="{Binding SeriesTimes}" HoverEnabled="True" Unit="°C"
+                                             Label="GPU" Label2="mem"
+                                             FixedMin="25" FixedMax="95" Capacity="600"
+                                             Height="130" Margin="0,8,0,0" />
                     </StackPanel>
                 </Border>
 
@@ -183,6 +221,7 @@
                     <StackPanel>
                         <TextBlock Text="BOARD POWER — 10 MIN" Style="{StaticResource CardTitle}" />
                         <controls:SparkGraph Values="{Binding PowerSeries}" Stroke="{StaticResource SeriesPower}"
+                                             Times="{Binding SeriesTimes}" HoverEnabled="True" Unit="W"
                                              Height="130" Margin="0,8,0,0" Capacity="600" />
                     </StackPanel>
                 </Border>
@@ -191,6 +230,7 @@
                     <StackPanel>
                         <TextBlock Text="GPU LOAD — 10 MIN" Style="{StaticResource CardTitle}" />
                         <controls:SparkGraph Values="{Binding UtilSeries}" Stroke="{StaticResource SeriesUtil}"
+                                             Times="{Binding SeriesTimes}" HoverEnabled="True" Unit="%"
                                              Height="130" Margin="0,8,0,0" FixedMin="0" FixedMax="100" Capacity="600" />
                     </StackPanel>
                 </Border>

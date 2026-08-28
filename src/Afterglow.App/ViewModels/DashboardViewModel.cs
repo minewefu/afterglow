@@ -46,6 +46,131 @@ public partial class DashboardViewModel : ObservableObject
     [ObservableProperty] private IReadOnlyList<double>? _fanSeries;
     [ObservableProperty] private IReadOnlyList<double>? _voltageSeries;
 
+    /// <summary>Timestamps for the telemetry series above (all share the snapshot ring).</summary>
+    [ObservableProperty] private IReadOnlyList<DateTimeOffset>? _seriesTimes;
+
+    // Expanded tile (click a hero card to open its full 10-minute graph)
+    [ObservableProperty] private string? _expandedMetric;
+    [ObservableProperty] private string _expandedTitle = string.Empty;
+    [ObservableProperty] private string _expandedUnit = string.Empty;
+    [ObservableProperty] private string _expandedLabel = string.Empty;
+    [ObservableProperty] private string _expandedLabel2 = string.Empty;
+    [ObservableProperty] private IReadOnlyList<double>? _expandedSeries;
+    [ObservableProperty] private IReadOnlyList<double>? _expandedSeries2;
+    [ObservableProperty] private IReadOnlyList<DateTimeOffset>? _expandedTimes;
+    [ObservableProperty] private System.Windows.Media.Brush? _expandedStroke;
+    [ObservableProperty] private System.Windows.Media.Brush? _expandedStroke2;
+    [ObservableProperty] private double _expandedFixedMin = double.NaN;
+    [ObservableProperty] private double _expandedFixedMax = double.NaN;
+    [ObservableProperty] private int _expandedCapacity = 600;
+
+    public bool IsExpanded => ExpandedMetric is not null;
+
+    public bool HasExpandedSecondSeries => ExpandedSeries2 is not null;
+
+    partial void OnExpandedMetricChanged(string? value) => OnPropertyChanged(nameof(IsExpanded));
+
+    partial void OnExpandedSeries2Changed(IReadOnlyList<double>? value) =>
+        OnPropertyChanged(nameof(HasExpandedSecondSeries));
+
+    /// <summary>Click on a hero tile: opens its expanded graph, or closes it if already open.</summary>
+    public void ToggleExpand(string metricKey)
+    {
+        ExpandedMetric = ExpandedMetric == metricKey ? null : metricKey;
+        RefreshExpanded();
+    }
+
+    [CommunityToolkit.Mvvm.Input.RelayCommand]
+    private void CloseExpanded() => ExpandedMetric = null;
+
+    private static System.Windows.Media.Brush? SeriesBrush(string key) =>
+        Application.Current?.TryFindResource(key) as System.Windows.Media.Brush;
+
+    private void RefreshExpanded()
+    {
+        if (ExpandedMetric is not { } key)
+        {
+            return;
+        }
+
+        ExpandedSeries2 = null;
+        ExpandedStroke2 = null;
+        ExpandedLabel = string.Empty;
+        ExpandedLabel2 = string.Empty;
+        ExpandedFixedMin = double.NaN;
+        ExpandedFixedMax = double.NaN;
+        ExpandedTimes = SeriesTimes;
+        ExpandedCapacity = 600;
+
+        switch (key)
+        {
+            case "clock":
+                ExpandedTitle = "CORE CLOCK — 10 MIN";
+                ExpandedUnit = "MHz";
+                ExpandedSeries = CoreClockSeries;
+                ExpandedStroke = SeriesBrush("SeriesClock");
+                break;
+            case "temp":
+                ExpandedTitle = "TEMPERATURES — 10 MIN";
+                ExpandedUnit = "°C";
+                ExpandedSeries = TempSeries;
+                ExpandedSeries2 = MemJunctionSeries;
+                ExpandedStroke = SeriesBrush("SeriesTemp");
+                ExpandedStroke2 = SeriesBrush("SeriesVram");
+                ExpandedLabel = "GPU";
+                ExpandedLabel2 = "mem";
+                ExpandedFixedMin = 25;
+                ExpandedFixedMax = 95;
+                break;
+            case "power":
+                ExpandedTitle = "BOARD POWER — 10 MIN";
+                ExpandedUnit = "W";
+                ExpandedSeries = PowerSeries;
+                ExpandedStroke = SeriesBrush("SeriesPower");
+                break;
+            case "util":
+                ExpandedTitle = "GPU LOAD — 10 MIN";
+                ExpandedUnit = "%";
+                ExpandedSeries = UtilSeries;
+                ExpandedStroke = SeriesBrush("SeriesUtil");
+                ExpandedFixedMin = 0;
+                ExpandedFixedMax = 100;
+                break;
+            case "vram":
+                ExpandedTitle = "VRAM USED — 10 MIN";
+                ExpandedUnit = "GB";
+                ExpandedSeries = VramSeries;
+                ExpandedStroke = SeriesBrush("SeriesVram");
+                ExpandedFixedMin = 0;
+                break;
+            case "fan":
+                ExpandedTitle = "FAN DUTY — 10 MIN";
+                ExpandedUnit = "%";
+                ExpandedSeries = FanSeries;
+                ExpandedStroke = SeriesBrush("SeriesFan");
+                ExpandedFixedMin = 0;
+                ExpandedFixedMax = 100;
+                break;
+            case "voltage":
+                ExpandedTitle = "CORE VOLTAGE — 10 MIN";
+                ExpandedUnit = "mV";
+                ExpandedSeries = VoltageSeries;
+                ExpandedStroke = SeriesBrush("SeriesVoltage");
+                break;
+            case "fps":
+                ExpandedTitle = "FRAMETIMES — LAST 360 FRAMES";
+                ExpandedUnit = "ms";
+                ExpandedSeries = FrametimeSeries;
+                ExpandedStroke = SeriesBrush("SeriesFps");
+                ExpandedTimes = null;      // frame axis, not time — no honest timestamp to show
+                ExpandedCapacity = 360;
+                break;
+            default:
+                ExpandedMetric = null;
+                break;
+        }
+    }
+
     public ObservableCollectionOfChips ThrottleChips { get; } = new();
 
     public DashboardViewModel(AppServices services)
@@ -107,6 +232,7 @@ public partial class DashboardViewModel : ObservableObject
 
         UpdateSeries();
         UpdateFps();
+        RefreshExpanded();
     }
 
     private void UpdateSeries()
@@ -126,6 +252,14 @@ public partial class DashboardViewModel : ObservableObject
         VramSeries = Extract(history, static s => s.VramUsedBytes is ulong b ? b / 1024.0 / 1024 / 1024 : null);
         FanSeries = Extract(history, static s => s.MaxFanPercent);
         VoltageSeries = Extract(history, static s => s.CoreVoltageMv);
+
+        var times = new DateTimeOffset[history.Length];
+        for (int i = 0; i < history.Length; i++)
+        {
+            times[i] = history[i].Timestamp;
+        }
+
+        SeriesTimes = times;
     }
 
     private void UpdateFps()

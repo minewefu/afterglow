@@ -47,6 +47,7 @@ public sealed class VfCurveChart : FrameworkElement
     private static readonly Typeface LabelFace = new("Segoe UI");
 
     private double _minV = 700, _maxV = 1200, _minF = 1000, _maxF = 3200;
+    private Point? _hover;
 
     public IReadOnlyList<VfBin>? Curve
     {
@@ -217,6 +218,39 @@ public sealed class VfCurveChart : FrameworkElement
             dc.DrawEllipse(CurveBrush, null, ToScreen(bin.VoltageMv, bin.MaxClockMHz), 2.5, 2.5);
         }
 
+        // Hover readout: the nearest measured bin under the mouse (suppressed
+        // while dragging a target pick, whose own crosshair takes over).
+        if (_hover is { } hover && !IsMouseCaptured)
+        {
+            VfBin? nearest = null;
+            double bestDx = double.MaxValue;
+            foreach (var bin in curve)
+            {
+                double dx = Math.Abs(ToScreen(bin.VoltageMv, bin.MaxClockMHz).X - hover.X);
+                if (dx < bestDx)
+                {
+                    bestDx = dx;
+                    nearest = bin;
+                }
+            }
+
+            if (nearest is { } hit)
+            {
+                var p = ToScreen(hit.VoltageMv, hit.MaxClockMHz);
+                dc.DrawLine(new Pen(GridBrush, 1), new Point(p.X, r.Y), new Point(p.X, r.Bottom));
+                dc.DrawEllipse(null, new Pen(CurveBrush, 2), p, 5.5, 5.5);
+
+                var hoverLabel = Format(
+                    $"{hit.MaxClockMHz:F0} MHz @ {hit.VoltageMv:F0} mV · {hit.Samples:N0} samples",
+                    11, PillTextBrush);
+                double hxp = Math.Clamp(p.X + 10, r.X + 2, r.Right - hoverLabel.Width - 8);
+                double hyp = Math.Clamp(p.Y - 26, r.Y + 2, r.Bottom - hoverLabel.Height - 4);
+                var hoverPill = new Rect(hxp - 4, hyp - 2, hoverLabel.Width + 8, hoverLabel.Height + 4);
+                dc.DrawRoundedRectangle(PillBrush, null, hoverPill, 4, 4);
+                dc.DrawText(hoverLabel, new Point(hxp, hyp));
+            }
+        }
+
         // Target marker + crosshair.
         if (TargetVoltage > 0 && TargetClock > 0)
         {
@@ -259,6 +293,7 @@ public sealed class VfCurveChart : FrameworkElement
     }
 
     private static readonly Brush PillBrush = Freeze(new SolidColorBrush(Color.FromArgb(210, 12, 15, 20)));
+    private static readonly Brush PillTextBrush = Freeze(new SolidColorBrush(Color.FromArgb(235, 255, 255, 255)));
 
     private FormattedText Format(string text, double size, Brush brush) =>
         new(text, CultureInfo.InvariantCulture, FlowDirection.LeftToRight,
@@ -282,6 +317,20 @@ public sealed class VfCurveChart : FrameworkElement
         if (IsMouseCaptured)
         {
             Pick(e.GetPosition(this));
+            return;
+        }
+
+        _hover = e.GetPosition(this);
+        InvalidateVisual();
+    }
+
+    protected override void OnMouseLeave(MouseEventArgs e)
+    {
+        base.OnMouseLeave(e);
+        if (_hover is not null)
+        {
+            _hover = null;
+            InvalidateVisual();
         }
     }
 
