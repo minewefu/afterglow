@@ -6,7 +6,12 @@ namespace Afterglow.Core;
 /// </summary>
 public static class AppPaths
 {
-    public static string Root { get; } = Path.Combine(
+    /// <summary>Test seam: redirects every path off the real ProgramData tree. Never set in production.</summary>
+    internal static string? OverrideRoot { get; set; }
+
+    public static string Root => OverrideRoot ?? DefaultRoot;
+
+    private static string DefaultRoot { get; } = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "Afterglow");
 
     public static string ProfilesDir => Path.Combine(Root, "profiles");

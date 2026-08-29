@@ -163,7 +163,7 @@ public partial class VfCurveViewModel : ObservableObject
             return;
         }
 
-        _probe = new VfCurveProbe(_gpu.Tuner, () => _gpu.Poller.Poll());
+        _probe = new VfCurveProbe(_gpu.Tuner, () => _gpu.Poller.Poll()) { TargetPciBusId = _gpu.PciBusId };
         _probe.ProgressChanged += progress =>
             Application.Current?.Dispatcher.BeginInvoke(() =>
             {

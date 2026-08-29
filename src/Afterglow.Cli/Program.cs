@@ -23,7 +23,7 @@ internal static class Program
             "certify" => CertifyCommand.Run(args),
             "drs" => DrsCommand.Run(args),
             "vfcurve" => VfCurveCommand.Run(args),
-            "mcp" => McpCommand.Run(),
+            "mcp" => McpCommand.Run(args),
             "help" or "--help" or "-h" => Help(),
             _ => Fail($"Unknown command '{command}'. Run 'afterglow-cli help'."),
         };
@@ -48,18 +48,22 @@ internal static class Program
               fps [--seconds N]             Capture FPS/frametimes for all presenting apps.
               stress [--seconds N]          Burn test with bit-exact error detection.
                      [--pattern P]          sustained (default) | transitions | excursions
-                     [--intensity N]
-              vram [--seconds N]            Full-capacity VRAM test: fills and verifies as
+                     [--intensity N] [--gpu N]
+              vram [--seconds N] [--gpu N]  Full-capacity VRAM test: fills and verifies as
                                             much of the card as the OS safely allows.
               certify --profile NAME        Apply a saved profile, then run all four
-                      [--seconds N]         stability modes against it; each pass is stamped
+                      [--seconds N] [--gpu N]  stability modes against it; each pass is stamped
                                             into the profile, all four = marked stable (admin).
               vfcurve [--probe]             Record and print the measured voltage/frequency
-                      [--seconds N]         curve. --probe locks each clock step under load
+                      [--seconds N] [--gpu N]  curve. --probe locks each clock step under load
                       [--load] [--fresh]    and maps the full curve in ~1 min (admin).
-              mcp                           Model Context Protocol server over stdio, so AI
+              mcp [--gpu N]                 Model Context Protocol server over stdio, so AI
                                             agents can monitor, tune, and stability-test the
                                             GPU with typed tools (run elevated for writes).
+                                            --gpu binds the whole server to one card.
+
+            On multi-GPU systems, --gpu binds stress/VRAM work to that card's exact
+            D3D adapter (matched by PCI bus, never by adapter order).
 
             caps, get, and monitor --once accept --json for machine-readable output.
               help                          Show this help.

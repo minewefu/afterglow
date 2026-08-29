@@ -96,6 +96,12 @@ public sealed class VramTest : IDisposable
     private volatile bool _stop;
     private VramProgress _progress = new(StressState.Idle, TimeSpan.Zero, 0, 0, 0, 0, 0, null);
 
+    /// <summary>
+    /// PCI bus of the card being tuned; binds the test to that exact adapter.
+    /// Null keeps the largest-VRAM NVIDIA fallback (single-GPU behavior).
+    /// </summary>
+    public uint? TargetPciBusId { get; set; }
+
     public event Action<VramProgress>? ProgressChanged;
 
     public VramProgress Progress
@@ -192,13 +198,17 @@ public sealed class VramTest : IDisposable
 
         try
         {
-            using var targetAdapter = StressAdapter.SelectNvidia(out string adapterName);
+            using var targetAdapter = StressAdapter.Select(TargetPciBusId, out string adapterName);
             if (targetAdapter is null)
             {
                 Report(StressState.Failed, stopwatch.Elapsed, 0, 0, 0, 0, 0,
-                    "No NVIDIA adapter found — refusing to run the VRAM test on a different GPU.");
+                    adapterName.Length > 0
+                        ? $"Adapter binding failed: {adapterName}"
+                        : "No NVIDIA adapter found — refusing to run the VRAM test on a different GPU.");
                 return;
             }
+
+            Diagnostics.Log.Info($"VRAM-test adapter: {adapterName}");
 
             var result = D3D11.D3D11CreateDevice(
                 targetAdapter, DriverType.Unknown, DeviceCreationFlags.None,

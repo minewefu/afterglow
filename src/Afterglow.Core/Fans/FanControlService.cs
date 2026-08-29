@@ -92,7 +92,7 @@ public sealed class FanControlService : IDisposable
             }
         }
 
-        AppliedStateStore.RecordFans(null, null);
+        AppliedStateStore.RecordFans(null, null, _tuner.GpuUuid);
     }
 
     public void SetFixed(uint dutyPct)
@@ -114,7 +114,7 @@ public sealed class FanControlService : IDisposable
         // Afterglow took the fans over.
         if (Command(duty, generation))
         {
-            AppliedStateStore.RecordFans("fixed", duty);
+            AppliedStateStore.RecordFans("fixed", duty, _tuner.GpuUuid);
         }
     }
 
@@ -134,7 +134,7 @@ public sealed class FanControlService : IDisposable
             _generation++;
         }
 
-        AppliedStateStore.RecordFans("curve", null);
+        AppliedStateStore.RecordFans("curve", null, _tuner.GpuUuid);
     }
 
     /// <summary>Feed one telemetry snapshot (called on the polling thread).</summary>

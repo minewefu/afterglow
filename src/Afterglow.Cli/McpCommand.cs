@@ -28,10 +28,24 @@ internal static class McpCommand
 
     private sealed record ToolDef(string Name, string Description, JsonObject InputSchema, Func<JsonObject?, object> Invoke);
 
-    public static int Run()
+    public static int Run(string[]? args = null)
     {
         using var manager = new GpuManager();
+
+        // `mcp --gpu N` binds the whole server to one card; agents that want
+        // another card run a second server. Default: the first NVML device.
         var gpu = manager.Gpus.Count > 0 ? manager.Gpus[0] : null;
+        if (args is not null && CliGpu.ParseIndex(args) is { } wantedIndex)
+        {
+            gpu = manager.Gpus.FirstOrDefault(g => g.Index == wantedIndex);
+            if (gpu is null)
+            {
+                Console.Error.WriteLine(
+                    $"GPU {wantedIndex} not found — {manager.Gpus.Count} NVIDIA GPU(s) detected.");
+                return 2;
+            }
+        }
+
         bool elevated = AppServicesLikeElevationCheck();
         var profiles = new ProfileStore();
 
@@ -449,7 +463,7 @@ internal static class McpCommand
         };
         int maxMinutes = Math.Clamp(args?["max_minutes"]?.GetValue<int>() ?? 30, 5, 120);
 
-        var stepper = new StabilityStepper(gpu.Tuner);
+        var stepper = new StabilityStepper(gpu.Tuner) { TargetPciBusId = gpu.PciBusId };
         var done = new ManualResetEventSlim(false);
         StepperStatus? final = null;
         stepper.StatusChanged += status =>
@@ -495,7 +509,7 @@ internal static class McpCommand
     {
         int seconds = Math.Clamp(args?["seconds"]?.GetValue<int>() ?? 90, 15, 1800);
 
-        using var vram = new VramTest();
+        using var vram = new VramTest { TargetPciBusId = gpu.PciBusId };
         var done = new ManualResetEventSlim(false);
         vram.ProgressChanged += progress =>
         {
@@ -554,7 +568,12 @@ internal static class McpCommand
             _ => StressPattern.Sustained,
         };
 
-        using var stress = new GpuStressTest { IterationsPerDispatch = intensity, Pattern = pattern };
+        using var stress = new GpuStressTest
+        {
+            IterationsPerDispatch = intensity,
+            Pattern = pattern,
+            TargetPciBusId = gpu.PciBusId,
+        };
         var done = new ManualResetEventSlim(false);
         StressProgress? final = null;
         double rateSum = 0;

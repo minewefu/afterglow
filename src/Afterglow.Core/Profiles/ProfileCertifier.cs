@@ -41,11 +41,15 @@ public sealed class ProfileCertifier
 
     public event Action<CertifierStatus>? StatusChanged;
 
-    public ProfileCertifier(GpuTuner tuner, ProfileStore store)
+    public ProfileCertifier(GpuTuner tuner, ProfileStore store, uint? pciBusId = null)
     {
         _tuner = tuner;
         _store = store;
+        _pciBusId = pciBusId;
     }
+
+    /// <summary>Binds the stress engines to the tuned card on multi-GPU systems.</summary>
+    private readonly uint? _pciBusId;
 
     public CertifierStatus Status
     {
@@ -177,7 +181,7 @@ public sealed class ProfileCertifier
             _ => StressPattern.Sustained,
         };
 
-        using var stress = new GpuStressTest { Pattern = pattern };
+        using var stress = new GpuStressTest { Pattern = pattern, TargetPciBusId = _pciBusId };
         var done = new ManualResetEventSlim(false);
         StressProgress? terminal = null;
 
@@ -225,7 +229,7 @@ public sealed class ProfileCertifier
 
     private (bool Passed, string Evidence, string? FailDetail) RunVramMode(int modeIndex, TimeSpan duration)
     {
-        using var vram = new VramTest();
+        using var vram = new VramTest { TargetPciBusId = _pciBusId };
         vram.ProgressChanged += progress =>
             Publish(true, CertificationModes.Vram, modeIndex, progress.Elapsed, duration);
         vram.Start();

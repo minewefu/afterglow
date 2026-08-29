@@ -469,13 +469,15 @@ public partial class MainViewModel : ObservableObject
             return;
         }
 
-        var state = AppliedStateStore.Load();
-        if (state is { CleanShutdown: false })
+        // Per-GPU records: any card with an unclean record raises the banner
+        // (reset-after-crash already resets every GPU).
+        var unclean = AppliedStateStore.LoadAll().FirstOrDefault(s => !s.CleanShutdown);
+        if (unclean is not null)
         {
             ShowCrashBanner = true;
             CrashBannerText =
-                $"Afterglow didn't shut down cleanly last time (profile '{state.ProfileName}' was applied " +
-                $"{state.AppliedAt:g}). If the system crashed, resetting to driver defaults is recommended.";
+                $"Afterglow didn't shut down cleanly last time (profile '{unclean.ProfileName}' was applied " +
+                $"{unclean.AppliedAt:g}). If the system crashed, resetting to driver defaults is recommended.";
         }
     }
 

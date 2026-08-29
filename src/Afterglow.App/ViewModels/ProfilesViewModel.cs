@@ -115,7 +115,8 @@ public partial class ProfilesViewModel : ObservableObject
         }
 
         var profile = Selected;
-        _certifier = new ProfileCertifier(_services.Gpus[0].Tuner, _services.Profiles);
+        _certifier = new ProfileCertifier(
+            _services.Gpus[0].Tuner, _services.Profiles, _services.Gpus[0].PciBusId);
         _certifier.StatusChanged += status =>
             System.Windows.Application.Current?.Dispatcher.BeginInvoke(() => OnCertifierStatus(status));
         CertifyRunning = true;
@@ -293,13 +294,18 @@ public partial class ProfilesViewModel : ObservableObject
 
         try
         {
-            // Profiles capture the full picture: tuning sliders AND the fan configuration.
+            // Profiles capture the full picture: tuning sliders AND the fan
+            // configuration — stamped with the GPU they were saved on, so on a
+            // multi-GPU system they can never be applied to the wrong card.
             var (fanMode, fixedPct, curve) = _fans.CurrentConfig;
+            var gpu = _services.Gpus.Count > 0 ? _services.Gpus[0] : null;
             var profile = _tuning.ToProfile(name) with
             {
                 FanMode = fanMode,
                 FixedFanPct = fixedPct,
                 FanCurve = fanMode == FanMode.Curve ? curve : null,
+                GpuUuid = gpu?.Uuid,
+                GpuName = gpu?.Name,
             };
             _services.Profiles.Save(profile);
             StatusText = $"Saved '{name}' (tuning + {fanMode switch { FanMode.Curve => "fan curve", FanMode.Fixed => "fixed fans", _ => "auto fans" }}).";

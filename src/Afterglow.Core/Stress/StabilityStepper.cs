@@ -50,6 +50,9 @@ public sealed class StabilityStepper
         _tuner = tuner;
     }
 
+    /// <summary>Binds the burn to the tuned card on multi-GPU systems (null = largest NVIDIA).</summary>
+    public uint? TargetPciBusId { get; set; }
+
     public StepperStatus Status
     {
         get
@@ -268,7 +271,7 @@ public sealed class StabilityStepper
 
     private StressState Burn(TimeSpan duration, int offset, int? lastGood)
     {
-        using var stress = new GpuStressTest();
+        using var stress = new GpuStressTest { TargetPciBusId = TargetPciBusId };
         var done = new ManualResetEventSlim(false);
         StressState final = StressState.Failed;
 

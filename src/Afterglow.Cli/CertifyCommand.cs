@@ -5,9 +5,10 @@ using Afterglow.Core.Profiles;
 namespace Afterglow.Cli;
 
 /// <summary>
-/// `certify --profile NAME [--seconds N]` — applies a saved profile and runs
-/// all four stability modes against it (sustained, transitions, excursions,
-/// VRAM), stamping each pass into the profile. All four = marked stable.
+/// `certify --profile NAME [--seconds N] [--gpu N]` — applies a saved profile
+/// and runs all four stability modes against it (sustained, transitions,
+/// excursions, VRAM), stamping each pass into the profile. All four = marked
+/// stable.
 /// </summary>
 internal static class CertifyCommand
 {
@@ -52,7 +53,15 @@ internal static class CertifyCommand
             return 1;
         }
 
-        var certifier = new ProfileCertifier(manager.Gpus[0].Tuner, store);
+        uint gpuIndex = CliGpu.ParseIndex(args) ?? manager.Gpus[0].Index;
+        var gpu = manager.Gpus.FirstOrDefault(g => g.Index == gpuIndex);
+        if (gpu is null)
+        {
+            Console.Error.WriteLine($"GPU {gpuIndex} not found — {manager.Gpus.Count} NVIDIA GPU(s) detected.");
+            return 2;
+        }
+
+        var certifier = new ProfileCertifier(gpu.Tuner, store, gpu.PciBusId);
         var done = new ManualResetEventSlim(false);
         int lastLogCount = 0;
         CertifierStatus? final = null;

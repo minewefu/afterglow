@@ -36,7 +36,26 @@ internal static class StressCommand
             }
         }
 
-        using var stress = new GpuStressTest { IterationsPerDispatch = intensity, Pattern = pattern };
+        // Hidden diagnostic: show how each NVML GPU resolves to a D3D adapter
+        // (exercises the LUID→PCI-bus binding without burning anything).
+        if (args.Contains("--probe-adapter"))
+        {
+            return ProbeAdapter();
+        }
+
+        var (bus, busError) = CliGpu.ResolveBus(args);
+        if (busError is not null)
+        {
+            Console.Error.WriteLine(busError);
+            return 1;
+        }
+
+        using var stress = new GpuStressTest
+        {
+            IterationsPerDispatch = intensity,
+            Pattern = pattern,
+            TargetPciBusId = bus,
+        };
         var done = new ManualResetEventSlim(false);
         StressProgress? final = null;
 
@@ -85,5 +104,26 @@ internal static class StressCommand
         }
 
         return final.State is StressState.Stopped or StressState.Running ? 0 : 1;
+    }
+
+    private static int ProbeAdapter()
+    {
+        using var manager = new Afterglow.Core.Hardware.GpuManager();
+        if (manager.Gpus.Count == 0)
+        {
+            Console.WriteLine($"No NVIDIA GPU via NVML ({manager.NvmlStatus}).");
+        }
+
+        foreach (var gpu in manager.Gpus)
+        {
+            Console.WriteLine(FormattableString.Invariant(
+                $"GPU {gpu.Index}: {gpu.Name}  (NVML PCI bus {(gpu.PciBusId is { } b ? b : (object)"?")}, UUID {gpu.Uuid ?? "?"})"));
+            using var bound = StressAdapter.Select(gpu.PciBusId, out string boundDesc);
+            Console.WriteLine($"  bus-bound D3D adapter: {(bound is null ? "FAILED" : "ok")} — {boundDesc}");
+        }
+
+        using var fallback = StressAdapter.Select(null, out string fallbackDesc);
+        Console.WriteLine($"no-bus fallback (largest NVIDIA): {(fallback is null ? "none" : fallbackDesc)}");
+        return 0;
     }
 }

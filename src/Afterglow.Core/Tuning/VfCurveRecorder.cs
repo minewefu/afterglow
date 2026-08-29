@@ -208,6 +208,31 @@ public sealed class VfCurveRecorder
 
     public static string DefaultPath => Path.Combine(AppPaths.Root, "vf-curve.json");
 
+    /// <summary>
+    /// Per-GPU curve file. The primary GPU keeps the legacy vf-curve.json (its
+    /// data predates multi-GPU and stays valid); other cards get their own file
+    /// so one card's V/F points never plan an undervolt for another.
+    /// </summary>
+    public static string PathFor(string? gpuUuid, bool isPrimary)
+    {
+        if (isPrimary || string.IsNullOrEmpty(gpuUuid))
+        {
+            return DefaultPath;
+        }
+
+        var keep = new string(gpuUuid.Where(char.IsLetterOrDigit).ToArray());
+        if (keep.StartsWith("GPU", StringComparison.OrdinalIgnoreCase))
+        {
+            keep = keep[3..];
+        }
+
+        string suffix = keep.Length > 0 ? keep[..Math.Min(12, keep.Length)].ToLowerInvariant() : "unknown";
+        return Path.Combine(AppPaths.Root, $"vf-curve-{suffix}.json");
+    }
+
+    /// <summary>File this recorder loads from and saves to (null = <see cref="DefaultPath"/>).</summary>
+    public string? PersistPath { get; set; }
+
     public void Save(string? path = null)
     {
         try
@@ -219,7 +244,7 @@ public sealed class VfCurveRecorder
                 data = _bins.Select(kv => new PersistedBin(kv.Key, kv.Value.MaxClock, kv.Value.ClockSum, kv.Value.Samples)).ToArray();
             }
 
-            File.WriteAllText(path ?? DefaultPath, JsonSerializer.Serialize(data, JsonOptions));
+            File.WriteAllText(path ?? PersistPath ?? DefaultPath, JsonSerializer.Serialize(data, JsonOptions));
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -230,7 +255,7 @@ public sealed class VfCurveRecorder
     {
         try
         {
-            string file = path ?? DefaultPath;
+            string file = path ?? PersistPath ?? DefaultPath;
             if (!File.Exists(file))
             {
                 return;

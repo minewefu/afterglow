@@ -15,6 +15,12 @@ public sealed class GpuContext
     public uint Architecture { get; init; }
     public required SensorPoller Poller { get; init; }
     public required GpuTuner Tuner { get; init; }
+
+    /// <summary>NVML UUID — the stable identity profiles and applied state are stamped with.</summary>
+    public string? Uuid { get; init; }
+
+    /// <summary>PCI bus number — binds stress/VRAM tests to this physical card.</summary>
+    public uint? PciBusId { get; init; }
 }
 
 /// <summary>
@@ -79,8 +85,10 @@ public sealed class GpuManager : IDisposable
         foreach (var device in _nvml.GetDevices())
         {
             NvapiGpu? pairedNvapi = null;
+            uint? pciBus = null;
             if (device.TryGetPciInfo(out _, out uint bus, out _, out _) == NvmlReturn.Success)
             {
+                pciBus = bus;
                 nvapiByBus.TryGetValue(bus, out pairedNvapi);
             }
 
@@ -107,6 +115,8 @@ public sealed class GpuManager : IDisposable
                 Architecture = arch,
                 Poller = poller,
                 Tuner = new GpuTuner(device, pairedNvapi),
+                Uuid = device.GetUuid(),
+                PciBusId = pciBus,
             });
         }
 

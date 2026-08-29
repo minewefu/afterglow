@@ -42,8 +42,18 @@ internal static class VfCurveCommand
             return 1;
         }
 
-        var gpu = manager.Gpus[0];
-        var recorder = new VfCurveRecorder();
+        uint gpuIndex = CliGpu.ParseIndex(args) ?? manager.Gpus[0].Index;
+        var gpu = manager.Gpus.FirstOrDefault(g => g.Index == gpuIndex);
+        if (gpu is null)
+        {
+            Console.Error.WriteLine($"GPU {gpuIndex} not found — {manager.Gpus.Count} NVIDIA GPU(s) detected.");
+            return 2;
+        }
+
+        var recorder = new VfCurveRecorder
+        {
+            PersistPath = VfCurveRecorder.PathFor(gpu.Uuid, isPrimary: gpu.Index == manager.Gpus[0].Index),
+        };
         if (!fresh)
         {
             recorder.Load();
@@ -58,7 +68,7 @@ internal static class VfCurveCommand
                 Console.WriteLine("Probing the V/F curve: locking each clock step under load (requires administrator)…");
             }
 
-            var vfProbe = new VfCurveProbe(gpu.Tuner, () => gpu.Poller.Poll());
+            var vfProbe = new VfCurveProbe(gpu.Tuner, () => gpu.Poller.Poll()) { TargetPciBusId = gpu.PciBusId };
             bool refused = false;
             vfProbe.ProgressChanged += progress =>
             {
@@ -93,7 +103,7 @@ internal static class VfCurveCommand
             {
                 if (drive)
                 {
-                    runner = new Stress.GpuStressTestRunner();
+                    runner = new Stress.GpuStressTestRunner { TargetPciBusId = gpu.PciBusId };
                     runner.Start();
                 }
 

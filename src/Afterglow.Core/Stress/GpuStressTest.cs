@@ -161,6 +161,12 @@ public sealed class GpuStressTest : IDisposable
     /// <summary>Load shape — sustained burn, transition cycling, or boost excursions.</summary>
     public StressPattern Pattern { get; set; } = StressPattern.Sustained;
 
+    /// <summary>
+    /// PCI bus of the card being tuned; binds the burn to that exact adapter.
+    /// Null keeps the largest-VRAM NVIDIA fallback (single-GPU behavior).
+    /// </summary>
+    public uint? TargetPciBusId { get; set; }
+
     public event Action<StressProgress>? ProgressChanged;
 
     public StressProgress Progress
@@ -228,13 +234,17 @@ public sealed class GpuStressTest : IDisposable
 
         try
         {
-            using var targetAdapter = StressAdapter.SelectNvidia(out string adapterName);
+            using var targetAdapter = StressAdapter.Select(TargetPciBusId, out string adapterName);
             if (targetAdapter is null)
             {
                 Report(StressState.Failed, stopwatch.Elapsed, 0, 0, 0,
-                    "No NVIDIA adapter found — refusing to run the burn on a different GPU.");
+                    adapterName.Length > 0
+                        ? $"Adapter binding failed: {adapterName}"
+                        : "No NVIDIA adapter found — refusing to run the burn on a different GPU.");
                 return;
             }
+
+            Diagnostics.Log.Info($"Burn adapter: {adapterName}");
 
             var result = D3D11.D3D11CreateDevice(
                 targetAdapter, DriverType.Unknown, DeviceCreationFlags.None,

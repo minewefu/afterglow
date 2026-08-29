@@ -107,12 +107,15 @@ public sealed class GpuTuner
         // Restore the tracked lock only when the persisted record belongs to
         // THIS GPU (or predates UUID stamping) — on a multi-GPU system, a lock
         // applied to another card must not be adopted here.
-        var state = AppliedStateStore.Load();
+        var state = AppliedStateStore.Load(_gpuUuid);
         if (state is not null && (state.GpuUuid is null || state.GpuUuid == _gpuUuid))
         {
             _appliedLockMHz = state.LockedCoreClockMHz;
         }
     }
+
+    /// <summary>NVML UUID of the GPU this tuner drives (null if the driver won't report one).</summary>
+    public string? GpuUuid => _gpuUuid;
 
     /// <summary>
     /// The clock lock Afterglow last applied (null = none). NVML has no getter
@@ -229,7 +232,17 @@ public sealed class GpuTuner
                 return new ApplyResult(false, results);
             }
 
-            AppliedStateStore.RecordPending(profile.Name);
+            // A profile stamped with another card's identity must never land
+            // here — same clocks mean different things on different silicon.
+            if (profile.GpuUuid is { } target && _gpuUuid is { } mine &&
+                !string.Equals(target, mine, StringComparison.OrdinalIgnoreCase))
+            {
+                results.Add(KnobResult.Fail("profile",
+                    $"saved for a different GPU ({profile.GpuName ?? target}) — re-save it on this card to use it here"));
+                return new ApplyResult(false, results);
+            }
+
+            AppliedStateStore.RecordPending(profile.Name, _gpuUuid);
 
             ApplyPowerLimit(profile, results);
             ApplyTempLimit(profile, results);
@@ -298,7 +311,7 @@ public sealed class GpuTuner
             RestoreAutoFans(results);
 
             bool all = results.All(r => r.Applied);
-            AppliedStateStore.Clear();
+            AppliedStateStore.Clear(_gpuUuid);
             Log.Info($"Reset to defaults: {(all ? "ok" : "PARTIAL")}");
             return new ApplyResult(all, results);
         }
@@ -616,7 +629,10 @@ public sealed class GpuTuner
 /// Persists what was applied so an unclean shutdown (crash, TDR, power cut) can be
 /// detected on the next start, and so Afterglow-tracked state (the clock lock, manual
 /// fan control) survives restarts. A pending marker is written before an apply begins,
-/// so even a crash mid-apply is caught.
+/// so even a crash mid-apply is caught. One file per GPU (keyed by NVML UUID) so two
+/// cards never overwrite each other's record; the pre-multi-GPU single file remains
+/// readable as the legacy fallback and is retired the first time that GPU's state is
+/// written or cleared.
 /// </summary>
 public static class AppliedStateStore
 {
@@ -634,21 +650,22 @@ public static class AppliedStateStore
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly object Lock = new();
 
-    public static void RecordPending(string profileName)
+    public static void RecordPending(string profileName, string? gpuUuid = null)
     {
-        Mutate(state => (state ?? Empty(profileName)) with
+        Mutate(gpuUuid, state => (state ?? Empty(profileName)) with
         {
             ProfileName = profileName,
             AppliedAt = DateTimeOffset.Now,
             AllKnobsSucceeded = false,
             CleanShutdown = false,
             Pending = true,
+            GpuUuid = gpuUuid,
         });
     }
 
     public static void Record(TuningProfile profile, bool allSucceeded, uint? lockedClock, string? gpuUuid = null)
     {
-        Mutate(state => (state ?? Empty(profile.Name)) with
+        Mutate(gpuUuid, state => (state ?? Empty(profile.Name)) with
         {
             ProfileName = profile.Name,
             AppliedAt = DateTimeOffset.Now,
@@ -661,9 +678,9 @@ public static class AppliedStateStore
     }
 
     /// <summary>Records that Afterglow took manual control of the fans (or released it with null).</summary>
-    public static void RecordFans(string? mode, uint? duty)
+    public static void RecordFans(string? mode, uint? duty, string? gpuUuid = null)
     {
-        Mutate(state =>
+        Mutate(gpuUuid, state =>
         {
             if (state is null && mode is null)
             {
@@ -675,43 +692,94 @@ public static class AppliedStateStore
                 FanMode = mode,
                 FanDuty = duty,
                 CleanShutdown = false,
+                GpuUuid = gpuUuid ?? state?.GpuUuid,
             };
         });
     }
 
+    /// <summary>App-level: marks every GPU's record (and the legacy file) as cleanly shut down.</summary>
     public static void MarkCleanShutdown()
-    {
-        Mutate(state => state is null ? null : state with { CleanShutdown = true });
-    }
-
-    public static AppliedState? Load()
     {
         lock (Lock)
         {
-            try
+            foreach (string path in AllFiles())
             {
-                if (!File.Exists(AppPaths.AppliedStateFile))
+                try
                 {
-                    return null;
+                    if (ReadFile(path) is { CleanShutdown: false } state)
+                    {
+                        WriteFile(path, state with { CleanShutdown = true });
+                    }
                 }
-
-                return JsonSerializer.Deserialize<AppliedState>(
-                    File.ReadAllText(AppPaths.AppliedStateFile), JsonOptions);
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
-            {
-                return null;
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                }
             }
         }
     }
 
-    public static void Clear()
+    /// <summary>
+    /// State for one GPU: its own file first, else the legacy single file
+    /// (whose record predates per-GPU files — callers already gate adoption
+    /// on the stamped UUID matching).
+    /// </summary>
+    public static AppliedState? Load(string? gpuUuid = null)
+    {
+        lock (Lock)
+        {
+            if (gpuUuid is not null && ReadFile(PathFor(gpuUuid)) is { } perGpu)
+            {
+                return perGpu;
+            }
+
+            return ReadFile(AppPaths.AppliedStateFile);
+        }
+    }
+
+    /// <summary>
+    /// Every persisted record, for startup crash scanning — per-GPU files plus
+    /// the legacy file when no per-GPU file has superseded it (same UUID).
+    /// </summary>
+    public static IReadOnlyList<AppliedState> LoadAll()
+    {
+        lock (Lock)
+        {
+            var states = new List<AppliedState>();
+            foreach (string path in PerGpuFiles())
+            {
+                if (ReadFile(path) is { } state)
+                {
+                    states.Add(state);
+                }
+            }
+
+            if (ReadFile(AppPaths.AppliedStateFile) is { } legacy &&
+                !states.Any(s => s.GpuUuid is not null && s.GpuUuid == legacy.GpuUuid))
+            {
+                states.Add(legacy);
+            }
+
+            return states;
+        }
+    }
+
+    /// <summary>Removes the GPU's record — its own file and, if it owns it, the legacy file.</summary>
+    public static void Clear(string? gpuUuid = null)
     {
         lock (Lock)
         {
             try
             {
-                File.Delete(AppPaths.AppliedStateFile);
+                if (gpuUuid is not null)
+                {
+                    File.Delete(PathFor(gpuUuid));
+                }
+
+                var legacy = ReadFile(AppPaths.AppliedStateFile);
+                if (legacy is null || legacy.GpuUuid is null || legacy.GpuUuid == gpuUuid || gpuUuid is null)
+                {
+                    File.Delete(AppPaths.AppliedStateFile);
+                }
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
@@ -719,23 +787,96 @@ public static class AppliedStateStore
         }
     }
 
+    /// <summary>Per-GPU file name derived from the NVML UUID ("GPU-2b6ae74e-…" → stable suffix).</summary>
+    public static string PathFor(string gpuUuid)
+    {
+        var keep = new string(gpuUuid.Where(char.IsLetterOrDigit).ToArray());
+        if (keep.StartsWith("GPU", StringComparison.OrdinalIgnoreCase))
+        {
+            keep = keep[3..];
+        }
+
+        string suffix = keep.Length > 0 ? keep[..Math.Min(12, keep.Length)].ToLowerInvariant() : "unknown";
+        return Path.Combine(
+            Path.GetDirectoryName(AppPaths.AppliedStateFile)!,
+            $"applied-state-{suffix}.json");
+    }
+
+    private static IEnumerable<string> PerGpuFiles()
+    {
+        string dir = Path.GetDirectoryName(AppPaths.AppliedStateFile)!;
+        if (!Directory.Exists(dir))
+        {
+            yield break;
+        }
+
+        foreach (string path in Directory.EnumerateFiles(dir, "applied-state-*.json"))
+        {
+            yield return path;
+        }
+    }
+
+    private static IEnumerable<string> AllFiles()
+    {
+        foreach (string path in PerGpuFiles())
+        {
+            yield return path;
+        }
+
+        yield return AppPaths.AppliedStateFile;
+    }
+
+    private static AppliedState? ReadFile(string path)
+    {
+        try
+        {
+            if (!File.Exists(path))
+            {
+                return null;
+            }
+
+            return JsonSerializer.Deserialize<AppliedState>(File.ReadAllText(path), JsonOptions);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static void WriteFile(string path, AppliedState state)
+    {
+        AppPaths.EnsureCreated();
+        File.WriteAllText(path, JsonSerializer.Serialize(state, JsonOptions));
+    }
+
     private static AppliedState Empty(string name) =>
         new(name, DateTimeOffset.Now, false, false);
 
-    private static void Mutate(Func<AppliedState?, AppliedState?> mutate)
+    private static void Mutate(string? gpuUuid, Func<AppliedState?, AppliedState?> mutate)
     {
         lock (Lock)
         {
             try
             {
-                var next = mutate(Load());
+                // Seed the mutation from this GPU's current view (its file, or
+                // the legacy file it hasn't superseded yet), but always write
+                // to the per-GPU file once a UUID is known.
+                var next = mutate(Load(gpuUuid));
                 if (next is null)
                 {
                     return;
                 }
 
-                AppPaths.EnsureCreated();
-                File.WriteAllText(AppPaths.AppliedStateFile, JsonSerializer.Serialize(next, JsonOptions));
+                WriteFile(gpuUuid is not null ? PathFor(gpuUuid) : AppPaths.AppliedStateFile, next);
+
+                // The legacy file is superseded for this GPU from now on;
+                // leaving a stale copy would double-report crashes.
+                if (gpuUuid is not null &&
+                    ReadFile(AppPaths.AppliedStateFile) is { } legacy &&
+                    (legacy.GpuUuid is null || legacy.GpuUuid == gpuUuid))
+                {
+                    File.Delete(AppPaths.AppliedStateFile);
+                }
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {

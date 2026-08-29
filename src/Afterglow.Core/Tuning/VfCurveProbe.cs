@@ -54,6 +54,9 @@ public sealed class VfCurveProbe
         _sample = sample;
     }
 
+    /// <summary>Binds the probe's load to the tuned card on multi-GPU systems.</summary>
+    public uint? TargetPciBusId { get; set; }
+
     public void Cancel() => _cancel = true;
 
     /// <summary>Runs the sweep on a background thread, feeding points into the recorder.</summary>
@@ -95,7 +98,7 @@ public sealed class VfCurveProbe
         }
 
         uint? previousLock = _tuner.AppliedLockMHz;
-        using var load = new GpuStressTest { IterationsPerDispatch = 2048 };
+        using var load = new GpuStressTest { IterationsPerDispatch = 2048, TargetPciBusId = TargetPciBusId };
         load.Start();
 
         try

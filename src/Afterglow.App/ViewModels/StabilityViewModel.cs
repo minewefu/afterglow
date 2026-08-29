@@ -55,7 +55,7 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
         }
 
         _vram?.Dispose();
-        _vram = new VramTest();
+        _vram = new VramTest { TargetPciBusId = _gpu?.PciBusId };
         _vram.ProgressChanged += progress =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnVramProgress(progress));
         VramFailed = false;
@@ -184,7 +184,12 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
         }
 
         _stress?.Dispose();
-        _stress = new GpuStressTest { IterationsPerDispatch = (uint)Intensity, Pattern = SelectedPattern };
+        _stress = new GpuStressTest
+        {
+            IterationsPerDispatch = (uint)Intensity,
+            Pattern = SelectedPattern,
+            TargetPciBusId = _gpu?.PciBusId,
+        };
         _stress.ProgressChanged += progress =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnStressProgress(progress));
         StressFailed = false;
@@ -259,7 +264,7 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
             return;
         }
 
-        _stepper = new StabilityStepper(_gpu.Tuner);
+        _stepper = new StabilityStepper(_gpu.Tuner) { TargetPciBusId = _gpu.PciBusId };
         _stepper.StatusChanged += status =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnStepperStatus(status));
         StepperRunning = true;

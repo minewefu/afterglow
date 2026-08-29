@@ -74,6 +74,17 @@ public sealed record TuningProfile
     /// <summary>Free-form user notes.</summary>
     public string Notes { get; init; } = string.Empty;
 
+    /// <summary>
+    /// NVML UUID of the GPU this profile was saved on. The apply engine refuses
+    /// a profile stamped for a different card — the same offsets mean different
+    /// things on different silicon. Null (pre-multi-GPU profiles) applies
+    /// anywhere.
+    /// </summary>
+    public string? GpuUuid { get; init; }
+
+    /// <summary>Display name of the GPU this profile was saved on.</summary>
+    public string? GpuName { get; init; }
+
     public DateTimeOffset CreatedAt { get; init; } = DateTimeOffset.Now;
     public DateTimeOffset ModifiedAt { get; init; } = DateTimeOffset.Now;
 

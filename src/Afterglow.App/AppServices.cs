@@ -41,8 +41,16 @@ public sealed class AppServices : IDisposable
 
     public required TdrWatchdog TdrWatchdog { get; init; }
 
-    /// <summary>Measured voltage/frequency curve, fed continuously from telemetry.</summary>
-    public required Core.Tuning.VfCurveRecorder VfCurve { get; init; }
+    /// <summary>Per-GPU measured voltage/frequency curves, each fed only its own card's telemetry.</summary>
+    public required IReadOnlyDictionary<uint, Core.Tuning.VfCurveRecorder> VfCurves { get; init; }
+
+    private readonly Core.Tuning.VfCurveRecorder _fallbackCurve = new();
+
+    /// <summary>The primary GPU's curve (compat convenience; empty recorder when no GPU).</summary>
+    public Core.Tuning.VfCurveRecorder VfCurve =>
+        Gpus.Count > 0 && VfCurves.TryGetValue(Gpus[0].Index, out var primary)
+            ? primary
+            : VfCurves.TryGetValue(0, out var demo) ? demo : _fallbackCurve;
 
     /// <summary>Always-on telemetry black box (null in demo mode).</summary>
     public Core.Diagnostics.FlightRecorder? Flight { get; init; }
@@ -110,7 +118,7 @@ public sealed class AppServices : IDisposable
                 DriverVersion = "demo",
                 GameWatcher = new GameWatcher(),
                 TdrWatchdog = new TdrWatchdog(),
-                VfCurve = demoCurve,
+                VfCurves = new Dictionary<uint, Core.Tuning.VfCurveRecorder> { [0] = demoCurve },
             };
             demoServices.InitializeSettings(new AppSettings());
             return demoServices;
@@ -137,9 +145,28 @@ public sealed class AppServices : IDisposable
 
         AppPaths.EnsureCreated();
 
-        var vfCurve = new Core.Tuning.VfCurveRecorder();
-        vfCurve.Load();
-        telemetry.SnapshotTaken += vfCurve.Add;
+        // One curve per GPU, each fed only its own card's snapshots — a second
+        // card's V/F points must never plan an undervolt for the first. The
+        // primary GPU keeps the legacy vf-curve.json.
+        var vfCurves = new Dictionary<uint, Core.Tuning.VfCurveRecorder>();
+        foreach (var gpu in manager.Gpus)
+        {
+            var curveRecorder = new Core.Tuning.VfCurveRecorder
+            {
+                PersistPath = Core.Tuning.VfCurveRecorder.PathFor(
+                    gpu.Uuid, isPrimary: gpu.Index == manager.Gpus[0].Index),
+            };
+            curveRecorder.Load();
+            vfCurves[gpu.Index] = curveRecorder;
+        }
+
+        telemetry.SnapshotTaken += snapshot =>
+        {
+            if (vfCurves.TryGetValue(snapshot.DeviceIndex, out var curveRecorder))
+            {
+                curveRecorder.Add(snapshot);
+            }
+        };
 
         // Analyze the previous flight recording BEFORE the new recorder
         // rotates it, then start this session's black box. Only the resident
@@ -206,7 +233,7 @@ public sealed class AppServices : IDisposable
             DriverVersion = manager.DriverVersion ?? "—",
             GameWatcher = new GameWatcher(),
             TdrWatchdog = new TdrWatchdog(),
-            VfCurve = vfCurve,
+            VfCurves = vfCurves,
             Flight = flight,
             LastCrashReport = crashReport,
         };
@@ -220,7 +247,10 @@ public sealed class AppServices : IDisposable
     {
         if (!DemoMode)
         {
-            VfCurve.Save();
+            foreach (var recorder in VfCurves.Values)
+            {
+                recorder.Save();
+            }
         }
 
         GameWatcher.Dispose();
