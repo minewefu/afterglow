@@ -91,9 +91,14 @@
                 <TextBlock Text="Afterglow" FontSize="15" FontWeight="SemiBold" Margin="10,0,0,0"
                            VerticalAlignment="Center" />
                 <Border Background="{StaticResource Bg3}" CornerRadius="6" Padding="8,3" Margin="14,0,0,0"
-                        VerticalAlignment="Center">
+                        VerticalAlignment="Center"
+                        Visibility="{Binding HasMultipleGpus, Converter={x:Static views:Converters.InverseBoolToVisibility}}">
                     <TextBlock Text="{Binding GpuName}" FontSize="11.5" Foreground="{StaticResource TextMuted}" />
                 </Border>
+                <ComboBox ItemsSource="{Binding GpuOptions}" SelectedIndex="{Binding SelectedGpuOption}"
+                          FontSize="11.5" Margin="14,0,0,0" VerticalAlignment="Center" MinWidth="210"
+                          ToolTip="Every page follows the selected GPU; runs already in flight keep the card they started on"
+                          Visibility="{Binding HasMultipleGpus, Converter={x:Static views:Converters.BoolToVisibility}}" />
                 <Border Background="#33E8B33C" CornerRadius="6" Padding="8,3" Margin="8,0,0,0"
                         VerticalAlignment="Center"
                         Visibility="{Binding ShowElevationBadge, Converter={x:Static views:Converters.BoolToVisibility}}">

@@ -114,7 +114,8 @@ public partial class MetricsViewModel : ObservableObject
         double gpuTemp = 0;
         double memTemp = 0;
         int samples = 0;
-        foreach (var snapshot in _services.Telemetry.HistoryFor(0).GetAll())
+        uint deviceIndex = _services.SelectedGpu?.Index ?? 0;
+        foreach (var snapshot in _services.Telemetry.HistoryFor(deviceIndex).GetAll())
         {
             if (snapshot.Timestamp < _captureStartedAt)
             {
@@ -129,11 +130,11 @@ public partial class MetricsViewModel : ObservableObject
 
         int core = 0;
         int mem = 0;
-        if (_services.Gpus.Count > 0)
+        if (_services.SelectedGpu is { } gpu)
         {
             try
             {
-                var current = _services.Gpus[0].Tuner.ReadCurrent();
+                var current = gpu.Tuner.ReadCurrent();
                 core = current.CoreOffsetMHz;
                 mem = current.MemOffsetMHz;
             }

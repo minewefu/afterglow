@@ -8,7 +8,7 @@ namespace Afterglow.App.ViewModels;
 public partial class DashboardViewModel : ObservableObject
 {
     private readonly AppServices _services;
-    private readonly uint _deviceIndex;
+    private uint _deviceIndex;
 
     // Hero values
     [ObservableProperty] private string _coreClockText = "—";
@@ -176,8 +176,16 @@ public partial class DashboardViewModel : ObservableObject
     public DashboardViewModel(AppServices services)
     {
         _services = services;
-        _deviceIndex = !services.DemoMode && services.Gpus.Count > 0 ? services.Gpus[0].Index : 0;
+        _deviceIndex = !services.DemoMode && services.SelectedGpu is { } gpu ? gpu.Index : 0;
         services.Telemetry.SnapshotTaken += OnSnapshot;
+    }
+
+    /// <summary>The UI moved to another GPU: follow it with the next snapshot.</summary>
+    public void RebindGpu()
+    {
+        _deviceIndex = !_services.DemoMode && _services.SelectedGpu is { } gpu ? gpu.Index : 0;
+        UpdateSeries();
+        RefreshExpanded();
     }
 
     private void OnSnapshot(GpuSnapshot snapshot)

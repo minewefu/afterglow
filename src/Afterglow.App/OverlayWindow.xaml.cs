@@ -38,7 +38,8 @@ public partial class OverlayWindow : Window
         InitializeComponent();
         _services = services;
         _settings = settings;
-        _deviceIndex = services.Gpus.Count > 0 ? services.Gpus[0].Index : 0;
+        _deviceIndex = services.SelectedGpu?.Index ?? 0;
+        services.SelectedGpuChanged += gpu => _deviceIndex = gpu.Index;
 
         Opacity = settings.Opacity;
         SourceInitialized += (_, _) => MakeClickThrough();

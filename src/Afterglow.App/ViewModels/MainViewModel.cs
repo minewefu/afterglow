@@ -13,6 +13,7 @@ public partial class MainViewModel : ObservableObject
     private OverlayWindow? _overlay;
     private (int Core, int Mem, double Power, uint? Boost, uint? Lock)? _preGameState;
     private (Core.Profiles.FanMode Mode, uint FixedPct, Core.Fans.FanCurveConfig Curve)? _preGameFans;
+    private Core.Hardware.GpuContext? _preGameGpu;
 
     public DashboardViewModel Dashboard { get; }
 
@@ -48,7 +49,7 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty]
     private string _forensicsBannerText = string.Empty;
 
-    public string GpuName { get; }
+    [ObservableProperty] private string _gpuName = string.Empty;
 
     public string DriverText { get; }
 
@@ -68,8 +69,11 @@ public partial class MainViewModel : ObservableObject
 
         GpuName = services.DemoMode
             ? "Afterglow Demo GPU"
-            : services.Gpus.Count > 0 ? services.Gpus[0].Name : "No NVIDIA GPU detected";
+            : services.SelectedGpu?.Name ?? "No NVIDIA GPU detected";
         DriverText = services.DemoMode ? "Synthetic demo data" : $"NVIDIA driver {services.DriverVersion}";
+
+        GpuOptions = services.Gpus.Select(g => $"GPU {g.Index} — {g.Name}").ToArray();
+        _selectedGpuOption = 0;
 
         Dashboard = new DashboardViewModel(services);
         Tuning = new TuningViewModel(services);
@@ -172,16 +176,54 @@ public partial class MainViewModel : ObservableObject
     /// <summary>Raised for tray balloon alerts (title, message).</summary>
     public event Action<string, string>? TrayAlert;
 
+    /// <summary>"GPU 0 — name" entries for the title-bar selector.</summary>
+    public IReadOnlyList<string> GpuOptions { get; }
+
+    public bool HasMultipleGpus => _services.Gpus.Count > 1;
+
+    [ObservableProperty] private int _selectedGpuOption;
+
+    partial void OnSelectedGpuOptionChanged(int value)
+    {
+        if (value < 0 || value >= _services.Gpus.Count)
+        {
+            return;
+        }
+
+        _services.SelectGpu(_services.Gpus[value].Index);
+        GpuName = _services.SelectedGpu?.Name ?? GpuName;
+
+        // Every page follows the selection; runs already in flight keep the
+        // card they started on.
+        Dashboard.RebindGpu();
+        Tuning.RebindGpu();
+        Fans.RebindGpu();
+        VfCurve.RebindGpu();
+        Stability.RebindGpu();
+    }
+
     /// <summary>Live one-line status for the tray tooltip.</summary>
     public string BuildTrayTooltip()
     {
-        var snapshot = _services.Gpus.Count > 0
-            ? _services.Telemetry.HistoryFor(_services.Gpus[0].Index).Latest
+        var snapshot = _services.SelectedGpu is { } gpu
+            ? _services.Telemetry.HistoryFor(gpu.Index).Latest
             : _services.DemoMode ? _services.Telemetry.HistoryFor(0).Latest : null;
         return snapshot is null
             ? "Afterglow"
             : $"Afterglow — {snapshot.GpuTempC}°C · {snapshot.CoreClockMHz} MHz · {snapshot.PowerW:F0} W";
     }
+
+    /// <summary>
+    /// The GPU a profile should land on: the card it was stamped with when
+    /// present, else the selected card. A stamped profile whose card is absent
+    /// still resolves to the selected GPU so the tuner's identity gate can
+    /// refuse it with the honest message instead of silently doing nothing.
+    /// </summary>
+    private Core.Hardware.GpuContext? TargetGpuFor(Core.Profiles.TuningProfile profile) =>
+        profile.GpuUuid is { } uuid
+            ? _services.Gpus.FirstOrDefault(g =>
+                  string.Equals(g.Uuid, uuid, StringComparison.OrdinalIgnoreCase)) ?? _services.SelectedGpu
+            : _services.SelectedGpu;
 
     /// <summary>
     /// Applies a profile's clock/power/voltage knobs AND its fan configuration
@@ -193,7 +235,7 @@ public partial class MainViewModel : ObservableObject
     /// </summary>
     public ApplyResult ApplyProfileFull(Core.Profiles.TuningProfile profile, bool gameContext = false)
     {
-        var gpu = _services.Gpus.Count > 0 ? _services.Gpus[0] : null;
+        var gpu = TargetGpuFor(profile);
         if (gpu is null)
         {
             return new ApplyResult(false, [KnobResult.Fail("profile", "no GPU")]);
@@ -237,13 +279,14 @@ public partial class MainViewModel : ObservableObject
 
     private void OnGameStarted(GameRule rule)
     {
-        var gpu = _services.Gpus.Count > 0 ? _services.Gpus[0] : null;
         var profile = _services.Profiles.Load(rule.ProfileName);
+        var gpu = profile is null ? null : TargetGpuFor(profile);
         if (gpu is null || profile is null)
         {
             return;
         }
 
+        _preGameGpu = gpu;
         _preGameState = gpu.Tuner.ReadCurrent();
         _preGameFans = Fans.CurrentConfig;
         var result = ApplyProfileFull(profile, gameContext: true);
@@ -255,13 +298,15 @@ public partial class MainViewModel : ObservableObject
 
     private void OnGameExited(GameRule rule)
     {
-        var gpu = _services.Gpus.Count > 0 ? _services.Gpus[0] : null;
+        // Restore to the exact card the game profile landed on.
+        var gpu = _preGameGpu ?? _services.SelectedGpu;
         if (gpu is null || _preGameState is not { } pre)
         {
             return;
         }
 
         _preGameState = null;
+        _preGameGpu = null;
         var restore = new Core.Profiles.TuningProfile
         {
             Name = "pre-game state",

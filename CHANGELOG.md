@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- Multi-GPU support, phase 1 (#1): a title-bar GPU selector (visible when
+  more than one NVIDIA card is present) points every page — dashboard,
+  tuning, fans, V/F curve, stability, profiles, FPS session recording, the
+  overlay, and the tray tooltip — at one card. Stress, VRAM, certification,
+  the stepper, and the V/F probe bind their D3D adapter to the tuned card's
+  PCI bus (resolved from the adapter LUID via D3DKMT — never by enumeration
+  order; on a requested bus with several NVIDIA adapters and no match, the
+  test refuses instead of guessing). Profiles are stamped with the GPU they
+  were saved on and refuse to apply to a different card; game rules and
+  startup apply target the stamped card. Applied-state/crash-recovery records
+  are per-GPU files (two cards can never overwrite each other; the old single
+  file stays readable until superseded), and each GPU records its own V/F
+  curve (previously all cards fed one curve). CLI: `--gpu N` on
+  stress/vram/certify/vfcurve and `mcp --gpu N`; new `stress --probe-adapter`
+  diagnostic prints each GPU's NVML-bus → D3D-adapter mapping. Honest limits:
+  dual-GPU behavior is not yet verified on real dual-NVIDIA hardware, and
+  fan-curve config, automation rules, and the flight recorder stay
+  primary-GPU for now.
+
 ## 1.1.0 — 2026-08-28
 
 - Independent defect review (docs/REVIEW-2026-08-28.md): all 22 findings and

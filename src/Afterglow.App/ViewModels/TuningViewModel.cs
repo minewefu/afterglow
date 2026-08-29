@@ -9,9 +9,9 @@ namespace Afterglow.App.ViewModels;
 public partial class TuningViewModel : ObservableObject
 {
     private readonly AppServices _services;
-    private readonly GpuContext? _gpu;
+    private GpuContext? _gpu;
 
-    public TuningCapabilities Capabilities { get; }
+    public TuningCapabilities Capabilities { get; private set; }
 
     // Pending values (sliders)
     [ObservableProperty]
@@ -75,32 +75,45 @@ public partial class TuningViewModel : ObservableObject
         ? string.Empty
         : "Temperature-limit control isn't exposed by this driver generation; use the power limit and fan curve instead.";
 
+    // Demo-mode ranges mirror an RTX 5090 so the whole UI is explorable.
+    private static readonly TuningCapabilities DemoCapabilities = new()
+    {
+        SupportsCoreOffset = true,
+        CoreOffsetMinMHz = -1000,
+        CoreOffsetMaxMHz = 1000,
+        SupportsMemOffset = true,
+        MemOffsetMinMHz = -2000,
+        MemOffsetMaxMHz = 6000,
+        SupportsPowerLimit = true,
+        PowerLimitMinW = 400,
+        PowerLimitMaxW = 575,
+        PowerLimitDefaultW = 575,
+        SupportsLockedCoreClock = true,
+        MaxCoreClockMHz = 3090,
+        SupportsFanControl = true,
+        FanCount = 3,
+        FanMinDutyPct = 30,
+        SupportsVoltageBoost = true,
+    };
+
     public TuningViewModel(AppServices services)
     {
         _services = services;
-        _gpu = services.Gpus.Count > 0 ? services.Gpus[0] : null;
+        _gpu = services.SelectedGpu;
+        Capabilities = _gpu?.Tuner.Capabilities ?? DemoCapabilities;
+        RefreshFromHardware();
+    }
 
-        Capabilities = _gpu?.Tuner.Capabilities ?? new TuningCapabilities
-        {
-            // Demo-mode ranges mirror an RTX 5090 so the whole UI is explorable.
-            SupportsCoreOffset = true,
-            CoreOffsetMinMHz = -1000,
-            CoreOffsetMaxMHz = 1000,
-            SupportsMemOffset = true,
-            MemOffsetMinMHz = -2000,
-            MemOffsetMaxMHz = 6000,
-            SupportsPowerLimit = true,
-            PowerLimitMinW = 400,
-            PowerLimitMaxW = 575,
-            PowerLimitDefaultW = 575,
-            SupportsLockedCoreClock = true,
-            MaxCoreClockMHz = 3090,
-            SupportsFanControl = true,
-            FanCount = 3,
-            FanMinDutyPct = 30,
-            SupportsVoltageBoost = true,
-        };
-
+    /// <summary>The UI moved to another GPU: re-read its ranges and applied values.</summary>
+    public void RebindGpu()
+    {
+        _gpu = _services.SelectedGpu;
+        Capabilities = _gpu?.Tuner.Capabilities ?? DemoCapabilities;
+        OnPropertyChanged(nameof(Capabilities));
+        OnPropertyChanged(nameof(CanTune));
+        OnPropertyChanged(nameof(TuneGateText));
+        OnPropertyChanged(nameof(SupportsTempLimit));
+        OnPropertyChanged(nameof(TempLimitNote));
         RefreshFromHardware();
     }
 

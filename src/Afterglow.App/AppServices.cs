@@ -52,6 +52,33 @@ public sealed class AppServices : IDisposable
             ? primary
             : VfCurves.TryGetValue(0, out var demo) ? demo : _fallbackCurve;
 
+    /// <summary>Curve recorder for one device (falls back to the primary's/demo's).</summary>
+    public Core.Tuning.VfCurveRecorder VfCurveFor(uint deviceIndex) =>
+        VfCurves.TryGetValue(deviceIndex, out var recorder) ? recorder : VfCurve;
+
+    private uint _selectedGpuIndex;
+
+    /// <summary>Device index of the GPU the UI is currently driving.</summary>
+    public uint SelectedGpuIndex => _selectedGpuIndex;
+
+    /// <summary>The GPU the UI is currently driving (null in demo mode / no hardware).</summary>
+    public GpuContext? SelectedGpu =>
+        Gpus.FirstOrDefault(g => g.Index == _selectedGpuIndex) ?? (Gpus.Count > 0 ? Gpus[0] : null);
+
+    /// <summary>Raised on the UI thread after the selection moved to another GPU.</summary>
+    public event Action<GpuContext>? SelectedGpuChanged;
+
+    public void SelectGpu(uint deviceIndex)
+    {
+        if (deviceIndex == _selectedGpuIndex || Gpus.All(g => g.Index != deviceIndex))
+        {
+            return;
+        }
+
+        _selectedGpuIndex = deviceIndex;
+        SelectedGpuChanged?.Invoke(SelectedGpu!);
+    }
+
     /// <summary>Always-on telemetry black box (null in demo mode).</summary>
     public Core.Diagnostics.FlightRecorder? Flight { get; init; }
 

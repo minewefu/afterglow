@@ -191,8 +191,13 @@ Corrections welcome.)*
   borderless/windowed/fullscreen-optimized — i.e., almost everything modern — works.
 - The **temperature-limit slider** isn't exposed on current Blackwell drivers through public
   interfaces; use the power limit and fan curve instead (Afterglow says this in-app too).
-- **The GUI drives one GPU** (the first NVIDIA card). Multi-GPU systems can tune secondary
-  cards through the CLI (`--gpu N`), but the pages, overlay, and tray show GPU 0 only.
+- **Multi-GPU support is new and not yet field-verified on a dual-NVIDIA system.** A title-bar
+  selector (shown when more than one NVIDIA GPU is present) points every page at one card;
+  stress/VRAM tests bind to the tuned card by PCI bus, profiles are stamped with the GPU they
+  were saved on (and refuse to apply elsewhere), and applied state is tracked per GPU. The CLI
+  takes `--gpu N`. The identity plumbing is verified on single-GPU hardware; dual-GPU behavior
+  still needs a tester with two cards ([#1](../../issues/1)). Fan-curve *config*, automation
+  rules, and the flight recorder remain primary-GPU for now.
 - Writes need administrator rights (true for every tool in this category). Afterglow launches
   with a UAC prompt; declining it leaves you in monitoring-only mode instead of exiting.
 

@@ -108,15 +108,14 @@ public partial class ProfilesViewModel : ObservableObject
             return;
         }
 
-        if (Selected is null || _services.Gpus.Count == 0)
+        if (Selected is null || _services.SelectedGpu is not { } gpu)
         {
             StatusText = "Select a profile to certify.";
             return;
         }
 
         var profile = Selected;
-        _certifier = new ProfileCertifier(
-            _services.Gpus[0].Tuner, _services.Profiles, _services.Gpus[0].PciBusId);
+        _certifier = new ProfileCertifier(gpu.Tuner, _services.Profiles, gpu.PciBusId);
         _certifier.StatusChanged += status =>
             System.Windows.Application.Current?.Dispatcher.BeginInvoke(() => OnCertifierStatus(status));
         CertifyRunning = true;
@@ -298,7 +297,7 @@ public partial class ProfilesViewModel : ObservableObject
             // configuration — stamped with the GPU they were saved on, so on a
             // multi-GPU system they can never be applied to the wrong card.
             var (fanMode, fixedPct, curve) = _fans.CurrentConfig;
-            var gpu = _services.Gpus.Count > 0 ? _services.Gpus[0] : null;
+            var gpu = _services.SelectedGpu;
             var profile = _tuning.ToProfile(name) with
             {
                 FanMode = fanMode,

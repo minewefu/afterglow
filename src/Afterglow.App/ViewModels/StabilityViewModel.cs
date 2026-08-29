@@ -9,7 +9,7 @@ namespace Afterglow.App.ViewModels;
 public partial class StabilityViewModel : ObservableObject, IDisposable
 {
     private readonly AppServices _services;
-    private readonly GpuContext? _gpu;
+    private GpuContext? _gpu;
     private GpuStressTest? _stress;
     private StabilityStepper? _stepper;
 
@@ -141,9 +141,16 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
     public StabilityViewModel(AppServices services)
     {
         _services = services;
-        _gpu = services.Gpus.Count > 0 ? services.Gpus[0] : null;
+        _gpu = services.SelectedGpu;
         services.Telemetry.SnapshotTaken += OnSnapshot;
     }
+
+    /// <summary>
+    /// The UI moved to another GPU. A run already in flight keeps burning the
+    /// card it started on (its adapter was bound at start); new runs bind to
+    /// the new selection.
+    /// </summary>
+    public void RebindGpu() => _gpu = _services.SelectedGpu;
 
     private void OnSnapshot(Core.Telemetry.GpuSnapshot snapshot)
     {

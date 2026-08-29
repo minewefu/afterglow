@@ -10,7 +10,10 @@ namespace Afterglow.App.ViewModels;
 public partial class VfCurveViewModel : ObservableObject
 {
     private readonly AppServices _services;
-    private readonly GpuContext? _gpu;
+    private GpuContext? _gpu;
+
+    private Core.Tuning.VfCurveRecorder Recorder =>
+        _gpu is { } gpu ? _services.VfCurveFor(gpu.Index) : _services.VfCurve;
 
     [ObservableProperty] private IReadOnlyList<VfBin>? _curve;
     [ObservableProperty] private long _peakSamples;
@@ -52,8 +55,22 @@ public partial class VfCurveViewModel : ObservableObject
     public VfCurveViewModel(AppServices services)
     {
         _services = services;
-        _gpu = services.Gpus.Count > 0 ? services.Gpus[0] : null;
+        _gpu = services.SelectedGpu;
         services.Telemetry.SnapshotTaken += OnSnapshot;
+        RefreshCurve();
+    }
+
+    /// <summary>The UI moved to another GPU: show its curve and plan against its ranges.</summary>
+    public void RebindGpu()
+    {
+        _gpu = _services.SelectedGpu;
+        _plan = null;
+        HasPlan = false;
+        PlanText = string.Empty;
+        TargetVoltage = 0;
+        TargetClock = 0;
+        OnPropertyChanged(nameof(CanApply));
+        OnPropertyChanged(nameof(GateText));
         RefreshCurve();
     }
 
@@ -80,7 +97,7 @@ public partial class VfCurveViewModel : ObservableObject
 
     private void RefreshCurve()
     {
-        var recorder = _services.VfCurve;
+        var recorder = Recorder;
         Curve = recorder.GetCurve();
         PeakSamples = recorder.PeakBinSamples();
         SampleText = Curve.Count == 0
@@ -95,7 +112,7 @@ public partial class VfCurveViewModel : ObservableObject
         TargetClock = Math.Round(clockMHz / 15) * 15;
 
         int currentOffset = _gpu?.Tuner.ReadCurrent().CoreOffsetMHz ?? 0;
-        _plan = _services.VfCurve.PlanUndervolt(TargetVoltage, TargetClock, currentOffset, _gpu?.Tuner.Capabilities);
+        _plan = Recorder.PlanUndervolt(TargetVoltage, TargetClock, currentOffset, _gpu?.Tuner.Capabilities);
 
         if (_plan is null)
         {
@@ -186,14 +203,14 @@ public partial class VfCurveViewModel : ObservableObject
 
         ProbeRunning = true;
         ProbeStatusText = "Starting probe…";
-        _probe.Start(_services.VfCurve);
+        _probe.Start(Recorder);
     }
 
     [RelayCommand]
     private void ResetCurve()
     {
-        _services.VfCurve.Clear();
-        _services.VfCurve.Save();
+        Recorder.Clear();
+        Recorder.Save();
         _plan = null;
         HasPlan = false;
         PlanText = string.Empty;

@@ -10,8 +10,8 @@ namespace Afterglow.App.ViewModels;
 public partial class FansViewModel : ObservableObject
 {
     private readonly AppServices _services;
-    private readonly GpuContext? _gpu;
-    private readonly FanControlService? _fanControl;
+    private GpuContext? _gpu;
+    private FanControlService? _fanControl;
 
     [ObservableProperty]
     private int _modeIndex; // 0 auto, 1 fixed, 2 curve
@@ -67,31 +67,15 @@ public partial class FansViewModel : ObservableObject
         ? string.Empty
         : "Fan control needs administrator rights.";
 
-    public bool HasMemJunction { get; }
+    public bool HasMemJunction { get; private set; }
 
     public FansViewModel(AppServices services)
     {
         _services = services;
-        _gpu = services.Gpus.Count > 0 ? services.Gpus[0] : null;
-        if (_gpu is not null)
-        {
-            services.FanControl.TryGetValue(_gpu.Index, out _fanControl);
-        }
+        BindGpu(services.SelectedGpu);
 
-        HasMemJunction = services.DemoMode ||
-            (_gpu?.Nvapi?.GetPrivateThermals().MemJunctionC is not null);
-
-        if (_gpu?.Nvapi is not null &&
-            _gpu.Nvapi.TryGetFanStatus(out var fanInfos) == Core.Interop.Nvapi.NvapiStatus.Ok)
-        {
-            FanIds = fanInfos.Select(f => f.CoolerId.ToString(System.Globalization.CultureInfo.InvariantCulture)).ToArray();
-        }
-        else if (services.DemoMode)
-        {
-            FanIds = ["1", "2", "3"];
-        }
-
-        // Restore the persisted configuration into the editor.
+        // Restore the persisted configuration into the editor (fan config is
+        // global; it drives whichever GPU is selected when the user acts).
         var saved = services.Settings.Fans;
         _loadingSettings = true;
         ModeIndex = saved.Mode switch
@@ -109,6 +93,40 @@ public partial class FansViewModel : ObservableObject
         _loadingSettings = false;
 
         services.Telemetry.SnapshotTaken += OnSnapshot;
+    }
+
+    private void BindGpu(GpuContext? gpu)
+    {
+        _gpu = gpu;
+        _fanControl = null;
+        if (_gpu is not null)
+        {
+            _services.FanControl.TryGetValue(_gpu.Index, out var fans);
+            _fanControl = fans;
+        }
+
+        HasMemJunction = _services.DemoMode ||
+            (_gpu?.Nvapi?.GetPrivateThermals().MemJunctionC is not null);
+
+        if (_gpu?.Nvapi is not null &&
+            _gpu.Nvapi.TryGetFanStatus(out var fanInfos) == Core.Interop.Nvapi.NvapiStatus.Ok)
+        {
+            FanIds = fanInfos.Select(f => f.CoolerId.ToString(System.Globalization.CultureInfo.InvariantCulture)).ToArray();
+        }
+        else
+        {
+            FanIds = _services.DemoMode ? ["1", "2", "3"] : [];
+        }
+    }
+
+    /// <summary>The UI moved to another GPU: rebind the fan service and per-fan readouts.</summary>
+    public void RebindGpu()
+    {
+        BindGpu(_services.SelectedGpu);
+        OnPropertyChanged(nameof(HasMemJunction));
+        OnPropertyChanged(nameof(FanIds));
+        OnPropertyChanged(nameof(CanControl));
+        OnPropertyChanged(nameof(GateText));
     }
 
     private bool _loadingSettings;
