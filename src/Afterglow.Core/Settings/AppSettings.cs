@@ -109,8 +109,16 @@ public sealed record AppSettings
 
     public OverlaySettings Overlay { get; init; } = new();
 
-    /// <summary>Fan mode/curve, restored automatically at startup (elevated).</summary>
+    /// <summary>
+    /// Fan mode/curve for the primary GPU, restored automatically at startup
+    /// (elevated). Kept as the legacy single-GPU field; secondary cards live
+    /// in <see cref="FansByGpu"/>.
+    /// </summary>
     public FanSettings Fans { get; init; } = new();
+
+    /// <summary>Per-GPU fan configuration, keyed by GPU UUID (or "index:N" when the driver reports none).</summary>
+    public IReadOnlyDictionary<string, FanSettings> FansByGpu { get; init; } =
+        new Dictionary<string, FanSettings>();
 
     public IReadOnlyList<GameRule> GameRules { get; init; } = [];
 

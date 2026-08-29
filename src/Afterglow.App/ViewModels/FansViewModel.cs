@@ -74,23 +74,8 @@ public partial class FansViewModel : ObservableObject
         _services = services;
         BindGpu(services.SelectedGpu);
 
-        // Restore the persisted configuration into the editor (fan config is
-        // global; it drives whichever GPU is selected when the user acts).
-        var saved = services.Settings.Fans;
-        _loadingSettings = true;
-        ModeIndex = saved.Mode switch
-        {
-            "fixed" => 1,
-            "curve" => 2,
-            _ => 0,
-        };
-        FixedDuty = saved.FixedDutyPct;
-        Curve = saved.Curve;
-        TempSourceIndex = (int)saved.Curve.TempSource;
-        Hysteresis = saved.Curve.HysteresisC;
-        ZeroRpmEnabled = saved.Curve.ZeroRpmBelowC > 0;
-        ZeroRpmBelow = saved.Curve.ZeroRpmBelowC > 0 ? saved.Curve.ZeroRpmBelowC : 45;
-        _loadingSettings = false;
+        // Restore the selected card's persisted configuration into the editor.
+        LoadFanSettings(_gpu is { } gpu ? services.FanSettingsFor(gpu) : services.Settings.Fans);
 
         services.Telemetry.SnapshotTaken += OnSnapshot;
     }
@@ -119,7 +104,11 @@ public partial class FansViewModel : ObservableObject
         }
     }
 
-    /// <summary>The UI moved to another GPU: rebind the fan service and per-fan readouts.</summary>
+    /// <summary>
+    /// The UI moved to another GPU: rebind the fan service and per-fan
+    /// readouts, and load that card's own persisted fan configuration into
+    /// the editor.
+    /// </summary>
     public void RebindGpu()
     {
         BindGpu(_services.SelectedGpu);
@@ -127,6 +116,7 @@ public partial class FansViewModel : ObservableObject
         OnPropertyChanged(nameof(FanIds));
         OnPropertyChanged(nameof(CanControl));
         OnPropertyChanged(nameof(GateText));
+        LoadFanSettings(_gpu is { } gpu ? _services.FanSettingsFor(gpu) : _services.Settings.Fans);
     }
 
     private bool _loadingSettings;
@@ -150,20 +140,55 @@ public partial class FansViewModel : ObservableObject
         }
 
         var (mode, fixedPct, curve) = CurrentConfig;
-        _services.UpdateSettings(s => s with
+        var settings = new Core.Settings.FanSettings
         {
-            Fans = new Core.Settings.FanSettings
+            Mode = mode switch
             {
-                Mode = mode switch
-                {
-                    Core.Profiles.FanMode.Fixed => "fixed",
-                    Core.Profiles.FanMode.Curve => "curve",
-                    _ => "auto",
-                },
-                FixedDutyPct = fixedPct,
-                Curve = curve,
+                Core.Profiles.FanMode.Fixed => "fixed",
+                Core.Profiles.FanMode.Curve => "curve",
+                _ => "auto",
             },
+            FixedDutyPct = fixedPct,
+            Curve = curve,
+        };
+
+        // The edit belongs to the selected card. The primary GPU also keeps
+        // the legacy single-GPU field in sync so a downgrade reads it.
+        var gpu = _gpu;
+        _services.UpdateSettings(s =>
+        {
+            if (gpu is null)
+            {
+                return s with { Fans = settings };
+            }
+
+            var byGpu = new Dictionary<string, Core.Settings.FanSettings>(
+                s.FansByGpu, StringComparer.Ordinal)
+            {
+                [AppServices.FanKeyFor(gpu)] = settings,
+            };
+            bool isPrimary = _services.Gpus.Count > 0 && gpu.Index == _services.Gpus[0].Index;
+            return s with { FansByGpu = byGpu, Fans = isPrimary ? settings : s.Fans };
         });
+    }
+
+    /// <summary>Loads one GPU's persisted fan configuration into the editor.</summary>
+    private void LoadFanSettings(Core.Settings.FanSettings saved)
+    {
+        _loadingSettings = true;
+        ModeIndex = saved.Mode switch
+        {
+            "fixed" => 1,
+            "curve" => 2,
+            _ => 0,
+        };
+        FixedDuty = saved.FixedDutyPct;
+        Curve = saved.Curve;
+        TempSourceIndex = (int)saved.Curve.TempSource;
+        Hysteresis = saved.Curve.HysteresisC;
+        ZeroRpmEnabled = saved.Curve.ZeroRpmBelowC > 0;
+        ZeroRpmBelow = saved.Curve.ZeroRpmBelowC > 0 ? saved.Curve.ZeroRpmBelowC : 45;
+        _loadingSettings = false;
     }
 
     private void OnSnapshot(GpuSnapshot snapshot)

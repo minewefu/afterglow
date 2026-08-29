@@ -16,10 +16,16 @@
   file stays readable until superseded), and each GPU records its own V/F
   curve (previously all cards fed one curve). CLI: `--gpu N` on
   stress/vram/certify/vfcurve and `mcp --gpu N`; new `stress --probe-adapter`
-  diagnostic prints each GPU's NVML-bus → D3D-adapter mapping. Honest limits:
-  dual-GPU behavior is not yet verified on real dual-NVIDIA hardware, and
-  fan-curve config, automation rules, and the flight recorder stay
-  primary-GPU for now.
+  diagnostic prints each GPU's NVML-bus → D3D-adapter mapping.
+- Multi-GPU support, phase 2: fan configuration is saved per GPU (the Fans
+  page edits and restores the selected card's own mode/curve at startup;
+  pre-multi-GPU settings migrate to the primary card), automation rules
+  watch every GPU independently (breach time and cooldown per card, the fan
+  action pins the breaching card's fans, alerts name the card), and the
+  flight recorder keeps one black box per GPU (primary keeps the original
+  flight directory; secondaries get flight\gpuN — crash forensics scans all
+  of them). Honest limit: dual-GPU behavior is still not verified on real
+  dual-NVIDIA hardware; that verification is what the 1.2.0 betas are for.
 
 ## 1.1.0 — 2026-08-28
 

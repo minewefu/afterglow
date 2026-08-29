@@ -99,11 +99,7 @@ public partial class MainViewModel : ObservableObject
         services.SettingsChanged += updated => _automation.UpdateRules(updated.AutomationRules);
         services.Telemetry.SnapshotTaken += snapshot =>
         {
-            if (snapshot.DeviceIndex != 0)
-            {
-                return;
-            }
-
+            // Rules watch every GPU; the engine tracks breaches per card.
             var fired = _automation.Evaluate(snapshot, DateTimeOffset.Now);
             if (fired.Count > 0)
             {
@@ -243,19 +239,29 @@ public partial class MainViewModel : ObservableObject
 
         var result = gpu.Tuner.Apply(profile);
 
+        // The Fans page editor mirrors the SELECTED card only — an apply
+        // landing on another GPU must not rewrite the editor's state.
+        bool syncEditor = gpu.Index == _services.SelectedGpu?.Index;
         if (_services.FanControl.TryGetValue(gpu.Index, out var fans))
         {
             switch (profile.FanMode)
             {
                 case Core.Profiles.FanMode.Fixed:
                     fans.SetFixed(profile.FixedFanPct);
-                    Fans.SyncFromApplied(Core.Profiles.FanMode.Fixed, profile.FixedFanPct, profile.FanCurve);
+                    if (syncEditor)
+                    {
+                        Fans.SyncFromApplied(Core.Profiles.FanMode.Fixed, profile.FixedFanPct, profile.FanCurve);
+                    }
+
                     break;
                 case Core.Profiles.FanMode.Curve when profile.FanCurve is not null:
                     try
                     {
                         fans.SetCurve(profile.FanCurve);
-                        Fans.SyncFromApplied(Core.Profiles.FanMode.Curve, profile.FixedFanPct, profile.FanCurve);
+                        if (syncEditor)
+                        {
+                            Fans.SyncFromApplied(Core.Profiles.FanMode.Curve, profile.FixedFanPct, profile.FanCurve);
+                        }
                     }
                     catch (ArgumentException)
                     {
@@ -265,7 +271,11 @@ public partial class MainViewModel : ObservableObject
                     break;
                 case Core.Profiles.FanMode.Auto when !gameContext:
                     fans.SetAuto();
-                    Fans.SyncFromApplied(Core.Profiles.FanMode.Auto, profile.FixedFanPct, null);
+                    if (syncEditor)
+                    {
+                        Fans.SyncFromApplied(Core.Profiles.FanMode.Auto, profile.FixedFanPct, null);
+                    }
+
                     break;
                 default:
                     // Game context + Auto: the profile has no fan opinion.
@@ -341,7 +351,11 @@ public partial class MainViewModel : ObservableObject
                     break;
             }
 
-            Fans.SyncFromApplied(fans.Mode, fans.FixedPct, fans.Mode == Core.Profiles.FanMode.Curve ? fans.Curve : null);
+            if (gpu.Index == _services.SelectedGpu?.Index)
+            {
+                Fans.SyncFromApplied(fans.Mode, fans.FixedPct, fans.Mode == Core.Profiles.FanMode.Curve ? fans.Curve : null);
+            }
+
             _preGameFans = null;
         }
 
@@ -467,18 +481,25 @@ public partial class MainViewModel : ObservableObject
             return;
         }
 
-        var fanSettings = _services.Settings.Fans;
-        if (_services.FanControl.TryGetValue(_services.Gpus[0].Index, out var fans))
+        // Every card restores its own persisted fan configuration.
+        foreach (var restoreGpu in _services.Gpus)
         {
+            if (!_services.FanControl.TryGetValue(restoreGpu.Index, out var fans))
+            {
+                continue;
+            }
+
+            var fanSettings = _services.FanSettingsFor(restoreGpu);
             switch (fanSettings.Mode)
             {
                 case "fixed":
                     fans.SetFixed(fanSettings.FixedDutyPct);
-                    Core.Diagnostics.Log.Info($"Startup: restored fixed fan duty {fanSettings.FixedDutyPct}%.");
+                    Core.Diagnostics.Log.Info(
+                        $"Startup: restored fixed fan duty {fanSettings.FixedDutyPct}% (GPU {restoreGpu.Index}).");
                     break;
                 case "curve" when fanSettings.Curve.Validate() is null:
                     fans.SetCurve(fanSettings.Curve);
-                    Core.Diagnostics.Log.Info("Startup: restored fan curve.");
+                    Core.Diagnostics.Log.Info($"Startup: restored fan curve (GPU {restoreGpu.Index}).");
                     break;
                 default:
                     break;
@@ -578,8 +599,8 @@ public partial class MainViewModel : ObservableObject
                     _ = ApplyProfileFull(profile);
                     action = $"applied profile '{name}'";
                     break;
-                case "fans" when _services.Gpus.Count > 0 &&
-                    _services.FanControl.TryGetValue(_services.Gpus[0].Index, out var fans):
+                case "fans" when _services.FanControl.TryGetValue(fired.DeviceIndex, out var fans):
+                    // Pin the fans on the card that actually breached.
                     fans.SetFixed(rule.ActionFanPct);
                     action = $"fans set to fixed {rule.ActionFanPct}%";
                     break;
@@ -593,13 +614,16 @@ public partial class MainViewModel : ObservableObject
             }
         }
 
+        string gpuLabel = _services.Gpus.Count > 1
+            ? $" on GPU {fired.DeviceIndex}"
+            : string.Empty;
         _services.Flight?.Marker(
-            $"automation metric={rule.Metric} value={fired.Value:F0} action={rule.Action}");
+            $"automation metric={rule.Metric} gpu={fired.DeviceIndex} value={fired.Value:F0} action={rule.Action}");
         Core.Diagnostics.Log.Info(
-            $"Automation: {metricLabel} {fired.Value:F0} >= {rule.Threshold:F0} for {rule.ForSeconds}s -> {action}");
+            $"Automation: {metricLabel}{gpuLabel} {fired.Value:F0} >= {rule.Threshold:F0} for {rule.ForSeconds}s -> {action}");
         TrayAlert?.Invoke(
             "Automation rule fired",
-            $"{metricLabel} hit {fired.Value:F0} (threshold {rule.Threshold:F0} for {rule.ForSeconds} s) — {action}.");
+            $"{metricLabel}{gpuLabel} hit {fired.Value:F0} (threshold {rule.Threshold:F0} for {rule.ForSeconds} s) — {action}.");
     }
 
     [RelayCommand]

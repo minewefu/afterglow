@@ -194,10 +194,11 @@ Corrections welcome.)*
 - **Multi-GPU support is new and not yet field-verified on a dual-NVIDIA system.** A title-bar
   selector (shown when more than one NVIDIA GPU is present) points every page at one card;
   stress/VRAM tests bind to the tuned card by PCI bus, profiles are stamped with the GPU they
-  were saved on (and refuse to apply elsewhere), and applied state is tracked per GPU. The CLI
-  takes `--gpu N`. The identity plumbing is verified on single-GPU hardware; dual-GPU behavior
-  still needs a tester with two cards ([#1](../../issues/1)). Fan-curve *config*, automation
-  rules, and the flight recorder remain primary-GPU for now.
+  were saved on (and refuse to apply elsewhere), and applied state, fan configuration, V/F
+  curves, and the flight recorder are all tracked per GPU, with automation rules watching
+  every card independently. The CLI takes `--gpu N`. The identity plumbing is verified on
+  single-GPU hardware; dual-GPU behavior still needs a tester with two cards
+  ([#1](../../issues/1)).
 - Writes need administrator rights (true for every tool in this category). Afterglow launches
   with a UAC prompt; declining it leaves you in monitoring-only mode instead of exiting.
 
