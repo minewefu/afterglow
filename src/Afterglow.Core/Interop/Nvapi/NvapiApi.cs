@@ -106,7 +106,14 @@ public sealed class NvapiGpu
         _getVoltageBoost = NvapiNative.GetDelegate<NvapiNative.VoltageBoostDelegate>(NvapiIds.GpuGetCoreVoltageBoostPercent);
         _setVoltageBoost = NvapiNative.GetDelegate<NvapiNative.VoltageBoostDelegate>(NvapiIds.GpuSetCoreVoltageBoostPercent);
         _getVfpCurve = NvapiNative.GetDelegate<NvapiNative.GetVfpCurveDelegate>(NvapiIds.GpuGetVfpCurve);
+        _getClockBoostMask = NvapiNative.GetDelegate<NvapiNative.ClockMasksDelegate>(NvapiIds.GpuGetClockBoostMask);
+        _getClockBoostTable = NvapiNative.GetDelegate<NvapiNative.ClockTableDelegate>(NvapiIds.GpuGetClockBoostTable);
+        _setClockBoostTable = NvapiNative.GetDelegate<NvapiNative.ClockTableDelegate>(NvapiIds.GpuSetClockBoostTable);
     }
+
+    private readonly NvapiNative.ClockMasksDelegate? _getClockBoostMask;
+    private readonly NvapiNative.ClockTableDelegate? _getClockBoostTable;
+    private readonly NvapiNative.ClockTableDelegate? _setClockBoostTable;
 
     public unsafe string? GetName()
     {
@@ -398,49 +405,206 @@ public sealed class NvapiGpu
         return _setVoltageBoost(_handle, ref boost);
     }
 
-    // --- Voltage/frequency curve (read-only) -------------------------------------
+    // --- Per-point voltage/frequency curve (clock-boost table) -------------------
 
     /// <summary>One point of the GPU's voltage/frequency curve.</summary>
     public readonly record struct VfPoint(double VoltageMv, double ClockMHz);
 
     /// <summary>
-    /// Reads the driver's boost (V/F) curve for the core domain. Read-only:
-    /// per-point curve writes are rejected by the driver on RTX 50, so Afterglow
-    /// visualizes the curve and undervolts through the documented lock+offset APIs.
-    /// Returns an empty list when the interface is unavailable.
+    /// One live slot of the driver's core V/F table: the stored point plus the
+    /// per-point offset currently applied to it. <see cref="Index"/> is the raw
+    /// table slot (0–254) used by <see cref="TrySetVfpPointOffsets"/>.
+    /// </summary>
+    public readonly record struct VfpTablePoint(int Index, double VoltageMv, double ClockMHz, int OffsetMHz);
+
+    // Delta scale, calibrated live rather than taken on faith: with a known
+    // global +100 MHz core offset applied, the table reads raw 100000 per
+    // point on RTX 5090 / driver 616.56 — plain kHz. (nvapioc halves these
+    // values, i.e. kHz × 2, on the generations it was built against; if a
+    // 20/30/40-series tester sees offsets reading at half/double the applied
+    // global offset, this constant is where the generations diverge.)
+    private const int TableDeltaPerMHz = 1000;
+
+    /// <summary>Static bound for a single point's offset; the driver additionally validates.</summary>
+    public const int VfpOffsetLimitMHz = 1500;
+
+    private NvapiStatus ReadMasks(out NvClockMasks masks)
+    {
+        masks = new NvClockMasks
+        {
+            Version = NvapiNative.MakeVersion<NvClockMasks>(1),
+            Mask = new byte[32],
+            Unknown1 = new byte[32],
+            Clocks = new NvClockMaskEntry[255],
+        };
+        return _getClockBoostMask is null ? NvapiStatus.NoImplementation : _getClockBoostMask(_handle, ref masks);
+    }
+
+    private NvapiStatus ReadCurve(byte[] mask, out NvVfpCurve curve)
+    {
+        curve = new NvVfpCurve
+        {
+            Version = NvapiNative.MakeVersion<NvVfpCurve>(1),
+            Mask = (byte[])mask.Clone(),
+            Unknown1 = new byte[32],
+            Clocks = new NvVfpCurveEntry[255],
+        };
+        return _getVfpCurve is null ? NvapiStatus.NoImplementation : _getVfpCurve(_handle, ref curve);
+    }
+
+    private NvapiStatus ReadTable(byte[] mask, out NvClockTable table)
+    {
+        table = new NvClockTable
+        {
+            Version = NvapiNative.MakeVersion<NvClockTable>(1),
+            Mask = (byte[])mask.Clone(),
+            Unknown1 = new byte[32],
+            Clocks = new NvClockTableEntry[255],
+        };
+        return _getClockBoostTable is null ? NvapiStatus.NoImplementation : _getClockBoostTable(_handle, ref table);
+    }
+
+    /// <summary>
+    /// Reads the driver's stored core V/F table with the per-point offsets
+    /// currently applied. Works on Pascal→Ada; Blackwell rejects the
+    /// interfaces, in which case the status is passed through unchanged.
+    /// </summary>
+    public NvapiStatus TryGetVfpPoints(out IReadOnlyList<VfpTablePoint> points)
+    {
+        points = [];
+        var rc = ReadMasks(out var masks);
+        if (rc != NvapiStatus.Ok)
+        {
+            return rc;
+        }
+
+        rc = ReadCurve(masks.Mask, out var curve);
+        if (rc != NvapiStatus.Ok)
+        {
+            return rc;
+        }
+
+        rc = ReadTable(masks.Mask, out var table);
+        if (rc != NvapiStatus.Ok)
+        {
+            return rc;
+        }
+
+        var result = new List<VfpTablePoint>();
+        for (int i = 0; i < 255; i++)
+        {
+            if (masks.Clocks[i].Enabled != 1 || curve.Clocks[i].ClockType != 0)
+            {
+                continue;
+            }
+
+            double mv = curve.Clocks[i].VoltageMicroV / 1000.0;
+            double mhz = curve.Clocks[i].FrequencyKHz / 1000.0;
+            if (mv is <= 300 or >= 1600 || mhz is <= 100 or >= 4500)
+            {
+                continue;
+            }
+
+            result.Add(new VfpTablePoint(
+                i, Math.Round(mv, 1), Math.Round(mhz, 1),
+                table.Clocks[i].FrequencyDeltaKHz / TableDeltaPerMHz));
+        }
+
+        result.Sort((a, b) => a.VoltageMv.CompareTo(b.VoltageMv));
+        points = result;
+        return NvapiStatus.Ok;
+    }
+
+    /// <summary>
+    /// Writes per-point core offsets (MHz, keyed by raw table slot) into the
+    /// clock-boost table. Slots not in the dictionary keep their current
+    /// delta; only live core-domain slots are touched, and each offset is
+    /// clamped to ±<see cref="VfpOffsetLimitMHz"/>.
+    /// </summary>
+    public NvapiStatus TrySetVfpPointOffsets(IReadOnlyDictionary<int, int> offsetsMHzByIndex)
+    {
+        if (_setClockBoostTable is null)
+        {
+            return NvapiStatus.NoImplementation;
+        }
+
+        var rc = ReadMasks(out var masks);
+        if (rc != NvapiStatus.Ok)
+        {
+            return rc;
+        }
+
+        rc = ReadTable(masks.Mask, out var table);
+        if (rc != NvapiStatus.Ok)
+        {
+            return rc;
+        }
+
+        foreach (var (index, offsetMHz) in offsetsMHzByIndex)
+        {
+            if (index is < 0 or > 254 || masks.Clocks[index].Enabled != 1 || table.Clocks[index].ClockType != 0)
+            {
+                continue;
+            }
+
+            int clamped = Math.Clamp(offsetMHz, -VfpOffsetLimitMHz, VfpOffsetLimitMHz);
+            table.Clocks[index].FrequencyDeltaKHz = clamped * TableDeltaPerMHz;
+        }
+
+        return _setClockBoostTable(_handle, ref table);
+    }
+
+    /// <summary>Clears every per-point offset (a zeroed table write, mask copied in).</summary>
+    public NvapiStatus TryClearVfpPointOffsets()
+    {
+        if (_setClockBoostTable is null)
+        {
+            return NvapiStatus.NoImplementation;
+        }
+
+        var rc = ReadMasks(out var masks);
+        if (rc != NvapiStatus.Ok)
+        {
+            return rc;
+        }
+
+        var table = new NvClockTable
+        {
+            Version = NvapiNative.MakeVersion<NvClockTable>(1),
+            Mask = (byte[])masks.Mask.Clone(),
+            Unknown1 = new byte[32],
+            Clocks = new NvClockTableEntry[255],
+        };
+        return _setClockBoostTable(_handle, ref table);
+    }
+
+    /// <summary>
+    /// Reads the driver's boost (V/F) curve for the core domain (points only,
+    /// no offsets). Returns an empty list when the interface is unavailable.
     /// </summary>
     public IReadOnlyList<VfPoint> GetVfCurve()
     {
-        if (_getVfpCurve is null)
+        var rc = ReadMasks(out var masks);
+        if (rc != NvapiStatus.Ok)
         {
             return [];
         }
 
-        var curve = new NvVfpCurve
-        {
-            Version = NvapiNative.MakeVersion<NvVfpCurve>(1),
-            Masks = new uint[4],
-            Unknown1 = new uint[12],
-            GpuCurveEntries = new NvVfpCurveEntry[80],
-            MemoryCurveEntries = new NvVfpCurveEntry[23],
-            Unknown2 = new uint[1064],
-        };
-
-        if (_getVfpCurve(_handle, ref curve) != NvapiStatus.Ok)
+        if (ReadCurve(masks.Mask, out var curve) != NvapiStatus.Ok)
         {
             return [];
         }
 
         var points = new List<VfPoint>();
-        foreach (var entry in curve.GpuCurveEntries)
+        for (int i = 0; i < 255; i++)
         {
-            if (entry.FrequencyKHz == 0 || entry.VoltageMicroV == 0)
+            if (masks.Clocks[i].Enabled != 1 || curve.Clocks[i].ClockType != 0)
             {
                 continue;
             }
 
-            double mv = entry.VoltageMicroV / 1000.0;
-            double mhz = entry.FrequencyKHz / 1000.0;
+            double mv = curve.Clocks[i].VoltageMicroV / 1000.0;
+            double mhz = curve.Clocks[i].FrequencyKHz / 1000.0;
             if (mv is > 300 and < 1600 && mhz is > 100 and < 4500)
             {
                 points.Add(new VfPoint(Math.Round(mv, 1), Math.Round(mhz, 1)));

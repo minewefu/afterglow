@@ -149,6 +149,22 @@ public sealed record TuningProfile
             }
         }
 
+        if (VfPointOffsetsMHz is { Count: > 0 } vfPoints)
+        {
+            foreach (var (index, offset) in vfPoints)
+            {
+                if (index is < 0 or > 254)
+                {
+                    return $"V/F point index {index} outside 0..254.";
+                }
+
+                if (offset is < -1500 or > 1500)
+                {
+                    return $"V/F point offset {offset} MHz outside ±1500 MHz.";
+                }
+            }
+        }
+
         return null;
     }
 }

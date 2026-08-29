@@ -298,6 +298,18 @@ public partial class ProfilesViewModel : ObservableObject
             // multi-GPU system they can never be applied to the wrong card.
             var (fanMode, fixedPct, curve) = _fans.CurrentConfig;
             var gpu = _services.SelectedGpu;
+
+            // Per-point curve offsets are part of the picture too (20/30/40
+            // series): capture whatever is applied right now.
+            IReadOnlyDictionary<int, int>? vfPoints = null;
+            if (gpu is { Tuner.Capabilities.SupportsVfPoints: true } &&
+                gpu.Tuner.TryReadVfPoints(out var tablePoints) == Core.Interop.Nvapi.NvapiStatus.Ok)
+            {
+                var nonZero = tablePoints.Where(p => p.OffsetMHz != 0)
+                    .ToDictionary(p => p.Index, p => p.OffsetMHz);
+                vfPoints = nonZero.Count > 0 ? nonZero : null;
+            }
+
             var profile = _tuning.ToProfile(name) with
             {
                 FanMode = fanMode,
@@ -305,6 +317,7 @@ public partial class ProfilesViewModel : ObservableObject
                 FanCurve = fanMode == FanMode.Curve ? curve : null,
                 GpuUuid = gpu?.Uuid,
                 GpuName = gpu?.Name,
+                VfPointOffsetsMHz = vfPoints,
             };
             _services.Profiles.Save(profile);
             StatusText = $"Saved '{name}' (tuning + {fanMode switch { FanMode.Curve => "fan curve", FanMode.Fixed => "fixed fans", _ => "auto fans" }}).";

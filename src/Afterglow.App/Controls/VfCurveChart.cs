@@ -38,6 +38,10 @@ public sealed class VfCurveChart : FrameworkElement
         nameof(TargetClock), typeof(double), typeof(VfCurveChart),
         new FrameworkPropertyMetadata(0.0, FrameworkPropertyMetadataOptions.AffectsRender));
 
+    public static readonly DependencyProperty DriverCurveProperty = DependencyProperty.Register(
+        nameof(DriverCurve), typeof(IReadOnlyList<VfBin>), typeof(VfCurveChart),
+        new FrameworkPropertyMetadata(null, FrameworkPropertyMetadataOptions.AffectsRender));
+
     private static readonly Brush GridBrush = Freeze(new SolidColorBrush(Color.FromArgb(22, 255, 255, 255)));
     private static readonly Brush LabelBrush = Freeze(new SolidColorBrush(Color.FromArgb(115, 255, 255, 255)));
     private static readonly Brush CurveBrush = Freeze(new SolidColorBrush(Color.FromRgb(0x58, 0xA6, 0xFF)));
@@ -85,6 +89,16 @@ public sealed class VfCurveChart : FrameworkElement
         set => SetValue(TargetClockProperty, value);
     }
 
+    /// <summary>
+    /// The driver's stored per-point table with applied offsets (gold, dashed) —
+    /// present only on GPUs whose driver exposes per-point curve control.
+    /// </summary>
+    public IReadOnlyList<VfBin>? DriverCurve
+    {
+        get => (IReadOnlyList<VfBin>?)GetValue(DriverCurveProperty);
+        set => SetValue(DriverCurveProperty, value);
+    }
+
     /// <summary>Raised when the user picks a target point (voltage mV, clock MHz).</summary>
     public event EventHandler<(double VoltageMv, double ClockMHz)>? TargetPicked;
 
@@ -123,13 +137,17 @@ public sealed class VfCurveChart : FrameworkElement
         }
 
         var curve = Curve;
-        if (curve is { Count: > 1 })
+        var driver = DriverCurve;
+        var rangeSource = curve is { Count: > 1 }
+            ? (driver is { Count: > 1 } ? curve.Concat(driver).ToList() : curve)
+            : driver is { Count: > 1 } ? driver : null;
+        if (rangeSource is not null)
         {
             // Auto-range with padding, snapped to readable steps.
-            double vMin = curve.Min(p => p.VoltageMv);
-            double vMax = curve.Max(p => p.VoltageMv);
-            double fMin = curve.Min(p => p.MaxClockMHz);
-            double fMax = curve.Max(p => p.MaxClockMHz);
+            double vMin = rangeSource.Min(p => p.VoltageMv);
+            double vMax = rangeSource.Max(p => p.VoltageMv);
+            double fMin = rangeSource.Min(p => p.MaxClockMHz);
+            double fMax = rangeSource.Max(p => p.MaxClockMHz);
             _minV = Math.Floor((vMin - 25) / 25) * 25;
             _maxV = Math.Ceiling((vMax + 25) / 25) * 25;
             _minF = Math.Floor((fMin - 100) / 100) * 100;
@@ -174,11 +192,38 @@ public sealed class VfCurveChart : FrameworkElement
             DrawLabel(dc, $"{f:F0}", new Point(4, p.Y - 7), 10);
         }
 
+        // Driver-stored per-point curve (with applied offsets): gold, dashed,
+        // square markers — visually distinct from the measured blue curve.
+        if (driver is { Count: > 1 })
+        {
+            var driverGeometry = new StreamGeometry();
+            using (var ctx = driverGeometry.Open())
+            {
+                ctx.BeginFigure(ToScreen(driver[0].VoltageMv, driver[0].MaxClockMHz), false, false);
+                for (int i = 1; i < driver.Count; i++)
+                {
+                    ctx.LineTo(ToScreen(driver[i].VoltageMv, driver[i].MaxClockMHz), true, false);
+                }
+            }
+
+            driverGeometry.Freeze();
+            dc.DrawGeometry(null, new Pen(DriverBrush, 1.5) { DashStyle = DashStyles.Dash }, driverGeometry);
+            foreach (var bin in driver)
+            {
+                var p = ToScreen(bin.VoltageMv, bin.MaxClockMHz);
+                dc.DrawRectangle(DriverBrush, null, new Rect(p.X - 2, p.Y - 2, 4, 4));
+            }
+        }
+
         if (curve is not { Count: > 1 })
         {
-            DrawLabel(dc,
-                "No curve data yet — run the GPU under load (a game, or the burn test) and the curve draws itself.",
-                new Point(r.X + 12, r.Y + (r.Height / 2)), 12, EmptyBrush);
+            if (driver is not { Count: > 1 })
+            {
+                DrawLabel(dc,
+                    "No curve data yet — run the GPU under load (a game, or the burn test) and the curve draws itself.",
+                    new Point(r.X + 12, r.Y + (r.Height / 2)), 12, EmptyBrush);
+            }
+
             return;
         }
 
@@ -294,6 +339,7 @@ public sealed class VfCurveChart : FrameworkElement
 
     private static readonly Brush PillBrush = Freeze(new SolidColorBrush(Color.FromArgb(210, 12, 15, 20)));
     private static readonly Brush PillTextBrush = Freeze(new SolidColorBrush(Color.FromArgb(235, 255, 255, 255)));
+    private static readonly Brush DriverBrush = Freeze(new SolidColorBrush(Color.FromRgb(0xE8, 0xB3, 0x3C)));
 
     private FormattedText Format(string text, double size, Brush brush) =>
         new(text, CultureInfo.InvariantCulture, FlowDirection.LeftToRight,

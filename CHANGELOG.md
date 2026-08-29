@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Per-point V/F curve editor** (#1) — the Afterburner-style mechanism, on the
+  V/F Curve page and as `afterglow-cli vfpoints`: the driver's stored curve
+  table drawn over the measured curve (gold dashed), per-point offsets, a
+  one-click flatten undervolt (raise the point at the target voltage, cap
+  every higher point), clear-all, and profile capture/apply of point offsets —
+  every write verified by reading the table back. Interop rebuilt on the
+  field-proven nvapioc layouts after discovering the original struct never
+  worked anywhere: **the long-standing "RTX 50 blocks the curve interfaces"
+  claim was our own broken layout, not the driver** — read and write are now
+  verified live on RTX 5090 (127 points, delta scale calibrated against a
+  known global offset), and RTX 20/30/40 are expected to work via the same
+  interfaces (awaiting field confirmation). The capability is probed live,
+  never assumed by generation.
+
 - Multi-GPU support, phase 1 (#1): a title-bar GPU selector (visible when
   more than one NVIDIA card is present) points every page — dashboard,
   tuning, fans, V/F curve, stability, profiles, FPS session recording, the

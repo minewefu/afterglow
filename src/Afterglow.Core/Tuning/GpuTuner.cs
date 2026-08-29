@@ -35,6 +35,14 @@ public sealed record TuningCapabilities
     public int TempLimitMinC { get; init; }
     public int TempLimitMaxC { get; init; }
     public int TempLimitDefaultC { get; init; }
+
+    /// <summary>
+    /// Per-point V/F curve offsets (the Afterburner-style curve editor),
+    /// probed live rather than assumed by generation. Verified working on
+    /// RTX 5090 (driver 616.56); expected across Turing→Blackwell.
+    /// </summary>
+    public bool SupportsVfPoints { get; init; }
+    public int VfPointCount { get; init; }
 }
 
 /// <summary>Pure clamp/validation helpers (unit-tested separately from hardware).</summary>
@@ -165,6 +173,15 @@ public sealed class GpuTuner
             tempLimit = true;
         }
 
+        // Per-point curve control is probed, not assumed by generation — the
+        // driver is the authority on whether the interfaces answer.
+        int vfPoints = 0;
+        if (_nvapi is not null &&
+            _nvapi.TryGetVfpPoints(out var vfpProbe) == NvapiStatus.Ok)
+        {
+            vfPoints = vfpProbe.Count;
+        }
+
         return new TuningCapabilities
         {
             SupportsCoreOffset = coreOffset,
@@ -187,6 +204,8 @@ public sealed class GpuTuner
             TempLimitMinC = tMin,
             TempLimitMaxC = tMax,
             TempLimitDefaultC = tDef,
+            SupportsVfPoints = vfPoints > 0,
+            VfPointCount = vfPoints,
         };
     }
 
@@ -254,6 +273,10 @@ public sealed class GpuTuner
                 Capabilities.SupportsCoreOffset, Capabilities.CoreOffsetMinMHz, Capabilities.CoreOffsetMaxMHz,
                 "core offset", results);
             ApplyLockedClock(profile.LockedCoreClockMHz, results);
+            if (profile.VfPointOffsetsMHz is { Count: > 0 } vfPoints)
+            {
+                results.Add(ApplyVfPointOffsetsCore(vfPoints));
+            }
 
             bool all = results.All(r => r.Applied);
             AppliedStateStore.Record(profile, all, _appliedLockMHz, _gpuUuid);
@@ -277,6 +300,11 @@ public sealed class GpuTuner
             if (Capabilities.SupportsMemOffset)
             {
                 Report(results, "memory offset", _nvml.TrySetClockOffset(NvmlClockType.Mem, 0), "0 MHz");
+            }
+
+            if (Capabilities.SupportsVfPoints && _nvapi is not null)
+            {
+                ReportNv(results, "V/F points", _nvapi.TryClearVfpPointOffsets(), "cleared");
             }
 
             var unlockRc = _nvml.TryResetGpuLockedClocks();
@@ -315,6 +343,78 @@ public sealed class GpuTuner
             Log.Info($"Reset to defaults: {(all ? "ok" : "PARTIAL")}");
             return new ApplyResult(all, results);
         }
+    }
+
+    /// <summary>The driver's stored per-point V/F table with applied offsets (empty when unsupported).</summary>
+    public NvapiStatus TryReadVfPoints(out IReadOnlyList<Interop.Nvapi.NvapiGpu.VfpTablePoint> points)
+    {
+        points = [];
+        return _nvapi is null ? NvapiStatus.NoImplementation : _nvapi.TryGetVfpPoints(out points);
+    }
+
+    /// <summary>Writes per-point curve offsets (UI/CLI entry point; serialized with Apply).</summary>
+    public KnobResult SetVfPointOffsets(IReadOnlyDictionary<int, int> offsetsMHzByIndex)
+    {
+        lock (_applyLock)
+        {
+            return ApplyVfPointOffsetsCore(offsetsMHzByIndex);
+        }
+    }
+
+    /// <summary>Clears all per-point curve offsets (UI/CLI entry point).</summary>
+    public KnobResult ClearVfPointOffsets()
+    {
+        lock (_applyLock)
+        {
+            if (!Capabilities.SupportsVfPoints || _nvapi is null)
+            {
+                return KnobResult.Fail("V/F points", "per-point curve control is not supported on this GPU/driver");
+            }
+
+            var rc = _nvapi.TryClearVfpPointOffsets();
+            return rc == NvapiStatus.Ok
+                ? KnobResult.Ok("V/F points", "cleared")
+                : KnobResult.Fail("V/F points", rc.ToString());
+        }
+    }
+
+    private KnobResult ApplyVfPointOffsetsCore(IReadOnlyDictionary<int, int> offsetsMHzByIndex)
+    {
+        const string knob = "V/F points";
+        if (!Capabilities.SupportsVfPoints || _nvapi is null)
+        {
+            return KnobResult.Fail(knob, "per-point curve control is not supported on this GPU/driver");
+        }
+
+        var rc = _nvapi.TrySetVfpPointOffsets(offsetsMHzByIndex);
+        if (rc != NvapiStatus.Ok)
+        {
+            return KnobResult.Fail(knob, rc.ToString());
+        }
+
+        // Same bar as every other knob: a write only counts once the readback
+        // agrees. Points the driver silently ignored fail the knob loudly.
+        if (_nvapi.TryGetVfpPoints(out var readback) == NvapiStatus.Ok)
+        {
+            var byIndex = readback.ToDictionary(p => p.Index, p => p.OffsetMHz);
+            int applied = 0;
+            foreach (var (index, offset) in offsetsMHzByIndex)
+            {
+                int expected = Math.Clamp(
+                    offset, -Interop.Nvapi.NvapiGpu.VfpOffsetLimitMHz, Interop.Nvapi.NvapiGpu.VfpOffsetLimitMHz);
+                if (byIndex.TryGetValue(index, out int actual) && actual == expected)
+                {
+                    applied++;
+                }
+            }
+
+            return applied == offsetsMHzByIndex.Count
+                ? KnobResult.Ok(knob, $"{applied} point offsets (verified)")
+                : KnobResult.Fail(knob,
+                    $"driver accepted the write but readback matched only {applied}/{offsetsMHzByIndex.Count} points");
+        }
+
+        return KnobResult.Ok(knob, $"{offsetsMHzByIndex.Count} point offsets (readback unavailable)");
     }
 
     private void ApplyOffset(

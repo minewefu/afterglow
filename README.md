@@ -52,9 +52,15 @@ Afterglow is a from-scratch, MIT-licensed answer:
 - **Clock-lock undervolting** — the documented-API method that works on RTX 50: cap the boost
   clock while a positive offset shifts the V/F curve, hitting the same clock at lower voltage.
   One-click presets in the undervolt wizard
-- **Measured V/F curve** — NVIDIA blocks the curve interfaces on RTX 50, so Afterglow maps
-  the real curve instead: a ~1-minute probe locks each clock step under load and records the
-  voltage the driver selects (plus continuous passive recording while you game). Pick any
+- **Per-point V/F curve editor** — direct edits to the driver's stored curve table, the
+  mechanism Afterburner's curve editor uses: per-point offsets, a one-click flatten undervolt
+  (raise the point at your target voltage, cap everything above it), every write verified by
+  reading the table back. Verified live on RTX 5090; expected on RTX 20/30/40 via the same
+  interfaces. Also `afterglow-cli vfpoints`
+- **Measured V/F curve** — the stored table says what the driver intends; the measured curve
+  shows what the GPU actually does under the power limit and thermals. A ~1-minute probe locks
+  each clock step under load and records the voltage the driver selects (plus continuous
+  passive recording while you game). Pick any
   point on the measured curve and Afterglow computes the exact offset + lock that holds that
   clock at that voltage
 
@@ -185,8 +191,12 @@ Corrections welcome.)*
   kernel-level register access; Afterglow deliberately doesn't ship a kernel driver, so on
   Blackwell it shows the sensor as unavailable rather than pretending. (Memory junction *is*
   available and shown.)
-- **Per-point V/F curve editing** is rejected by the driver on RTX 50; Afterglow's undervolting
-  uses the supported lock+offset method there instead.
+- **Per-point curve control uses private NVAPI interfaces** (the same ones Afterburner uses).
+  Read + write verified on RTX 5090 / driver 616.56; other generations are probed live and the
+  editor only appears when the driver answers. The global core offset lives in the same table,
+  so clearing all point offsets also returns the core offset to 0. (Early releases claimed
+  RTX 50 blocks these interfaces — that was a broken struct layout in pre-1.0 development,
+  fixed in 1.2.)
 - The **overlay** doesn't render over legacy exclusive-fullscreen (no injection by design);
   borderless/windowed/fullscreen-optimized — i.e., almost everything modern — works.
 - The **temperature-limit slider** isn't exposed on current Blackwell drivers through public

@@ -50,6 +50,9 @@ internal static class NvapiIds
     public const uint GpuGetCoreVoltageBoostPercent = 0x9DF23CA1;
     public const uint GpuSetCoreVoltageBoostPercent = 0xB9306D9B;
     public const uint GpuGetVfpCurve = 0x21537AD4;
+    public const uint GpuGetClockBoostMask = 0x507B4B59;
+    public const uint GpuGetClockBoostTable = 0x23F1B133;
+    public const uint GpuSetClockBoostTable = 0x0733E009;
 }
 
 #pragma warning disable CS0649 // fields assigned by native code
@@ -211,42 +214,89 @@ internal struct NvVoltageBoostPercent
     public uint[] Reserved;
 }
 
-/// <summary>One point of the driver's voltage/frequency curve.</summary>
+// --- Per-point V/F curve (private clock-boost interfaces) --------------------
+// Layouts and call sequence follow Demion/nvapioc: GetClockBoostMask marks
+// live table slots, GetVFPCurve carries each slot's frequency/voltage
+// (clockType 0 = core, 1 = memory), and Get/SetClockBoostTable carry the
+// per-point frequency deltas (plain kHz — calibrated live against a known
+// global offset). All 255 slots are uniform (the previous 80+23 split read
+// the same 7208-byte wire format with an interpreted tail — and never
+// worked; the "RTX 50 blocks the curve APIs" finding from early development
+// was that broken layout, not the driver). Read AND write verified live on
+// RTX 5090 / driver 616.56.
+
+/// <summary>One slot of the clock-boost mask: whether the table index is a live point.</summary>
 [StructLayout(LayoutKind.Sequential, Pack = 8)]
-internal struct NvVfpCurveEntry
+internal unsafe struct NvClockMaskEntry
 {
-    public uint Unknown1;
-    public uint FrequencyKHz;
-    public uint VoltageMicroV;
-    public uint Unknown2;
-    public uint Unknown3;
-    public uint Unknown4;
-    public uint Unknown5;
+    public uint ClockType;
+    public byte Enabled;
+    public fixed byte Unknown[19];
 }
 
-/// <summary>
-/// GPU boost (V/F) curve: 80 core points and 23 memory points.
-/// Read-only in Afterglow — the driver rejects curve writes on Blackwell.
-/// </summary>
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+internal struct NvClockMasks
+{
+    public uint Version;
+
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
+    public byte[] Mask;
+
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
+    public byte[] Unknown1;
+
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 255)]
+    public NvClockMaskEntry[] Clocks;
+}
+
+/// <summary>One stored V/F point: the driver's frequency/voltage for a table slot.</summary>
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+internal unsafe struct NvVfpCurveEntry
+{
+    public uint ClockType;
+    public uint FrequencyKHz;
+    public uint VoltageMicroV;
+    public fixed byte Unknown[16];
+}
+
 [StructLayout(LayoutKind.Sequential, Pack = 8)]
 internal struct NvVfpCurve
 {
     public uint Version;
 
-    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)]
-    public uint[] Masks;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
+    public byte[] Mask;
 
-    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 12)]
-    public uint[] Unknown1;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
+    public byte[] Unknown1;
 
-    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 80)]
-    public NvVfpCurveEntry[] GpuCurveEntries;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 255)]
+    public NvVfpCurveEntry[] Clocks;
+}
 
-    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 23)]
-    public NvVfpCurveEntry[] MemoryCurveEntries;
+/// <summary>One clock-boost-table slot: the per-point frequency delta (stored as kHz × 2).</summary>
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+internal unsafe struct NvClockTableEntry
+{
+    public uint ClockType;
+    public fixed byte Unknown1[16];
+    public int FrequencyDeltaKHz;
+    public fixed byte Unknown2[12];
+}
 
-    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 1064)]
-    public uint[] Unknown2;
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+internal struct NvClockTable
+{
+    public uint Version;
+
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
+    public byte[] Mask;
+
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
+    public byte[] Unknown1;
+
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 255)]
+    public NvClockTableEntry[] Clocks;
 }
 
 #pragma warning restore CS0649
@@ -330,4 +380,10 @@ internal static class NvapiNative
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate NvapiStatus GetVfpCurveDelegate(nint gpu, ref NvVfpCurve curve);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate NvapiStatus ClockMasksDelegate(nint gpu, ref NvClockMasks masks);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate NvapiStatus ClockTableDelegate(nint gpu, ref NvClockTable table);
 }

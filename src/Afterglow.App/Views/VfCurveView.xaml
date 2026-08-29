@@ -29,8 +29,12 @@
 
                     <controls:VfCurveChart x:Name="Chart" Height="300" Margin="0,10,0,0"
                                            Curve="{Binding Curve}" PeakSamples="{Binding PeakSamples}"
+                                           DriverCurve="{Binding DriverCurve}"
                                            LiveVoltage="{Binding LiveVoltage}" LiveClock="{Binding LiveClock}"
                                            TargetVoltage="{Binding TargetVoltage}" TargetClock="{Binding TargetClock}" />
+                    <TextBlock Text="Gold dashed = the driver's stored per-point table (with your offsets applied)."
+                               FontSize="10.5" Foreground="{StaticResource TextFaint}" Margin="0,6,0,0"
+                               Visibility="{Binding SupportsVfPoints, Converter={x:Static views:Converters.BoolToVisibility}}" />
                 </StackPanel>
             </Border>
 
@@ -77,6 +81,57 @@
                             </Style>
                         </TextBlock.Style>
                     </TextBlock>
+                </StackPanel>
+            </Border>
+
+            <!-- Per-point curve editor: only on GPUs whose driver exposes the table (20/30/40 series) -->
+            <Border Style="{StaticResource Card}" Margin="0,10,0,0"
+                    Visibility="{Binding SupportsVfPoints, Converter={x:Static views:Converters.BoolToVisibility}}">
+                <StackPanel>
+                    <TextBlock Text="Per-point curve editor" FontWeight="SemiBold" FontSize="13.5" />
+                    <TextBlock Text="{Binding VfPointsNote}" FontSize="11.5" Foreground="{StaticResource TextFaint}"
+                               TextWrapping="Wrap" Margin="0,2,0,0" />
+
+                    <Grid Margin="0,12,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <Slider Style="{StaticResource TuneSlider}" Minimum="0" Maximum="{Binding VfpPointMax}"
+                                Value="{Binding VfpPointSlider}" TickFrequency="1" IsSnapToTickEnabled="True"
+                                VerticalAlignment="Center" Margin="0,0,14,0" />
+                        <TextBlock Grid.Column="1" Text="{Binding VfpPointText}" FontSize="12.5"
+                                   FontFamily="{StaticResource MonoFont}" VerticalAlignment="Center" />
+                    </Grid>
+
+                    <WrapPanel Margin="0,12,0,0">
+                        <TextBlock Text="Point offset" FontSize="12" Foreground="{StaticResource TextMuted}"
+                                   VerticalAlignment="Center" Margin="0,0,0,6" />
+                        <TextBox Text="{Binding VfpOffsetText, UpdateSourceTrigger=PropertyChanged}" Width="70"
+                                 FontSize="12.5" Margin="8,0,0,6" TextAlignment="Center" VerticalAlignment="Center" />
+                        <TextBlock Text="MHz" FontSize="12" Foreground="{StaticResource TextMuted}"
+                                   VerticalAlignment="Center" Margin="6,0,0,6" />
+                        <Button Style="{StaticResource PrimaryButton}" Content="Apply to point" Margin="10,0,0,6"
+                                VerticalAlignment="Center" Command="{Binding ApplyVfPointOffsetCommand}"
+                                IsEnabled="{Binding CanApply}" />
+                        <Rectangle Width="1" Height="24" Fill="{StaticResource Stroke}" Margin="16,0,16,6" />
+                        <TextBlock Text="Flatten at this point to" FontSize="12" Foreground="{StaticResource TextMuted}"
+                                   VerticalAlignment="Center" Margin="0,0,0,6"
+                                   ToolTip="The classic curve undervolt: raise the selected point to the target clock and cap every higher-voltage point to the same clock, so the GPU runs the target clock at this voltage and never boosts past it." />
+                        <TextBox Text="{Binding VfpTargetClockText, UpdateSourceTrigger=PropertyChanged}" Width="70"
+                                 FontSize="12.5" Margin="8,0,0,6" TextAlignment="Center" VerticalAlignment="Center" />
+                        <TextBlock Text="MHz" FontSize="12" Foreground="{StaticResource TextMuted}"
+                                   VerticalAlignment="Center" Margin="6,0,0,6" />
+                        <Button Style="{StaticResource PrimaryButton}" Content="Flatten (undervolt)" Margin="10,0,0,6"
+                                VerticalAlignment="Center" Command="{Binding ApplyVfFlattenCommand}"
+                                IsEnabled="{Binding CanApply}" />
+                        <Button Style="{StaticResource GhostButton}" Content="Clear all point offsets" Margin="16,0,0,6"
+                                VerticalAlignment="Center" Command="{Binding ClearVfPointsCommand}"
+                                IsEnabled="{Binding CanApply}" />
+                    </WrapPanel>
+
+                    <TextBlock Text="{Binding VfpStatusText}" FontSize="12" Foreground="{StaticResource TextMuted}"
+                               TextWrapping="Wrap" Margin="0,8,0,0" />
                 </StackPanel>
             </Border>
 

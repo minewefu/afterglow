@@ -23,6 +23,7 @@ internal static class Program
             "certify" => CertifyCommand.Run(args),
             "drs" => DrsCommand.Run(args),
             "vfcurve" => VfCurveCommand.Run(args),
+            "vfpoints" => VfPointsCommand.Run(args),
             "mcp" => McpCommand.Run(args),
             "help" or "--help" or "-h" => Help(),
             _ => Fail($"Unknown command '{command}'. Run 'afterglow-cli help'."),
@@ -57,6 +58,10 @@ internal static class Program
               vfcurve [--probe]             Record and print the measured voltage/frequency
                       [--seconds N] [--gpu N]  curve. --probe locks each clock step under load
                       [--load] [--fresh]    and maps the full curve in ~1 min (admin).
+              vfpoints [--gpu N]            Per-point V/F curve control (verified on RTX 50,
+                       [--set "I=MHZ,..."]  expected on 20/30/40). No args = list the stored
+                       [--flatten MV:MHZ]   table; --flatten = classic curve undervolt at the
+                       [--clear]            point nearest MV (admin for writes).
               mcp [--gpu N]                 Model Context Protocol server over stdio, so AI
                                             agents can monitor, tune, and stability-test the
                                             GPU with typed tools (run elevated for writes).
