@@ -193,10 +193,14 @@ Corrections welcome.)*
   available and shown.)
 - **Per-point curve control uses private NVAPI interfaces** (the same ones Afterburner uses).
   Read + write verified on RTX 5090 / driver 616.56; other generations are probed live and the
-  editor only appears when the driver answers. The global core offset lives in the same table,
-  so clearing all point offsets also returns the core offset to 0. (Early releases claimed
-  RTX 50 blocks these interfaces — that was a broken struct layout in pre-1.0 development,
-  fixed in 1.2.)
+  editor only appears when the driver answers. The global core offset shares this table: a
+  core-offset write lands on every point at once, so applying one erases per-point edits
+  (measured on RTX 5090 / 616.56 — a per-point −50 became the global +100 the moment the
+  offset was applied). Clearing the point offsets left that global offset intact on this
+  driver — but rather than rely on that, Afterglow writes the core offset again after any
+  clear it performs, and only ever removes a curve for a profile that recorded a reading of
+  the table when it was saved. (Early releases claimed RTX 50 blocks these interfaces — that
+  was a broken struct layout in pre-1.0 development, fixed in 1.2.)
 - The **overlay** doesn't render over legacy exclusive-fullscreen (no injection by design);
   borderless/windowed/fullscreen-optimized — i.e., almost everything modern — works.
 - The **temperature-limit slider** isn't exposed on current Blackwell drivers through public

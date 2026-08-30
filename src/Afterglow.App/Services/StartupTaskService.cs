@@ -6,6 +6,16 @@ using System.Security.Principal;
 namespace Afterglow.App.Services;
 
 /// <summary>
+/// Outcome of <see cref="StartupTaskService.Enable"/>. <see cref="Error"/> is
+/// null only when the task actually exists afterwards; otherwise it says why
+/// not, in words the user can act on.
+/// </summary>
+public sealed record StartupTaskResult(string? Error)
+{
+    public bool Created => Error is null;
+}
+
+/// <summary>
 /// Manages the "Afterglow" Task Scheduler entry that starts the app at logon
 /// elevated and without a UAC prompt. A classic Run-key autostart would launch
 /// unelevated and re-prompt at every boot; the scheduled task is the standard
@@ -18,21 +28,44 @@ public static class StartupTaskService
 
     public static bool IsEnabled() => RunSchtasks($"/Query /TN \"{TaskName}\"") == 0;
 
-    public static bool Enable()
+    /// <summary>
+    /// Refuses unless the exe lives somewhere only administrators can change.
+    /// The task starts Afterglow elevated with no consent prompt, so whatever
+    /// can replace the exe inherits that at every logon — and the portable build
+    /// usually sits in a user-writable folder, where that is a real privilege
+    /// crossing rather than a theoretical one.
+    /// </summary>
+    public static StartupTaskResult Enable()
     {
         string? exe = Environment.ProcessPath;
         using var identity = WindowsIdentity.GetCurrent();
         string? sid = identity.User?.Value;
         if (exe is null || sid is null)
         {
-            return false;
+            return new StartupTaskResult("Afterglow couldn't identify its own executable or user account.");
+        }
+
+        var trust = Core.Security.TrustedInstallLocation.Check(exe);
+        if (!trust.IsTrusted)
+        {
+            return new StartupTaskResult(
+                $"Afterglow won't create an elevated logon task from here: {trust.Reason}. The task would start " +
+                "Afterglow with administrator rights and no UAC prompt at every logon, so anything able to replace " +
+                "the exe would get those rights too. Install into Program Files (run the setup .exe) and switch " +
+                "this on from there.");
         }
 
         string tmp = Path.Combine(Path.GetTempPath(), $"afterglow-task-{Environment.ProcessId}.xml");
         try
         {
             File.WriteAllText(tmp, BuildTaskXml(exe, sid), System.Text.Encoding.Unicode);
-            return RunSchtasks($"/Create /TN \"{TaskName}\" /XML \"{tmp}\" /F") == 0;
+            return RunSchtasks($"/Create /TN \"{TaskName}\" /XML \"{tmp}\" /F") == 0
+                ? new StartupTaskResult(null)
+                : new StartupTaskResult("Task Scheduler refused to create the startup task.");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return new StartupTaskResult($"Couldn't stage the task definition in {tmp}: {ex.Message}");
         }
         finally
         {

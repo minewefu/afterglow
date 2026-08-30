@@ -57,6 +57,17 @@ public sealed record TuningProfile
     /// <summary>Per-point V/F curve offsets (MHz), keyed by curve point index; empty when unused.</summary>
     public IReadOnlyDictionary<int, int>? VfPointOffsetsMHz { get; init; }
 
+    /// <summary>
+    /// True when this profile was saved by a path that actually read the V/F
+    /// table, so an empty <see cref="VfPointOffsetsMHz"/> means "no per-point
+    /// offsets", not "this profile has no opinion". Only then may applying it
+    /// remove a curve. Every profile built from <c>ReadCurrent</c> — the CLI's
+    /// partial `set`, the MCP tuning tool, the stepper's per-step offset, the
+    /// pre-game restore — leaves this false and can never delete a curve the
+    /// user did not ask to lose.
+    /// </summary>
+    public bool CapturedVfPoints { get; init; }
+
     /// <summary>Set once the user (or the stability stepper) has validated this profile under load.</summary>
     public bool MarkedStable { get; init; }
 
@@ -84,6 +95,18 @@ public sealed record TuningProfile
 
     /// <summary>Display name of the GPU this profile was saved on.</summary>
     public string? GpuName { get; init; }
+
+    /// <summary>
+    /// True when this profile may land on the card with the given NVML UUID.
+    /// The same rule the tuner's identity gate enforces: an unstamped profile
+    /// (or a card the driver won't identify) applies anywhere, two known and
+    /// different identities never mix. Callers that pick the target card
+    /// themselves — automation aims at the card that breached — ask this first,
+    /// so they can refuse before any knob moves instead of half-applying.
+    /// </summary>
+    public bool AppliesToGpu(string? gpuUuid) =>
+        GpuUuid is null || gpuUuid is null ||
+        string.Equals(GpuUuid, gpuUuid, StringComparison.OrdinalIgnoreCase);
 
     public DateTimeOffset CreatedAt { get; init; } = DateTimeOffset.Now;
     public DateTimeOffset ModifiedAt { get; init; } = DateTimeOffset.Now;

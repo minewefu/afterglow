@@ -52,6 +52,7 @@ internal static class VfCurveCommand
 
         var recorder = new VfCurveRecorder
         {
+            DeviceIndex = gpu.Index,
             PersistPath = VfCurveRecorder.PathFor(gpu.Uuid, isPrimary: gpu.Index == manager.Gpus[0].Index),
         };
         if (!fresh)

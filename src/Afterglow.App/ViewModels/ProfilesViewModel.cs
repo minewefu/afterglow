@@ -302,12 +302,18 @@ public partial class ProfilesViewModel : ObservableObject
             // Per-point curve offsets are part of the picture too (20/30/40
             // series): capture whatever is applied right now.
             IReadOnlyDictionary<int, int>? vfPoints = null;
+            bool capturedVfPoints = false;
             if (gpu is { Tuner.Capabilities.SupportsVfPoints: true } &&
                 gpu.Tuner.TryReadVfPoints(out var tablePoints) == Core.Interop.Nvapi.NvapiStatus.Ok)
             {
                 var nonZero = tablePoints.Where(p => p.OffsetMHz != 0)
                     .ToDictionary(p => p.Index, p => p.OffsetMHz);
                 vfPoints = nonZero.Count > 0 ? nonZero : null;
+
+                // The table was read, so "none" here is a fact about this card
+                // and applying the profile may remove a curve. A profile that
+                // never read it says nothing about the curve either way.
+                capturedVfPoints = true;
             }
 
             var profile = _tuning.ToProfile(name) with
@@ -318,6 +324,7 @@ public partial class ProfilesViewModel : ObservableObject
                 GpuUuid = gpu?.Uuid,
                 GpuName = gpu?.Name,
                 VfPointOffsetsMHz = vfPoints,
+                CapturedVfPoints = capturedVfPoints,
             };
             _services.Profiles.Save(profile);
             StatusText = $"Saved '{name}' (tuning + {fanMode switch { FanMode.Curve => "fan curve", FanMode.Fixed => "fixed fans", _ => "auto fans" }}).";

@@ -286,7 +286,25 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
     public void Dispose()
     {
         GC.SuppressFinalize(this);
+
+        // A stepper mid-run has an untested offset applied and its cancel path
+        // puts the starting offset back, so give that a bounded moment to land
+        // before the process goes away (in practice well under a second; the
+        // bound covers an offset apply already retrying). Never claim the
+        // restore happened if the run was still unwinding when time ran out.
+        // Ask everything to stop first, then wait once: the stepper's unwind
+        // and the burn/VRAM teardowns then overlap instead of adding up.
         _stepper?.Cancel();
+        _stress?.Stop();
+        _vram?.Stop();
+
+        if (_stepper is { } stepper && !stepper.CancelAndWait(TimeSpan.FromSeconds(15)))
+        {
+            Core.Diagnostics.Log.Warn(
+                "Stepper did not finish stopping within 15 s of shutdown — the offset it was testing may still be " +
+                "applied, and a late write from it can leave the next launch reporting an unclean shutdown.");
+        }
+
         _stress?.Dispose();
         _vram?.Dispose();
     }
@@ -294,12 +312,19 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
     private void OnStepperStatus(StepperStatus status)
     {
         StepperRunning = status.Running;
-        StepperPhaseText = status.Running
-            ? $"Testing {(status.CurrentOffsetMHz >= 0 ? "+" : string.Empty)}{status.CurrentOffsetMHz} MHz — " +
-              $"{status.StepElapsed:mm\\:ss} / {status.StepDuration:mm\\:ss}"
-            : status.ResultOffsetMHz is int result
-                ? $"Finished — stable core offset: {(result >= 0 ? "+" : string.Empty)}{result} MHz"
-                : $"{status.Phase}";
+        StepperPhaseText = status switch
+        {
+            // Cancelled: the burn is being stopped and the starting offset put
+            // back. Shown until the run publishes its terminal status, so the
+            // stop is visible for the seconds the unwind actually takes.
+            { Phase: "stopping" } => "Stopping — ending the burn and restoring the core offset you started from…",
+            { Running: true } =>
+                $"Testing {(status.CurrentOffsetMHz >= 0 ? "+" : string.Empty)}{status.CurrentOffsetMHz} MHz — " +
+                $"{status.StepElapsed:mm\\:ss} / {status.StepDuration:mm\\:ss}",
+            { ResultOffsetMHz: int result } =>
+                $"Finished — stable core offset: {(result >= 0 ? "+" : string.Empty)}{result} MHz",
+            _ => status.Phase,
+        };
         StepperProgress = status.StepDuration.TotalSeconds > 0
             ? Math.Clamp(status.StepElapsed.TotalSeconds / status.StepDuration.TotalSeconds, 0, 1)
             : 0;

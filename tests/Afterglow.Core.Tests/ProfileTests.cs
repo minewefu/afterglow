@@ -92,3 +92,40 @@ public class ProfileTests : IDisposable
         }
     }
 }
+
+/// <summary>The identity predicate the automation profile action consults
+/// before it applies to the card that breached.</summary>
+public class ProfileGpuTargetingTests
+{
+    [Fact]
+        public void Profile_stamped_for_another_card_does_not_apply_to_it()
+        {
+            const string cardA = "GPU-aaaa1111-2222-3333-4444-555566667777";
+            const string cardB = "GPU-bbbb1111-2222-3333-4444-555566667777";
+            var profile = new TuningProfile { Name = "Throttle", GpuUuid = cardA, GpuName = "RTX 5090" };
+    
+            // The card it was saved on, whatever the driver's casing.
+            Assert.True(profile.AppliesToGpu(cardA));
+            Assert.True(profile.AppliesToGpu(cardA.ToUpperInvariant()));
+    
+            // The other card in the box — an automation breach here must be refused,
+            // not silently redirected to card A.
+            Assert.False(profile.AppliesToGpu(cardB));
+        }
+
+    [Fact]
+        public void Unstamped_profile_or_unidentified_card_applies_anywhere()
+        {
+            const string card = "GPU-aaaa1111-2222-3333-4444-555566667777";
+            var legacy = new TuningProfile { Name = "Pre-multi-GPU" };
+            var stamped = new TuningProfile { Name = "Throttle", GpuUuid = card };
+    
+            // Profiles saved before UUID stamping apply to any card.
+            Assert.True(legacy.AppliesToGpu(card));
+            Assert.True(legacy.AppliesToGpu(null));
+    
+            // A card whose driver reports no UUID cannot be told apart, so the gate
+            // opens — exactly what GpuTuner.Apply's identity check does.
+            Assert.True(stamped.AppliesToGpu(null));
+        }
+}

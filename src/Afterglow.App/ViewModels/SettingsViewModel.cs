@@ -167,12 +167,22 @@ public partial class SettingsViewModel : ObservableObject
             return;
         }
 
-        bool ok = value ? Services.StartupTaskService.Enable() : Services.StartupTaskService.Disable();
-        if (!ok)
+        string? failure;
+        if (value)
         {
-            StartWithWindowsNote = value
-                ? "Couldn't create the startup task (Task Scheduler refused)."
-                : "Couldn't remove the startup task.";
+            // Enable() refuses outright when the exe sits somewhere a non-admin
+            // can change it, and explains why — pass that through verbatim so
+            // the note tells the user what to do about it.
+            failure = Services.StartupTaskService.Enable().Error;
+        }
+        else
+        {
+            failure = Services.StartupTaskService.Disable() ? null : "Couldn't remove the startup task.";
+        }
+
+        if (failure is not null)
+        {
+            StartWithWindowsNote = failure;
             RevertStartWithWindows(!value);
             return;
         }
@@ -215,6 +225,18 @@ public partial class SettingsViewModel : ObservableObject
         _loading = true;
         PollingIntervalMs = s.PollingIntervalMs;
         StartWithWindows = Services.StartupTaskService.IsEnabled();
+
+        // A task registered before the location check existed (or from a copy
+        // that has since moved) keeps running elevated at every logon. Say so:
+        // the toggle only reports that a task exists, not that it is safe.
+        if (StartWithWindows && Environment.ProcessPath is { } exe &&
+            Core.Security.TrustedInstallLocation.Check(exe) is { IsTrusted: false } untrusted)
+        {
+            StartWithWindowsNote =
+                $"This startup task runs Afterglow elevated with no prompt from a location that is not " +
+                $"administrator-only: {untrusted.Reason}. Anything able to replace the exe would inherit those " +
+                "rights at logon. Turn this off, or reinstall into Program Files with the setup .exe.";
+        }
         AutomationRules.Clear();
         foreach (var rule in s.AutomationRules)
         {

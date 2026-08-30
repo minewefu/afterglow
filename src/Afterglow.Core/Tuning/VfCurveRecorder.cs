@@ -42,11 +42,43 @@ public sealed class VfCurveRecorder
     /// <summary>Ignore samples below this GPU load — idle points aren't curve points.</summary>
     public uint MinLoadPct { get; set; } = 25;
 
+    /// <summary>
+    /// The card this curve belongs to. When set, samples carrying any other
+    /// device index are refused: this curve is turned into real hardware writes,
+    /// so one card's V/F points must never be binned into another card's curve.
+    /// Null leaves the recorder unbound (demo mode, tests).
+    /// </summary>
+    public uint? DeviceIndex { get; init; }
+
+    /// <summary>Samples refused because they came from another card (expected: 0).</summary>
+    public long ForeignSamplesIgnored { get; private set; }
+
     public long TotalSamples { get; private set; }
 
     /// <summary>Feeds one telemetry snapshot into the curve.</summary>
     public void Add(GpuSnapshot snapshot)
     {
+        // Checked, not trusted: the probe samples through a caller-supplied
+        // delegate, and a delegate pointing at the wrong card would otherwise
+        // write another GPU's silicon into this card's persisted curve.
+        if (DeviceIndex is uint own && snapshot.DeviceIndex != own)
+        {
+            bool first;
+            lock (_lock)
+            {
+                first = ++ForeignSamplesIgnored == 1;
+            }
+
+            if (first)
+            {
+                Diagnostics.Log.Warn(
+                    $"V/F curve for GPU {own} ignored a sample from GPU {snapshot.DeviceIndex}; " +
+                    "the curve stays this card's.");
+            }
+
+            return;
+        }
+
         if (snapshot.CoreVoltageMv is not double mv ||
             snapshot.CoreClockMHz is not uint mhz ||
             snapshot.GpuUtilPct is not uint load)

@@ -15,6 +15,26 @@ public static class VfPointPlanner
     /// <summary>Largest per-point delta the planner will ask for (driver limit is wider).</summary>
     public const int MaxPlannedOffsetMHz = 1000;
 
+    /// <summary>
+    /// True when the table carries per-point SHAPE — at least two live slots
+    /// with different deltas. A global core offset alone reads the same delta on
+    /// every slot (measured on RTX 5090 / driver 616.56); the converse does not
+    /// follow, since a per-point edit that happens to be uniform reads the same
+    /// way. This detects a shaped curve, not every possible edit.
+    /// </summary>
+    public static bool HasPerPointShape(IReadOnlyList<NvapiGpu.VfpTablePoint> points)
+    {
+        for (int i = 1; i < points.Count; i++)
+        {
+            if (points[i].OffsetMHz != points[0].OffsetMHz)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     public sealed record FlattenPlan(
         IReadOnlyDictionary<int, int> OffsetsMHz,
         int AnchorIndex,

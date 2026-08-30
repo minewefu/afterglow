@@ -151,4 +151,73 @@ public class VfCurveRecorderTests
             File.Delete(path);
         }
     }
+
+    [Fact]
+        public void Bound_recorder_refuses_another_cards_samples()
+        {
+            // The probe samples through a caller-supplied delegate; if that delegate
+            // is ever pointed at the wrong card, its silicon must not reach this
+            // curve — the curve is turned into a real undervolt.
+            var recorder = new VfCurveRecorder { DeviceIndex = 1 };
+            for (int i = 0; i < 25; i++)
+            {
+                recorder.Add(new GpuSnapshot
+                {
+                    Timestamp = DateTimeOffset.UtcNow,
+                    DeviceIndex = 0,
+                    CoreVoltageMv = 900,
+                    CoreClockMHz = 2800,
+                    GpuUtilPct = 95,
+                });
+            }
+    
+            Assert.Empty(recorder.GetCurve());
+            Assert.Equal(0L, recorder.TotalSamples);
+            Assert.Equal(25L, recorder.ForeignSamplesIgnored);
+            Assert.Null(recorder.PlanUndervolt(900, 2900, currentOffsetMHz: 0));
+        }
+
+    [Fact]
+        public void Bound_recorder_still_records_its_own_card()
+        {
+            var recorder = new VfCurveRecorder { DeviceIndex = 1 };
+            for (int i = 0; i < 25; i++)
+            {
+                recorder.Add(new GpuSnapshot
+                {
+                    Timestamp = DateTimeOffset.UtcNow,
+                    DeviceIndex = 1,
+                    CoreVoltageMv = 900,
+                    CoreClockMHz = 2800,
+                    GpuUtilPct = 95,
+                });
+            }
+    
+            Assert.Equal(0L, recorder.ForeignSamplesIgnored);
+            Assert.Equal(25L, recorder.TotalSamples);
+            var bin = Assert.Single(recorder.GetCurve());
+            Assert.Equal(900, bin.VoltageMv, precision: 1);
+        }
+
+    [Fact]
+        public void Unbound_recorder_keeps_accepting_every_sample()
+        {
+            // Demo mode and the fallback curve have no card to bind to.
+            var recorder = new VfCurveRecorder();
+            for (int i = 0; i < 25; i++)
+            {
+                recorder.Add(new GpuSnapshot
+                {
+                    Timestamp = DateTimeOffset.UtcNow,
+                    DeviceIndex = 3,
+                    CoreVoltageMv = 900,
+                    CoreClockMHz = 2800,
+                    GpuUtilPct = 95,
+                });
+            }
+    
+            Assert.Equal(25L, recorder.TotalSamples);
+            Assert.Equal(0L, recorder.ForeignSamplesIgnored);
+            Assert.NotEmpty(recorder.GetCurve());
+        }
 }

@@ -11,7 +11,8 @@ namespace Afterglow.Cli;
 ///   (no args)                     list the stored table with applied offsets
 ///   --set "IDX=MHZ,IDX=MHZ"       write specific point offsets
 ///   --flatten MV:MHZ              classic curve undervolt at the point nearest MV
-///   --clear                       zero every point offset (incl. the global core offset)
+///   --clear                       zero every point offset (the global core offset survived
+///                                 this on RTX 5090 / 616.56; re-check yours with `get`)
 /// </summary>
 internal static class VfPointsCommand
 {

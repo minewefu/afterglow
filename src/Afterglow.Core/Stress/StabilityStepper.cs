@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Afterglow.Core.Interop.Nvml;
 using Afterglow.Core.Tuning;
 
@@ -64,7 +65,12 @@ public sealed class StabilityStepper
         }
     }
 
-    public bool IsRunning => _thread is { IsAlive: true } && !_cancel;
+    /// <summary>
+    /// True while the run thread is alive — including the unwind after Cancel(),
+    /// when the burn is still being stopped and the starting offset put back.
+    /// A cancelled run is still a run in progress, and still owns the GPU.
+    /// </summary>
+    public bool IsRunning => _thread is { IsAlive: true };
 
     private static volatile bool _anyRunning;
 
@@ -83,6 +89,10 @@ public sealed class StabilityStepper
     {
         if (IsRunning)
         {
+            // A cancelled run is still unwinding — stopping the burn and putting
+            // the starting offset back. A second thread here would burn and apply
+            // offsets twice on one GPU, off a stale starting-offset snapshot.
+            Log("Ignored a start request — the previous run is still stopping.");
             return;
         }
 
@@ -114,6 +124,24 @@ public sealed class StabilityStepper
     public void Cancel()
     {
         _cancel = true;
+    }
+
+    /// <summary>
+    /// Cancels and waits, bounded, for the run thread to unwind — so the cancel
+    /// path's restore of the starting offset actually lands before the caller
+    /// moves on (app shutdown). Returns false if the run was still unwinding
+    /// when the timeout expired; the caller must not then claim the offset was
+    /// restored. The unwind is bounded by, at worst, an offset apply already in
+    /// flight (3 retries, 1.5 s apart), one poll tick, stopping the burn — which
+    /// costs up to 5 s in Burn and up to 5 s again when the using-scope disposes
+    /// it — and the restoring apply. A caller wanting near-certainty should
+    /// allow ~20 s; the app deliberately waits less and reports the shortfall
+    /// rather than holding shutdown open. Mirrors GpuStressTest.StopAndWait.
+    /// </summary>
+    public bool CancelAndWait(TimeSpan timeout)
+    {
+        _cancel = true;
+        return _thread?.Join(timeout) ?? true;
     }
 
     private void Log(string line)
@@ -257,7 +285,7 @@ public sealed class StabilityStepper
                 MemOffsetMHz = current.MemOffsetMHz,
                 LockedCoreClockMHz = current.LockedCoreClockMHz,
                 VoltageBoostPct = current.VoltageBoostPct,
-            }).AllSucceeded)
+            }, reconcileVfPoints: false).AllSucceeded)
             {
                 return true;
             }
@@ -275,8 +303,19 @@ public sealed class StabilityStepper
         var done = new ManualResetEventSlim(false);
         StressState final = StressState.Failed;
 
+        // Set once the step is over, so the burn's own progress events can no
+        // longer publish "burning" over the status we replace it with — stopping
+        // a burn emits a final Stopped event, which would otherwise scrub the
+        // "stopping" notice a fraction of a second after it appeared.
+        bool stepOver = false;
+
         stress.ProgressChanged += progress =>
         {
+            if (Volatile.Read(ref stepOver))
+            {
+                return;
+            }
+
             Publish(true, "burning", offset, lastGood, progress.Elapsed, duration);
             if (progress.State is StressState.ArtifactDetected or StressState.DeviceLost or StressState.Failed)
             {
@@ -285,10 +324,31 @@ public sealed class StabilityStepper
             }
         };
 
-        stress.Start();
-        if (!done.Wait(duration))
+        if (_cancel)
         {
-            stress.StopAndWait(TimeSpan.FromSeconds(5));
+            // Cancelled while the previous step's offset was being applied:
+            // don't spin up a device and shaders for a burn we won't run — but
+            // still say the stop registered, since the unwind takes seconds.
+            Publish(true, "stopping", offset, lastGood, duration, duration);
+            return StressState.Stopped;
+        }
+
+        stress.Start();
+        bool terminal = WaitForBurn(done, duration, () => _cancel);
+        Volatile.Write(ref stepOver, true);
+        if (_cancel)
+        {
+            // Say the stop registered — ending the burn and putting the starting
+            // offset back takes seconds more, and until then the last thing
+            // published would still read as a step burning away normally.
+            // Full elapsed/duration, not zero: a determinate progress bar bound
+            // to these must not snap back to empty at the moment of the stop.
+            Publish(true, "stopping", offset, lastGood, duration, duration);
+        }
+
+        stress.StopAndWait(TimeSpan.FromSeconds(5));
+        if (!terminal)
+        {
             final = _cancel ? StressState.Stopped : stress.Progress.State switch
             {
                 StressState.ArtifactDetected => StressState.ArtifactDetected,
@@ -297,12 +357,34 @@ public sealed class StabilityStepper
                 _ => StressState.Stopped,
             };
         }
-        else
-        {
-            stress.StopAndWait(TimeSpan.FromSeconds(5));
-        }
 
         return final;
+    }
+
+    /// <summary>How often the burn wait re-checks for a cancel request.</summary>
+    private static readonly TimeSpan BurnPollInterval = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>
+    /// Waits out one burn step: true when the burn signalled a terminal state,
+    /// false when the step ran its full duration or the run was cancelled.
+    /// Polls rather than blocking for the whole step, so Stop ends the step
+    /// within a tick instead of leaving the GPU burning at an abandoned offset
+    /// for minutes. (The MCP tool bounds its own wait one level up, in
+    /// find_stable_offset, by cancelling on a time budget.)
+    /// Static and internal so it can be exercised without a GPU.
+    /// </summary>
+    internal static bool WaitForBurn(ManualResetEventSlim done, TimeSpan duration, Func<bool> cancelled)
+    {
+        var burnClock = Stopwatch.StartNew();
+        while (!done.Wait(BurnPollInterval))
+        {
+            if (cancelled() || burnClock.Elapsed >= duration)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static string Fmt(int offset) => offset >= 0 ? $"+{offset} MHz" : $"{offset} MHz";

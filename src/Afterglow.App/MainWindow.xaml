@@ -95,8 +95,13 @@
                         Visibility="{Binding HasMultipleGpus, Converter={x:Static views:Converters.InverseBoolToVisibility}}">
                     <TextBlock Text="{Binding GpuName}" FontSize="11.5" Foreground="{StaticResource TextMuted}" />
                 </Border>
+                <!-- IsHitTestVisibleInChrome is required inside the 44px WindowChrome caption:
+                     without it WM_NCHITTEST answers HTCAPTION here and a click drags the window
+                     instead of opening the list. It is set on the ComboBox and not on the
+                     StackPanel (it inherits) so the title text stays a drag handle. -->
                 <ComboBox ItemsSource="{Binding GpuOptions}" SelectedIndex="{Binding SelectedGpuOption}"
                           FontSize="11.5" Margin="14,0,0,0" VerticalAlignment="Center" MinWidth="210"
+                          shell:WindowChrome.IsHitTestVisibleInChrome="True"
                           ToolTip="Every page follows the selected GPU; runs already in flight keep the card they started on"
                           Visibility="{Binding HasMultipleGpus, Converter={x:Static views:Converters.BoolToVisibility}}" />
                 <Border Background="#33E8B33C" CornerRadius="6" Padding="8,3" Margin="8,0,0,0"

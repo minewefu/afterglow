@@ -237,9 +237,21 @@ public sealed class GpuTuner
     /// <summary>
     /// Applies a profile's clock/power/voltage knobs. A profile with
     /// LockedCoreClockMHz = null removes any active lock, and that removal is
-    /// reported as its own knob result so it never happens invisibly.
+    /// reported as its own knob result so it never happens invisibly. The same
+    /// rule holds for the per-point V/F curve: a profile carrying no point
+    /// offsets means the stock curve. Applying the core offset is what levels
+    /// the shared clock-boost table on the hardware this was measured on, so the
+    /// reconcile below usually finds nothing to do and stays silent; when it
+    /// does have to remove offsets, it says so as its own knob.
     /// </summary>
-    public ApplyResult Apply(TuningProfile profile)
+    /// <param name="reconcileVfPoints">
+    /// Hard opt-out for callers that must never touch the V/F table. Removing a
+    /// curve additionally requires the profile itself to have recorded that it
+    /// read the table (<see cref="TuningProfile.CapturedVfPoints"/>), so a
+    /// profile assembled from <see cref="ReadCurrent"/> — which cannot see
+    /// per-point offsets — can never delete a curve the user did not ask to lose.
+    /// </param>
+    public ApplyResult Apply(TuningProfile profile, bool reconcileVfPoints = true)
     {
         lock (_applyLock)
         {
@@ -273,10 +285,10 @@ public sealed class GpuTuner
                 Capabilities.SupportsCoreOffset, Capabilities.CoreOffsetMinMHz, Capabilities.CoreOffsetMaxMHz,
                 "core offset", results);
             ApplyLockedClock(profile.LockedCoreClockMHz, results);
-            if (profile.VfPointOffsetsMHz is { Count: > 0 } vfPoints)
-            {
-                results.Add(ApplyVfPointOffsetsCore(vfPoints));
-            }
+
+            // Runs after the core offset above, on purpose: the global offset
+            // lives in the same table and is the baseline this reconciles to.
+            ApplyVfPointOffsets(profile, results, reconcileVfPoints);
 
             bool all = results.All(r => r.Applied);
             AppliedStateStore.Record(profile, all, _appliedLockMHz, _gpuUuid);
@@ -302,6 +314,11 @@ public sealed class GpuTuner
                 Report(results, "memory offset", _nvml.TrySetClockOffset(NvmlClockType.Mem, 0), "0 MHz");
             }
 
+            // Zeroing the whole table is unambiguous here: the global core
+            // offset shares it and was just set to 0 above, so the clear can
+            // take nothing else with it. Profile apply reaches the same call
+            // only for a profile that recorded a curve reading, and always
+            // writes the core offset again afterwards.
             if (Capabilities.SupportsVfPoints && _nvapi is not null)
             {
                 ReportNv(results, "V/F points", _nvapi.TryClearVfpPointOffsets(), "cleared");
@@ -376,6 +393,115 @@ public sealed class GpuTuner
                 ? KnobResult.Ok("V/F points", "cleared")
                 : KnobResult.Fail("V/F points", rc.ToString());
         }
+    }
+
+    /// <summary>
+    /// Reconciles the per-point curve table with what the profile asks for.
+    /// A profile carrying no point offsets means the stock curve — not "leave
+    /// whatever the last profile flattened in force" — so an earlier flatten is
+    /// removed here, visibly, exactly as ApplyLockedClock removes a lock the
+    /// profile doesn't carry. Without this, ProfileCertifier would burn, stamp
+    /// and mark-stable a profile against a curve it never tested.
+    ///
+    /// Ordering is load-bearing and measured, not assumed (RTX 5090, driver
+    /// 616.56): the global core offset shares this table, and NVML's core-offset
+    /// write — issued a few lines above — rewrites every live slot uniformly,
+    /// which is what normally erases per-point shape. This step is the check
+    /// that it really happened, plus the repair when it didn't.
+    /// </summary>
+    private void ApplyVfPointOffsets(TuningProfile profile, List<KnobResult> results, bool reconcile)
+    {
+        const string knob = "V/F points";
+        var carried = profile.VfPointOffsetsMHz is { Count: > 0 } ? profile.VfPointOffsetsMHz : null;
+
+        if (!Capabilities.SupportsVfPoints || _nvapi is null)
+        {
+            // No per-point control: answer only a profile that asked for it, so
+            // ordinary profiles on such a GPU gain no spurious failed knob.
+            if (carried is not null)
+            {
+                results.Add(KnobResult.Fail(knob, "per-point curve control is not supported on this GPU/driver"));
+            }
+
+            return;
+        }
+
+        if (carried is not null)
+        {
+            results.Add(ApplyVfPointOffsetsCore(carried));
+            return;
+        }
+
+        // "No point offsets" only means "remove them" when the profile actually
+        // looked at the table when it was saved. Anything else has no opinion.
+        if (!reconcile || !profile.CapturedVfPoints)
+        {
+            return;
+        }
+
+        // The table is the authority on what is in force. If it can't be read we
+        // say nothing about the curve rather than failing a profile whose every
+        // real knob landed — the core-offset write above is what normally levels
+        // the table, and this step is the backstop that confirms it.
+        if (_nvapi.TryGetVfpPoints(out var table) is var readRc && readRc != NvapiStatus.Ok)
+        {
+            Log.Warn($"Could not read the V/F table after applying '{profile.Name}' ({readRc}); " +
+                     "per-point offsets, if any, were neither confirmed nor removed.");
+            return;
+        }
+
+        if (!VfPointPlanner.HasPerPointShape(table))
+        {
+            // No per-point shape is in force. On the hardware this was measured
+            // on, the core-offset write above is what levels the table, so this
+            // is the ordinary outcome and there is nothing left to do or report.
+            return;
+        }
+
+        // Shape survived the core-offset write. Clear it the way the V/F page
+        // does, then verify: a clear that leaves shape behind, or that takes the
+        // global core offset with it, must be reported, never assumed away.
+        var clearRc = _nvapi.TryClearVfpPointOffsets();
+        if (clearRc != NvapiStatus.Ok)
+        {
+            results.Add(KnobResult.Fail(knob, $"per-point offsets are still in force ({clearRc})"));
+            return;
+        }
+
+        if (_nvapi.TryGetVfpPoints(out var after) != NvapiStatus.Ok)
+        {
+            results.Add(KnobResult.Fail(knob, "the removal could not be verified — the table did not read back"));
+            return;
+        }
+
+        if (VfPointPlanner.HasPerPointShape(after))
+        {
+            results.Add(KnobResult.Fail(knob, "per-point offsets could not be removed"));
+            return;
+        }
+
+        // The clear writes zeros across the table the global core offset shares,
+        // so the offset is written again unconditionally rather than after a
+        // comparison: if the clear took it, the driver now reports 0 and a
+        // zeroed table reads 0, so no comparison could have detected the loss.
+        // Re-writing the profile's own value is idempotent and costs one call.
+        string detail = "per-point offsets removed (this profile recorded none)";
+        if (Capabilities.SupportsCoreOffset)
+        {
+            var reRc = _nvml.TrySetClockOffset(NvmlClockType.Graphics, profile.CoreOffsetMHz);
+            if (reRc != NvmlReturn.Success)
+            {
+                results.Add(KnobResult.Fail(
+                    knob,
+                    $"{detail}, but the {profile.CoreOffsetMHz} MHz core offset could not be written again " +
+                    $"afterwards ({reRc}) — check it on the Tuning page"));
+                return;
+            }
+
+            detail += $"; core offset re-applied at {profile.CoreOffsetMHz} MHz";
+        }
+
+        results.Add(KnobResult.Ok(knob, detail));
     }
 
     private KnobResult ApplyVfPointOffsetsCore(IReadOnlyDictionary<int, int> offsetsMHzByIndex)
@@ -759,7 +885,9 @@ public static class AppliedStateStore
             AllKnobsSucceeded = false,
             CleanShutdown = false,
             Pending = true,
-            GpuUuid = gpuUuid,
+            // A run where NVML won't report a UUID is not evidence the record
+            // changed owner — keep a stamp we are in no position to replace.
+            GpuUuid = gpuUuid ?? state?.GpuUuid,
         });
     }
 
@@ -773,7 +901,7 @@ public static class AppliedStateStore
             CleanShutdown = false,
             LockedCoreClockMHz = lockedClock,
             Pending = false,
-            GpuUuid = gpuUuid,
+            GpuUuid = gpuUuid ?? state?.GpuUuid, // keep the stamp when this run has no UUID (see RecordPending)
         });
     }
 
@@ -819,9 +947,18 @@ public static class AppliedStateStore
     }
 
     /// <summary>
-    /// State for one GPU: its own file first, else the legacy single file
-    /// (whose record predates per-GPU files — callers already gate adoption
-    /// on the stamped UUID matching).
+    /// State for one GPU: its own file first, else the legacy single file —
+    /// but only when that legacy record is this GPU's. An unstamped record
+    /// predates per-GPU files and still migrates (the single-GPU upgrade);
+    /// a record stamped for a DIFFERENT card is not ours to read. Handing it
+    /// back would let Mutate copy the fields a write doesn't touch — the
+    /// tracked clock lock above all — into our file under our stamp, which
+    /// defeats GpuTuner's identity guard on the next launch.
+    ///
+    /// Called with a null uuid (a run where NVML would not identify the card)
+    /// there is no identity to compare, so the legacy record is returned as-is
+    /// and a write keeps whatever stamp it already carried: best effort, and
+    /// the only case where this can still hand back another card's record.
     /// </summary>
     public static AppliedState? Load(string? gpuUuid = null)
     {
@@ -832,7 +969,13 @@ public static class AppliedStateStore
                 return perGpu;
             }
 
-            return ReadFile(AppPaths.AppliedStateFile);
+            var legacy = ReadFile(AppPaths.AppliedStateFile);
+            if (gpuUuid is not null && legacy?.GpuUuid is { } owner && owner != gpuUuid)
+            {
+                return null; // another card's record: never adopted, never seeded from
+            }
+
+            return legacy;
         }
     }
 

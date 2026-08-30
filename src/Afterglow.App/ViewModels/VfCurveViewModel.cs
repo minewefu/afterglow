@@ -12,6 +12,11 @@ public partial class VfCurveViewModel : ObservableObject
     private readonly AppServices _services;
     private GpuContext? _gpu;
 
+    /// <summary>
+    /// The SELECTED card's curve recorder — it moves with the title-bar
+    /// selector, so anything long-running (the probe) must capture its recorder
+    /// once at start instead of reading this on every tick.
+    /// </summary>
     private Core.Tuning.VfCurveRecorder Recorder =>
         _gpu is { } gpu ? _services.VfCurveFor(gpu.Index) : _services.VfCurve;
 
@@ -34,6 +39,9 @@ public partial class VfCurveViewModel : ObservableObject
     private UndervoltPlan? _plan;
     private int _tick;
     private VfCurveProbe? _probe;
+
+    /// <summary>The card a running probe is bound to — captured at start, never re-read from _gpu.</summary>
+    private GpuContext? _probeGpu;
 
     [ObservableProperty] private bool _probeRunning;
     [ObservableProperty] private string _probeStatusText = string.Empty;
@@ -78,10 +86,11 @@ public partial class VfCurveViewModel : ObservableObject
     public string VfPointsNote { get; } =
         "Direct edits to the driver's stored V/F table — the mechanism Afterburner's curve editor uses. " +
         "Verified working on RTX 50 (5090, driver 616.56); expected to work on RTX 20/30/40 with the same " +
-        "interfaces. Note the global core offset lives in this same table (it shifts every point), so " +
-        "clearing all point offsets also returns the core offset to 0. Every write is verified by reading " +
-        "the table back. Validate with the Stability page afterwards — a point that applies is not a point " +
-        "that's stable.";
+        "interfaces. The global core offset shares this table, so applying a core offset rewrites every " +
+        "point at once and erases per-point edits — set the offset first, shape the curve second. Applying " +
+        "any profile also removes point offsets that profile doesn't carry, so the curve matches what you " +
+        "applied. Every write is verified by reading the table back. Validate with the Stability page " +
+        "afterwards — a point that applies is not a point that's stable.";
 
     private void RefreshVfPoints()
     {
@@ -191,7 +200,13 @@ public partial class VfCurveViewModel : ObservableObject
         RefreshVfPoints();
     }
 
-    /// <summary>The UI moved to another GPU: show its curve and plan against its ranges.</summary>
+    /// <summary>
+    /// The UI moved to another GPU: show its curve and plan against its ranges.
+    /// A probe already in flight keeps the card it started on (its tuner,
+    /// sampler, load and recorder were bound at start); it is never silently
+    /// redirected and never silently cancelled — the status line names that card
+    /// for as long as it differs from the selected one.
+    /// </summary>
     public void RebindGpu()
     {
         _gpu = _services.SelectedGpu;
@@ -204,6 +219,19 @@ public partial class VfCurveViewModel : ObservableObject
         OnPropertyChanged(nameof(CanApply));
         OnPropertyChanged(nameof(GateText));
         OnPropertyChanged(nameof(SupportsVfPoints));
+
+        if (ProbeRunning && _probeGpu is { } probing && probing.Index != _gpu?.Index)
+        {
+            ProbeStatusText =
+                $"Probe still running on GPU {probing.Index} — {probing.Name}; it finishes on that card, and " +
+                "its readings are that card's. The curve below is the selected card's.";
+        }
+        else if (!ProbeRunning)
+        {
+            // Don't leave the previous card's verdict standing over this card's curve.
+            ProbeStatusText = string.Empty;
+        }
+
         RefreshCurve();
         RefreshVfPoints();
     }
@@ -306,7 +334,13 @@ public partial class VfCurveViewModel : ObservableObject
             return;
         }
 
-        if (_gpu is null)
+        // Bind the whole probe to ONE card, captured here: _gpu moves with the
+        // title-bar selector, but a probe that locked clocks on this card must
+        // keep sampling this card, loading this card, and saving into this
+        // card's curve until it finishes. Reading _gpu per sample would report
+        // another card's voltage as this card's measured V/F point.
+        var gpu = _gpu;
+        if (gpu is null)
         {
             ProbeStatusText = _services.DemoMode
                 ? "Probe unavailable in demo mode — the demo curve is synthetic."
@@ -314,30 +348,41 @@ public partial class VfCurveViewModel : ObservableObject
             return;
         }
 
-        _probe = new VfCurveProbe(_gpu.Tuner, () => _gpu.Poller.Poll()) { TargetPciBusId = _gpu.PciBusId };
+        var recorder = _services.VfCurveFor(gpu.Index);
+        _probeGpu = gpu;
+        _probe = new VfCurveProbe(gpu.Tuner, () => gpu.Poller.Poll()) { TargetPciBusId = gpu.PciBusId };
         _probe.ProgressChanged += progress =>
             Application.Current?.Dispatcher.BeginInvoke(() =>
             {
+                // Name the probed card whenever it is no longer the one on
+                // screen: these volts are not the selected card's.
+                string card = _gpu is { } selected && selected.Index == gpu.Index
+                    ? string.Empty
+                    : $" [GPU {gpu.Index} — {gpu.Name}]";
+
                 ProbeRunning = progress.Running;
                 ProbeStatusText = progress.Running
                     ? progress.MeasuredVoltageMv is double mv
-                        ? $"Step {progress.StepIndex}/{progress.StepCount}: {progress.TargetClockMHz} MHz measured at {mv:F0} mV"
-                        : $"Step {progress.StepIndex + 1}/{progress.StepCount}: locking {progress.TargetClockMHz} MHz…"
+                        ? $"Step {progress.StepIndex}/{progress.StepCount}: {progress.TargetClockMHz} MHz measured at {mv:F0} mV{card}"
+                        : $"Step {progress.StepIndex + 1}/{progress.StepCount}: locking {progress.TargetClockMHz} MHz…{card}"
                     : progress.Phase switch
                     {
-                        "complete" => "Probe complete — the curve below is your GPU's measured V/F map.",
-                        "cancelled" => "Probe cancelled; previous clock state restored.",
-                        _ => $"Probe stopped: {progress.Phase}",
+                        "complete" => card.Length == 0
+                            ? "Probe complete — the curve below is your GPU's measured V/F map."
+                            : $"Probe complete on GPU {gpu.Index} — {gpu.Name}; the readings went to that card's curve. The curve below is the selected card's.",
+                        "cancelled" => $"Probe cancelled; previous clock state restored.{card}",
+                        _ => $"Probe stopped: {progress.Phase}{card}",
                     };
                 if (!progress.Running)
                 {
+                    _probeGpu = null;
                     RefreshCurve();
                 }
             });
 
         ProbeRunning = true;
         ProbeStatusText = "Starting probe…";
-        _probe.Start(Recorder);
+        _probe.Start(recorder);
     }
 
     [RelayCommand]

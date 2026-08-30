@@ -45,7 +45,17 @@ public partial class App : Application
         // without any prompt of its own.
         if (args.Contains("--register-startup"))
         {
-            Shutdown(AppServices.CheckElevated() && StartupTaskService.Enable() ? 0 : 1);
+            string? failure = AppServices.CheckElevated()
+                ? StartupTaskService.Enable().Error
+                : "the post-install step did not run elevated.";
+            if (failure is not null)
+            {
+                // Inno runs this hidden and ignores the exit code, so the log is
+                // the only place a refusal can still be read afterwards.
+                Core.Diagnostics.Log.Error($"--register-startup did not register the task: {failure}");
+            }
+
+            Shutdown(failure is null ? 0 : 1);
             return;
         }
 
@@ -336,6 +346,13 @@ public partial class App : Application
         _tooltipTimer?.Stop();
         _hotkeys?.Dispose();
         _tray?.Dispose();
+
+        // Before the clean-shutdown mark and before the GPU services go away: a
+        // stepper still in flight has an untested offset applied, and its cancel
+        // path restores the offset the run started from. Applying writes a fresh
+        // record with CleanShutdown = false, so restoring after MarkCleanShutdown
+        // would fake a crash on the next launch.
+        _mainViewModel?.Stability.Dispose();
         AppliedStateStore.MarkCleanShutdown();
         _services?.Dispose();
         _activationSignal?.Dispose();

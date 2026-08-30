@@ -209,6 +209,7 @@ public sealed class AppServices : IDisposable
         {
             var curveRecorder = new Core.Tuning.VfCurveRecorder
             {
+                DeviceIndex = gpu.Index,
                 PersistPath = Core.Tuning.VfCurveRecorder.PathFor(
                     gpu.Uuid, isPrimary: gpu.Index == manager.Gpus[0].Index),
             };

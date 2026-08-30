@@ -2,6 +2,59 @@
 
 ## Unreleased
 
+### Fixed — independent review of 1.2.0-beta.3 (all 8 high-severity findings)
+
+- Automation rules: the "apply a profile" action now lands on the card that
+  actually breached, not on whichever card the profile was stamped for or the
+  title bar happened to show. A profile saved for a different card is refused
+  outright — before any clock or fan moves — and the log line and tray balloon
+  now report what really happened, including a refusal or a partial apply,
+  instead of always claiming success. The action also no longer hands the
+  breaching card's fans back to firmware
+- Applied state: a legacy single-GPU record stamped for another card is no
+  longer handed to a second GPU, which could copy that card's tracked clock
+  lock into the second card's file under the second card's identity — a silent
+  ~half-boost cap on a knob NVML has no getter for. Unstamped records from a
+  genuine single-GPU upgrade still migrate
+- Fans: "Firmware (auto)" now always issues the driver release, so it can
+  recover fans left in manual mode by the per-fan buttons, `afterglow-cli set
+  --fan`, the MCP fan tool, or an unclean exit — previously it silently did
+  nothing and still reported "restored". A refused release now says so instead
+- Profile apply: a saved profile that recorded no per-point V/F offsets now
+  removes point offsets still in force (reported as its own knob, like the clock
+  lock), so certification can no longer stamp a profile stable against a curve it
+  never tested. Only profiles that actually read the table when they were saved
+  can remove a curve — a partial `set`, an MCP tuning call, a stepper step or the
+  post-game restore says nothing about the curve and leaves it alone
+- V/F probe: a probe is bound to the card it started on — switching the
+  title-bar GPU mid-probe no longer redirects sampling to the other card while
+  the probe keeps locking clocks on, and saving results into, the first. Each
+  card's curve recorder now refuses samples from any other card
+- Stability stepper: Stop now takes effect within half a second instead of
+  after the rest of the burn step (up to 5 minutes of burning at an offset the
+  user just abandoned), quitting mid-run waits for the starting offset to be
+  restored (and says so in the log if it could not), and a stepper instance that
+  is still unwinding now refuses to start a second run on the same GPU
+- Start with Windows: the elevated, no-UAC logon task is refused unless the
+  executable sits where only administrators can change it. Registering it from
+  a portable copy in a user-writable folder handed anything able to rewrite that
+  exe administrator rights at every logon. The default install location passes;
+  an install redirected to a user-writable folder does not, and the refusal
+  explains what to do. A task registered before this check is not removed — the
+  Settings toggle now warns when the running exe's location would be refused
+- The multi-GPU selector in the title bar is clickable again — it sat inside the
+  window-chrome caption band, so every click dragged the window instead of
+  opening the list
+
+### Changed
+
+- The per-point curve documentation now matches measurement rather than
+  inference: a core-offset write lands on every point of the shared clock-boost
+  table at once (so applying one erases per-point edits), and clearing the point
+  offsets left the global core offset intact on RTX 5090 / driver 616.56 — but
+  rather than depend on that, any clear Afterglow performs during an apply is
+  followed by writing the core offset again
+
 - **Per-point V/F curve editor** (#1) — the Afterburner-style mechanism, on the
   V/F Curve page and as `afterglow-cli vfpoints`: the driver's stored curve
   table drawn over the measured curve (gold dashed), per-point offsets, a

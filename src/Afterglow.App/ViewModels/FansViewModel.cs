@@ -245,18 +245,24 @@ public partial class FansViewModel : ObservableObject
                 case 1:
                     uint duty = Core.Tuning.TuningMath.NormalizeFixedFanDuty(
                         (uint)FixedDuty, _gpu?.Tuner.Capabilities.FanMinDutyPct ?? 30);
-                    _fanControl.SetFixed((uint)FixedDuty);
-                    StatusText = duty == (uint)FixedDuty
-                        ? $"Fixed {duty}% applied to all fans."
-                        : $"Fixed {duty}% applied (requested {FixedDuty:F0}%, raised to the hardware minimum spin duty).";
+                    bool pinned = _fanControl.SetFixed((uint)FixedDuty);
+                    StatusText = !pinned
+                        ? $"The driver did not accept fixed {duty}% — the fans are unchanged."
+                        : duty == (uint)FixedDuty
+                            ? $"Fixed {duty}% applied to all fans."
+                            : $"Fixed {duty}% applied (requested {FixedDuty:F0}%, raised to the hardware minimum spin duty).";
                     break;
                 case 2:
                     _fanControl.SetCurve(BuildConfig());
                     StatusText = "Curve active — Afterglow is driving the fans.";
                     break;
                 default:
-                    _fanControl.SetAuto();
-                    StatusText = "Firmware (auto) fan control restored.";
+                    // Only claim the restore when the driver actually granted it.
+                    StatusText = _fanControl.SetAuto()
+                        ? "Firmware (auto) fan control restored."
+                        : "The driver did not accept the release, so the fans stay as they are. If they are pinned, " +
+                          "this usually means Afterglow is not running as administrator; on a card with no fan " +
+                          "control there was nothing to release.";
                     break;
             }
 

@@ -111,3 +111,45 @@ public class VfPointStructLayoutTests
         Assert.Equal(9248, Marshal.SizeOf<Afterglow.Core.Interop.Nvapi.NvClockTable>());
     }
 }
+
+/// <summary>
+/// The two pure decisions that gate removing a user's curve: is there per-point
+/// shape in the table at all, and did the profile ever look at the table?
+/// </summary>
+public class VfPointReconcileTests
+{
+    private static NvapiGpu.VfpTablePoint P(int i, int offset) => new(i, 800 + i, 1500 + i, offset);
+
+    [Fact]
+    public void A_uniform_table_is_not_shaped_however_large_the_offset()
+    {
+        // What a global core offset alone looks like: same delta on every slot.
+        Assert.False(VfPointPlanner.HasPerPointShape([P(0, 100), P(1, 100), P(2, 100)]));
+        Assert.False(VfPointPlanner.HasPerPointShape([P(0, 0), P(1, 0)]));
+        Assert.False(VfPointPlanner.HasPerPointShape([P(0, 250)]));
+        Assert.False(VfPointPlanner.HasPerPointShape([]));
+    }
+
+    [Fact]
+    public void One_slot_out_of_line_is_shape()
+    {
+        Assert.True(VfPointPlanner.HasPerPointShape([P(0, 100), P(1, 100), P(2, -50)]));
+        Assert.True(VfPointPlanner.HasPerPointShape([P(0, -50), P(1, 100)]));
+    }
+
+    [Fact]
+    public void Only_a_profile_that_read_the_table_may_claim_it_carries_no_offsets()
+    {
+        // A profile assembled from ReadCurrent (CLI --core-offset, MCP tuning,
+        // the stepper, the post-game restore) cannot see point offsets, so its
+        // silence must never be read as "remove the curve".
+        var fromReadCurrent = new TuningProfile { Name = "partial set", CoreOffsetMHz = 100 };
+        Assert.False(fromReadCurrent.CapturedVfPoints);
+        Assert.Null(fromReadCurrent.VfPointOffsetsMHz);
+
+        // A profile saved after reading the table says the same thing and means it.
+        var saved = fromReadCurrent with { CapturedVfPoints = true };
+        Assert.True(saved.CapturedVfPoints);
+        Assert.Null(saved.Validate());
+    }
+}

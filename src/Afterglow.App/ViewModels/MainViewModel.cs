@@ -133,7 +133,9 @@ public partial class MainViewModel : ObservableObject
                 Application.Current?.Dispatcher.BeginInvoke(() =>
                     TrayAlert?.Invoke(
                         "Fan command failed",
-                        $"The driver refused a fan command ({rc}). Fan control may need administrator rights."));
+                        rc == Core.Interop.Nvml.NvmlReturn.NotSupported
+                            ? "This GPU does not expose fan control through the driver, so the fan command did nothing."
+                            : $"The driver refused a fan command ({rc}). Fan control may need administrator rights."));
         }
 
         if (services.Settings.UpdateCheckEnabled && !services.DemoMode)
@@ -227,17 +229,40 @@ public partial class MainViewModel : ObservableObject
     /// Central path used by the Profiles page, hotkeys, startup, and per-game rules.
     /// When <paramref name="gameContext"/> is true, an Auto-fan profile is read as
     /// "no fan opinion" and leaves the user's current fan setup untouched.
+    /// <paramref name="target"/> pins the apply to one specific card — automation
+    /// aims at the card that breached, which is not necessarily the stamped or the
+    /// selected one; when it is null the profile's own stamp, else the selected
+    /// card, decides as before. A caller that passes a target owns the identity
+    /// check (TuningProfile.AppliesToGpu) — the fan half of an apply runs whether
+    /// or not the clock half was refused.
     /// The Fans page UI is kept in sync with whatever was applied.
     /// </summary>
-    public ApplyResult ApplyProfileFull(Core.Profiles.TuningProfile profile, bool gameContext = false)
+    public ApplyResult ApplyProfileFull(
+        Core.Profiles.TuningProfile profile,
+        bool gameContext = false,
+        Core.Hardware.GpuContext? target = null)
     {
-        var gpu = TargetGpuFor(profile);
+        var gpu = target ?? TargetGpuFor(profile);
         if (gpu is null)
         {
             return new ApplyResult(false, [KnobResult.Fail("profile", "no GPU")]);
         }
 
         var result = gpu.Tuner.Apply(profile);
+
+        // A profile the engine refused outright — invalid, or stamped for
+        // another card — never reached a knob, so the fan half must not run
+        // either: applying one card's fan curve to another, or a duty from a
+        // profile that failed validation, is exactly what the refusal prevents.
+        if (result.Results.Any(r => r.Knob == "profile" && !r.Applied))
+        {
+            return result;
+        }
+
+        // The fan half is part of the apply, so its outcome is part of the
+        // result: a profile whose fan command the driver refused is a partial
+        // apply, and every caller that reports to the user reads AllSucceeded.
+        var results = result.Results.ToList();
 
         // The Fans page editor mirrors the SELECTED card only — an apply
         // landing on another GPU must not rewrite the editor's state.
@@ -247,7 +272,9 @@ public partial class MainViewModel : ObservableObject
             switch (profile.FanMode)
             {
                 case Core.Profiles.FanMode.Fixed:
-                    fans.SetFixed(profile.FixedFanPct);
+                    results.Add(fans.SetFixed(profile.FixedFanPct)
+                        ? KnobResult.Ok("fans", $"fixed {profile.FixedFanPct}%")
+                        : KnobResult.Fail("fans", $"the driver did not accept fixed {profile.FixedFanPct}%"));
                     if (syncEditor)
                     {
                         Fans.SyncFromApplied(Core.Profiles.FanMode.Fixed, profile.FixedFanPct, profile.FanCurve);
@@ -258,19 +285,26 @@ public partial class MainViewModel : ObservableObject
                     try
                     {
                         fans.SetCurve(profile.FanCurve);
+                        results.Add(KnobResult.Ok("fans", "curve armed"));
                         if (syncEditor)
                         {
                             Fans.SyncFromApplied(Core.Profiles.FanMode.Curve, profile.FixedFanPct, profile.FanCurve);
                         }
                     }
-                    catch (ArgumentException)
+                    catch (ArgumentException ex)
                     {
-                        // Invalid stored curve: leave fans as they are.
+                        // Invalid stored curve: leave fans as they are — and say so.
+                        results.Add(KnobResult.Fail("fans", $"stored curve rejected: {ex.Message}"));
                     }
 
                     break;
+                case Core.Profiles.FanMode.Curve:
+                    results.Add(KnobResult.Fail("fans", "the profile selects a fan curve but carries none"));
+                    break;
                 case Core.Profiles.FanMode.Auto when !gameContext:
-                    fans.SetAuto();
+                    results.Add(fans.SetAuto()
+                        ? KnobResult.Ok("fans", "firmware (auto)")
+                        : KnobResult.Fail("fans", "the driver did not accept the release to firmware control"));
                     if (syncEditor)
                     {
                         Fans.SyncFromApplied(Core.Profiles.FanMode.Auto, profile.FixedFanPct, null);
@@ -284,7 +318,9 @@ public partial class MainViewModel : ObservableObject
         }
 
         Tuning.RefreshFromHardware();
-        return result;
+        return results.Count == result.Results.Count
+            ? result
+            : new ApplyResult(results.All(r => r.Applied), results);
     }
 
     private void OnGameStarted(GameRule rule)
@@ -326,7 +362,9 @@ public partial class MainViewModel : ObservableObject
             VoltageBoostPct = pre.Boost,
             LockedCoreClockMHz = pre.Lock,
         };
-        _ = gpu.Tuner.Apply(restore);
+        // Built from ReadCurrent, which cannot see per-point offsets, so this
+        // restore must not be read as "the user wants no curve".
+        _ = gpu.Tuner.Apply(restore, reconcileVfPoints: false);
 
         // Fans back to what the user had before the game (if the game profile changed them).
         if (_preGameFans is { } fans && _services.FanControl.TryGetValue(gpu.Index, out var fanService))
@@ -493,9 +531,10 @@ public partial class MainViewModel : ObservableObject
             switch (fanSettings.Mode)
             {
                 case "fixed":
-                    fans.SetFixed(fanSettings.FixedDutyPct);
-                    Core.Diagnostics.Log.Info(
-                        $"Startup: restored fixed fan duty {fanSettings.FixedDutyPct}% (GPU {restoreGpu.Index}).");
+                    Core.Diagnostics.Log.Info(fans.SetFixed(fanSettings.FixedDutyPct)
+                        ? $"Startup: restored fixed fan duty {fanSettings.FixedDutyPct}% (GPU {restoreGpu.Index})."
+                        : $"Startup: the driver did not accept fixed fan duty {fanSettings.FixedDutyPct}% " +
+                          $"(GPU {restoreGpu.Index}); the fans are unchanged.");
                     break;
                 case "curve" when fanSettings.Curve.Validate() is null:
                     fans.SetCurve(fanSettings.Curve);
@@ -596,13 +635,16 @@ public partial class MainViewModel : ObservableObject
             switch (rule.Action)
             {
                 case "profile" when rule.ActionProfile is { } name && _services.Profiles.Load(name) is { } profile:
-                    _ = ApplyProfileFull(profile);
-                    action = $"applied profile '{name}'";
+                    // Throttle the card that actually breached — not whatever card
+                    // the profile is stamped for or the title bar happens to show.
+                    action = ApplyAutomationProfile(name, profile, fired.DeviceIndex);
                     break;
                 case "fans" when _services.FanControl.TryGetValue(fired.DeviceIndex, out var fans):
-                    // Pin the fans on the card that actually breached.
-                    fans.SetFixed(rule.ActionFanPct);
-                    action = $"fans set to fixed {rule.ActionFanPct}%";
+                    // Pin the fans on the card that actually breached — and report
+                    // the driver's answer, not the request.
+                    action = fans.SetFixed(rule.ActionFanPct)
+                        ? $"fans set to fixed {rule.ActionFanPct}%"
+                        : $"the driver did not accept fixed {rule.ActionFanPct}% on the fans";
                     break;
                 case "reset":
                     PanicReset();
@@ -624,6 +666,47 @@ public partial class MainViewModel : ObservableObject
         TrayAlert?.Invoke(
             "Automation rule fired",
             $"{metricLabel}{gpuLabel} hit {fired.Value:F0} (threshold {rule.Threshold:F0} for {rule.ForSeconds} s) — {action}.");
+    }
+
+    /// <summary>
+    /// The automation "profile" action. A rule watches every card but a profile
+    /// carries at most one card's stamp, so there is no configuration that suits
+    /// both cards: apply to the card that breached, and refuse a profile stamped
+    /// for a different card outright — before any knob, clocks OR fans, moves —
+    /// rather than landing it on the wrong GPU. The returned string is what the
+    /// log line and the tray balloon report. It is derived from the apply's own
+    /// per-knob results — which include the fan half — so a refusal, an invalid
+    /// profile and a partial apply are each reported as what they are.
+    /// </summary>
+    private string ApplyAutomationProfile(string name, Core.Profiles.TuningProfile profile, uint deviceIndex)
+    {
+        var gpu = _services.Gpus.FirstOrDefault(g => g.Index == deviceIndex);
+        if (gpu is null)
+        {
+            return $"no action taken — GPU {deviceIndex} is not available";
+        }
+
+        if (!profile.AppliesToGpu(gpu.Uuid))
+        {
+            return $"no action taken — profile '{name}' is saved for {profile.GpuName ?? "another card"}, not for GPU {deviceIndex} which is the card that breached; save a profile on that card and point the rule at it";
+        }
+
+        // gameContext: an Auto-fan profile means "no fan opinion" here. Without
+        // it, the throttle profile would hand the fans of a card that is
+        // breaching its thermal limit straight back to firmware.
+        var result = ApplyProfileFull(profile, gameContext: true, target: gpu);
+        if (result.AllSucceeded)
+        {
+            return $"applied profile '{name}'";
+        }
+
+        // A profile the engine refused never reached a knob, fans included;
+        // saying "some knobs failed" would imply a partial apply that never
+        // happened.
+        var refused = result.Results.FirstOrDefault(r => r.Knob == "profile" && !r.Applied);
+        return refused is not null
+            ? $"no action taken — profile '{name}' was refused: {refused.Detail}"
+            : $"applied profile '{name}' — {result.Summary}";
     }
 
     [RelayCommand]
