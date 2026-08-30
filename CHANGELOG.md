@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.2.0-beta.4 — 2026-08-30
 
 ### Fixed — independent review of 1.2.0-beta.3 (all 8 high-severity findings)
 
