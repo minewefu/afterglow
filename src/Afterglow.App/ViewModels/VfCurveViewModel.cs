@@ -46,11 +46,20 @@ public partial class VfCurveViewModel : ObservableObject
     [ObservableProperty] private bool _probeRunning;
     [ObservableProperty] private string _probeStatusText = string.Empty;
 
-    public bool CanApply => _services.DemoMode || (_services.IsElevated && _gpu is not null);
+    // Capability term for non-NVIDIA GPUs only — the NVIDIA gate is unchanged.
+    public bool CanApply => _services.DemoMode
+        || (_services.IsElevated && _gpu is not null
+            && (_gpu.Vendor == Core.Hardware.GpuVendor.Nvidia
+                || _gpu.Tuner.Capabilities.SupportsCoreOffset
+                || _gpu.Tuner.Capabilities.SupportsLockedCoreClock));
 
     public string GateText => CanApply
         ? string.Empty
-        : "Applying an undervolt needs administrator rights.";
+        : _gpu is not null && _gpu.Vendor != Core.Hardware.GpuVendor.Nvidia
+            && !_gpu.Tuner.Capabilities.SupportsCoreOffset
+            && !_gpu.Tuner.Capabilities.SupportsLockedCoreClock
+            ? "Undervolting isn't implemented for this GPU yet — the offset and clock-lock knobs it needs are unavailable in this beta."
+            : "Applying an undervolt needs administrator rights.";
 
     public string MethodNote { get; } =
         "Two curves, two truths: the gold dashed line is the driver's stored V/F table (editable per point " +

@@ -221,7 +221,10 @@ public partial class DashboardViewModel : ObservableObject
 
         if (s is { VramUsedBytes: ulong used, VramTotalBytes: ulong total } && total > 0)
         {
-            VramText = $"{used / 1024.0 / 1024.0 / 1024.0:F1} / {total / 1024.0 / 1024.0 / 1024.0:F0} GB";
+            // On a shared-memory iGPU the figure is the GPU's allocatable
+            // budget carved from system RAM, not dedicated VRAM — say so.
+            string shared = s.MemoryIsShared == true ? " shared" : "";
+            VramText = $"{used / 1024.0 / 1024.0 / 1024.0:F1} / {total / 1024.0 / 1024.0 / 1024.0:F0} GB{shared}";
             VramFraction = (double)used / total;
         }
 

@@ -41,7 +41,7 @@ internal static class McpCommand
             if (gpu is null)
             {
                 Console.Error.WriteLine(
-                    $"GPU {wantedIndex} not found — {manager.Gpus.Count} NVIDIA GPU(s) detected.");
+                    $"GPU {wantedIndex} not found — {manager.Gpus.Count} GPU(s) detected.");
                 return 2;
             }
         }
@@ -222,7 +222,7 @@ internal static class McpCommand
 
         object RequireGpu()
         {
-            return new { error = $"No NVIDIA GPU available (NVML: {manager.NvmlStatus})." };
+            return new { error = $"No supported GPU available (NVML: {manager.NvmlStatus}, IGCL: {manager.IgclStatus})." };
         }
 
         return
@@ -235,7 +235,7 @@ internal static class McpCommand
                 _ => gpu is null ? RequireGpu() : new
                 {
                     gpu = gpu.Name,
-                    driver = manager.DriverVersion,
+                    driver = gpu.DriverVersion,
                     architecture = gpu.Architecture,
                     elevated,
                     write_access = elevated,

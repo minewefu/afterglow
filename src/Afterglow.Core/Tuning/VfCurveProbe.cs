@@ -27,7 +27,7 @@ public sealed record VfProbeProgress(
 /// </summary>
 public sealed class VfCurveProbe
 {
-    private readonly GpuTuner _tuner;
+    private readonly IGpuTuner _tuner;
     private readonly Func<Telemetry.GpuSnapshot> _sample;
     private volatile bool _cancel;
     private Thread? _thread;
@@ -48,7 +48,7 @@ public sealed class VfCurveProbe
 
     public bool IsRunning => _thread is { IsAlive: true };
 
-    public VfCurveProbe(GpuTuner tuner, Func<Telemetry.GpuSnapshot> sample)
+    public VfCurveProbe(IGpuTuner tuner, Func<Telemetry.GpuSnapshot> sample)
     {
         _tuner = tuner;
         _sample = sample;

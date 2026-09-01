@@ -31,7 +31,7 @@ public sealed record CertifierStatus(
 /// </summary>
 public sealed class ProfileCertifier
 {
-    private readonly GpuTuner _tuner;
+    private readonly IGpuTuner _tuner;
     private readonly ProfileStore _store;
     private readonly object _lock = new();
     private readonly List<string> _log = [];
@@ -41,7 +41,7 @@ public sealed class ProfileCertifier
 
     public event Action<CertifierStatus>? StatusChanged;
 
-    public ProfileCertifier(GpuTuner tuner, ProfileStore store, uint? pciBusId = null)
+    public ProfileCertifier(IGpuTuner tuner, ProfileStore store, uint? pciBusId = null)
     {
         _tuner = tuner;
         _store = store;

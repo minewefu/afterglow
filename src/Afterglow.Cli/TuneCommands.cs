@@ -30,14 +30,18 @@ internal static class TuneCommands
             {
                 gpu = gpu.Name,
                 index = gpu.Index,
-                driver = manager.DriverVersion,
+                driver = gpu.DriverVersion,
                 architecture = gpu.Architecture,
                 capabilities = c,
             }, JsonOut));
             return 0;
         }
 
-        Console.WriteLine($"{gpu.Name} (GPU {gpu.Index}) — driver-reported tuning capabilities:");
+        // On Intel the all-false flags are Afterglow's not-implemented-yet
+        // policy, not the driver's answer — say which one is speaking.
+        Console.WriteLine(gpu.Vendor == GpuVendor.Intel
+            ? $"{gpu.Name} (GPU {gpu.Index}) — Afterglow tuning capabilities (tuning not implemented for Intel GPUs in this beta):"
+            : $"{gpu.Name} (GPU {gpu.Index}) — driver-reported tuning capabilities:");
         Console.WriteLine($"  Core offset     {(c.SupportsCoreOffset ? $"{c.CoreOffsetMinMHz}..{c.CoreOffsetMaxMHz} MHz" : "not supported")}");
         Console.WriteLine($"  Memory offset   {(c.SupportsMemOffset ? $"{c.MemOffsetMinMHz}..{c.MemOffsetMaxMHz} MHz" : "not supported")}");
         Console.WriteLine($"  Power limit     {(c.SupportsPowerLimit ? $"{c.PowerLimitMinW:F0}..{c.PowerLimitMaxW:F0} W (default {c.PowerLimitDefaultW:F0})" : "not supported")}");
@@ -75,7 +79,7 @@ internal static class TuneCommands
         Console.WriteLine($"{gpu.Name} (GPU {gpu.Index}) — current applied state:");
         Console.WriteLine($"  Core offset     {core} MHz");
         Console.WriteLine($"  Memory offset   {mem} MHz");
-        Console.WriteLine($"  Power limit     {power:F0} W");
+        Console.WriteLine($"  Power limit     {(power is double p ? $"{p:F0} W" : "not supported")}");
         if (boost is uint b)
         {
             Console.WriteLine($"  Voltage boost   {b}%");
@@ -208,7 +212,9 @@ internal static class TuneCommands
 
         if (!allOk)
         {
-            Console.Error.WriteLine("Some knobs failed. Run elevated (administrator) for write access.");
+            Console.Error.WriteLine(gpu.Vendor == GpuVendor.Intel
+                ? "Some knobs failed. Tuning is not implemented for Intel GPUs in this beta — monitoring only."
+                : "Some knobs failed. Run elevated (administrator) for write access.");
             return 1;
         }
 
@@ -236,7 +242,7 @@ internal static class TuneCommands
     {
         if (manager.Gpus.Count == 0)
         {
-            Console.Error.WriteLine($"No NVIDIA GPU found (NVML: {manager.NvmlStatus}).");
+            Console.Error.WriteLine($"No supported GPU found (NVML: {manager.NvmlStatus}, IGCL: {manager.IgclStatus}).");
             return null;
         }
 

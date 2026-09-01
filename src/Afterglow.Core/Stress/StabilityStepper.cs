@@ -37,7 +37,7 @@ public sealed record StepperStatus(
 /// </summary>
 public sealed class StabilityStepper
 {
-    private readonly GpuTuner _tuner;
+    private readonly IGpuTuner _tuner;
     private readonly object _lock = new();
     private readonly List<string> _log = [];
     private Thread? _thread;
@@ -46,7 +46,7 @@ public sealed class StabilityStepper
 
     public event Action<StepperStatus>? StatusChanged;
 
-    public StabilityStepper(GpuTuner tuner)
+    public StabilityStepper(IGpuTuner tuner)
     {
         _tuner = tuner;
     }

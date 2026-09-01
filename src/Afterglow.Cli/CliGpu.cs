@@ -37,7 +37,7 @@ internal static class CliGpu
         var gpu = manager.Gpus.FirstOrDefault(g => g.Index == index);
         if (gpu is null)
         {
-            return (null, $"GPU {index} not found — {manager.Gpus.Count} NVIDIA GPU(s) detected.");
+            return (null, $"GPU {index} not found — {manager.Gpus.Count} GPU(s) detected.");
         }
 
         if (gpu.PciBusId is null)

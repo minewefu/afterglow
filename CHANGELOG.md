@@ -2,6 +2,41 @@
 
 ## 1.3.0-beta.1 — 2026-09-01
 
+- **Intel Arc support, milestone 2: live monitoring in the app.** The hardware
+  layer is vendor-plural: `GpuManager` now initializes IGCL alongside NVML/NVAPI
+  and produces a `GpuContext` per Intel GPU (numbered after the NVML devices, so
+  per-index history, fans, flight recorders, and the GPU selector work
+  unchanged), each with a reboot-stable `INTEL-<domain:bus:device.function>-<deviceid>`
+  identity for profile/state stamping — the IGCL LUID changes every boot and is
+  never persisted, and the full PCI location fits inside the 12-character
+  prefix per-GPU state files key on, so identical cards can never share a file. A new `IntelSensorSource` feeds the existing telemetry pipeline
+  from IGCL: core clock, board power and GPU utilization derived from the
+  driver's monotonic energy/activity counters (unit-checked; counter resets and
+  missing samples yield an honest "—", never a guess), session energy, media
+  clock, shared-memory use — the dashboard VRAM tile now says "shared" on
+  UMA iGPUs, where the figure is the GPU's allocatable budget rather than
+  dedicated VRAM. The tuning surface is behind a new `IGpuTuner` interface
+  extracted from `GpuTuner` with its exact NVIDIA signatures (that path is
+  deliberately untouched — it cannot be regression-tested on this machine);
+  the Intel implementation reports every capability false in this beta, and the
+  page gates learned a capability-aware branch that applies to non-NVIDIA GPUs
+  only (the NVIDIA gates are untouched, like the rest of that path): Tuning
+  says "monitoring only in this beta", Fans says the fans are
+  firmware-controlled, the V/F and stepper pages name the missing knobs, and
+  the `caps` header says the flags are Afterglow's not-implemented-yet policy
+  rather than calling them driver-reported. `ReadCurrent`'s power-limit slot
+  became nullable so `get` and the MCP status report "not supported"/null on
+  Intel instead of a fabricated 0 W (NVIDIA still always reads a real value
+  back). Verified live on the OneXPlayer 3: the app starts on the Arc B390
+  with a populated dashboard (550 MHz idle clock, watts, load, 1.0/13 GB
+  shared budget) and honest "—" for the temperature, fan, and voltage sensors
+  this device does not expose. `afterglow-cli monitor` works on Intel-only
+  machines (in `--json`/`--once` it primes Intel's counter-based metrics with
+  a second sample; NVIDIA output — down to its unenriched CLI field set and
+  single immediate poll — is byte-identical to before), and "No NVIDIA GPU"
+  errors became "No supported GPU"/"GPU(s) detected" across the CLI's
+  vendor-neutral enumeration paths.
+
 - **Intel Arc support, milestone 1: interop layer + multi-vendor selftest.** New
   IGCL (Intel Graphics Control Library, `ControlLib.dll`) and Level Zero Sysman
   (`ze_loader.dll`) bindings in `Afterglow.Core/Interop`, grounded field-for-field

@@ -94,7 +94,7 @@ public sealed record ApplyResult(bool AllSucceeded, IReadOnlyList<KnobResult> Re
 /// FanControlService (continuous curves) and the CLI's explicit fan command,
 /// so profile switches can't fight the fan service.
 /// </summary>
-public sealed class GpuTuner
+public sealed class GpuTuner : IGpuTuner
 {
     private readonly NvmlDevice _nvml;
     private readonly NvapiGpu? _nvapi;
@@ -210,7 +210,7 @@ public sealed class GpuTuner
     }
 
     /// <summary>Reads the currently applied values (lock is Afterglow-tracked; see <see cref="AppliedLockMHz"/>).</summary>
-    public (int CoreOffsetMHz, int MemOffsetMHz, double PowerLimitW, uint? VoltageBoostPct, uint? LockedCoreClockMHz) ReadCurrent()
+    public (int CoreOffsetMHz, int MemOffsetMHz, double? PowerLimitW, uint? VoltageBoostPct, uint? LockedCoreClockMHz) ReadCurrent()
     {
         int core = 0, mem = 0;
         if (_nvml.TryGetClockOffset(NvmlClockType.Graphics, out var c) == NvmlReturn.Success)
@@ -1030,11 +1030,19 @@ public static class AppliedStateStore
         }
     }
 
-    /// <summary>Per-GPU file name derived from the NVML UUID ("GPU-2b6ae74e-…" → stable suffix).</summary>
+    /// <summary>
+    /// Per-GPU file name derived from the GPU UUID ("GPU-2b6ae74e-…" or
+    /// "INTEL-0000:00:02.0-…" → stable suffix). Vendor prefixes are stripped so
+    /// the 12-character budget is spent on the identifying digits.
+    /// </summary>
     public static string PathFor(string gpuUuid)
     {
         var keep = new string(gpuUuid.Where(char.IsLetterOrDigit).ToArray());
-        if (keep.StartsWith("GPU", StringComparison.OrdinalIgnoreCase))
+        if (keep.StartsWith("INTEL", StringComparison.OrdinalIgnoreCase))
+        {
+            keep = "i" + keep[5..]; // keep vendor namespaces disjoint post-strip
+        }
+        else if (keep.StartsWith("GPU", StringComparison.OrdinalIgnoreCase))
         {
             keep = keep[3..];
         }

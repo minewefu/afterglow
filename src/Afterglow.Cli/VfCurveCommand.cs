@@ -38,7 +38,7 @@ internal static class VfCurveCommand
         using var manager = new GpuManager();
         if (manager.Gpus.Count == 0)
         {
-            Console.Error.WriteLine($"No NVIDIA GPU found (NVML: {manager.NvmlStatus}).");
+            Console.Error.WriteLine($"No supported GPU found (NVML: {manager.NvmlStatus}, IGCL: {manager.IgclStatus}).");
             return 1;
         }
 
@@ -46,7 +46,7 @@ internal static class VfCurveCommand
         var gpu = manager.Gpus.FirstOrDefault(g => g.Index == gpuIndex);
         if (gpu is null)
         {
-            Console.Error.WriteLine($"GPU {gpuIndex} not found — {manager.Gpus.Count} NVIDIA GPU(s) detected.");
+            Console.Error.WriteLine($"GPU {gpuIndex} not found — {manager.Gpus.Count} GPU(s) detected.");
             return 2;
         }
 

@@ -61,13 +61,25 @@ public partial class TuningViewModel : ObservableObject
 
     public string LockClockLabel => $"{LockClock:F0} MHz";
 
-    public bool CanTune => _services.DemoMode || (_services.IsElevated && _gpu is not null);
+    // The capability term applies only to non-NVIDIA GPUs: the NVIDIA gate is
+    // deliberately unchanged (it cannot be regression-tested on this machine),
+    // including its behavior on cards where individual probes failed.
+    public bool CanTune => _services.DemoMode
+        || (_services.IsElevated && _gpu is not null
+            && (_gpu.Vendor == Core.Hardware.GpuVendor.Nvidia || HasAnyTuningKnob(Capabilities)));
 
     public string TuneGateText => CanTune
         ? string.Empty
         : _gpu is null
-            ? "No NVIDIA GPU detected — tuning unavailable."
-            : "Running without administrator rights — monitoring works, tuning is locked. Restart Afterglow and accept the elevation prompt to tune.";
+            ? "No supported GPU detected — tuning unavailable."
+            : _gpu.Vendor != Core.Hardware.GpuVendor.Nvidia && !HasAnyTuningKnob(Capabilities)
+                ? "Tuning isn't implemented for this GPU yet — monitoring only in this beta."
+                : "Running without administrator rights — monitoring works, tuning is locked. Restart Afterglow and accept the elevation prompt to tune.";
+
+    private static bool HasAnyTuningKnob(TuningCapabilities c) =>
+        c.SupportsCoreOffset || c.SupportsMemOffset || c.SupportsPowerLimit
+        || c.SupportsLockedCoreClock || c.SupportsVoltageBoost || c.SupportsTempLimit
+        || c.SupportsVfPoints;
 
     public bool SupportsTempLimit => Capabilities.SupportsTempLimit;
 
@@ -129,7 +141,7 @@ public partial class TuningViewModel : ObservableObject
         var (core, mem, power, boost, lockMHz) = _gpu.Tuner.ReadCurrent();
         CoreOffset = core;
         MemOffset = mem;
-        PowerLimit = power > 0 ? power : Capabilities.PowerLimitDefaultW;
+        PowerLimit = power is > 0 ? power.Value : Capabilities.PowerLimitDefaultW;
         VoltageBoost = boost ?? 0;
         LockEnabled = lockMHz is not null;
         if (lockMHz is uint lc)
