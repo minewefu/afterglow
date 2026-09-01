@@ -128,6 +128,21 @@ public class IntelIdentityTests
     }
 
     [Fact]
+    public void Validation_floors_follow_the_device_not_the_nvidia_defaults()
+    {
+        // A 150 MHz clamp is legitimate on Intel (domain floor 100 MHz) but
+        // was rejected by the NVML-era 210 MHz schema floor.
+        var profile = new Afterglow.Core.Profiles.TuningProfile { Name = "clamp", LockedCoreClockMHz = 150 };
+        Assert.NotNull(profile.Validate());
+        Assert.Null(profile.Validate(lockFloorMHz: 100));
+
+        // Low-power Arc parts report power minimums below the 50 W default.
+        var lowPower = new Afterglow.Core.Profiles.TuningProfile { Name = "lp", PowerLimitW = 25 };
+        Assert.NotNull(lowPower.Validate());
+        Assert.Null(lowPower.Validate(powerFloorW: 15));
+    }
+
+    [Fact]
     public void Intel_and_nvidia_state_files_cannot_collide()
     {
         // After prefix stripping, Intel suffixes start with 'i' and NVML UUIDs

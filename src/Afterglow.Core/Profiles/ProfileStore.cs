@@ -42,7 +42,11 @@ public sealed class ProfileStore
                 {
                     errors.Add((file, "Empty profile file."));
                 }
-                else if (profile.Validate() is string error)
+                // The store is vendor-agnostic, so its corruption guard uses
+                // the widest legitimate floors (Intel clamps reach 100 MHz;
+                // low-power Arc parts report power minimums below 50 W). The
+                // apply engine re-validates against the actual device.
+                else if (profile.Validate(lockFloorMHz: 100, powerFloorW: 15) is string error)
                 {
                     errors.Add((file, error));
                 }
@@ -82,7 +86,8 @@ public sealed class ProfileStore
     /// <summary>Validates then atomically writes the profile. Throws on validation failure.</summary>
     public void Save(TuningProfile profile)
     {
-        if (profile.Validate() is string error)
+        // Widest legitimate floors — see the load-side comment above.
+        if (profile.Validate(lockFloorMHz: 100, powerFloorW: 15) is string error)
         {
             throw new InvalidOperationException($"Refusing to save invalid profile: {error}");
         }

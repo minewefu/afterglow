@@ -147,12 +147,23 @@ counters unsupported.
 
 ## Consequences for the port (recorded, not assumed)
 
-- **TDP writes have no answering path on this device yet**: IGCL enumerates no power
+- **TDP writes have no answering path on this device**: IGCL enumerates no power
   domains, the IGCL OC power limit is unsupported, and Sysman's power domain says
-  `canControl=false`. Frequency-range clamping *is* controllable and is the
-  driver-supported lever this device offers. Whether `ctlFrequencySetRange` /
-  OC writes actually stick (and verify by readback) is a milestone-3 question;
-  nothing here has attempted a write yet — selftest is read-only.
+  `canControl=false`. MSR-based package-limit writes would need ring-0 access,
+  which this project bans. The UI says so instead of pretending.
+- **The frequency-range clamp is verified working on this device** (2026-09-01,
+  driver 32.0.101.8991, elevated): `ctlFrequencySetRange(GPU, 100, 450)` returned
+  success, `ctlFrequencyGetRange` read back `100..450 MHz`, and the core was
+  observed enforced at **100 MHz under load** — the driver enforces the clamp.
+  Release via `SetRange(-1, -1)` (the header's "factory value" sentinel) also
+  verified: readback returned `100..2300 MHz` and clocks recovered immediately.
+  Note the header's warning that the -1 restore returns to the *factory* max,
+  which can sit below the hardware max — release verification therefore checks
+  that the clamp we applied is gone, not that the hardware max returned, and
+  the observed released value becomes the baseline clamp detection compares
+  against. This is the knob Afterglow maps its "locked core clock" onto for
+  Arc — with a real "(verified)" suffix, which the NVML lock can never earn
+  (no getter exists there).
 - **GPU temperature is not exposed** by either stack on this device. The dashboard
   will say so rather than substitute a number from an undocumented source.
 - The shared-memory module (location SYSTEM) is the honest signal the VRAM test

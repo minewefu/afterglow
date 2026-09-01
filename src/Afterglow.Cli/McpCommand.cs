@@ -388,8 +388,15 @@ internal static class McpCommand
         };
 
         // Schema validation errors cite generic sanity bounds; report the
-        // ranges that actually matter — this GPU's — alongside them.
-        if (profile.Validate() is string validationError)
+        // ranges that actually matter — this GPU's — alongside them. Floors
+        // come from the device where its driver reports lower ones than the
+        // NVIDIA-era defaults (Intel clamps reach 100 MHz).
+        var validationCaps = gpu.Tuner.Capabilities;
+        uint lockFloor = validationCaps.LockClockMinMHz is > 0 and < 210 ? validationCaps.LockClockMinMHz : 210;
+        double powerFloor = validationCaps is { SupportsPowerLimit: true, PowerLimitMinW: > 0 and < 50 }
+            ? validationCaps.PowerLimitMinW
+            : 50;
+        if (profile.Validate(lockFloor, powerFloor) is string validationError)
         {
             var caps = gpu.Tuner.Capabilities;
             return new

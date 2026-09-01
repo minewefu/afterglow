@@ -2,6 +2,35 @@
 
 ## 1.3.0-beta.1 — 2026-09-01
 
+- **Intel Arc support, milestone 3: the first verified write path — the
+  frequency clamp — plus the honest TDP verdict.** `ArcGpuTuner` now maps
+  Afterglow's "locked core clock" knob onto IGCL's GPU frequency-range clamp
+  (`ctlFrequencySetRange`), the one GPU-domain control the OneXPlayer 3's
+  driver reports as controllable. Unlike NVML's lock, IGCL has a real readback
+  getter, so every clamp apply and release either reports "(verified)" from an
+  actual driver round-trip or fails loudly — a write the getter cannot confirm
+  is reported as a failure, never a silent success — and `get` on Intel reads
+  the clamp back from the driver, with a live "released" answer overriding any
+  tracked shadow. Verified live: clamping to 450 MHz returned "100..450 MHz
+  (verified)" and the core was enforced at 100 MHz under load; releasing
+  restored "100..2300 MHz (verified)" with clocks recovering immediately. Apply/Reset/panic/ForceUnlock, applied-state
+  stamping with the Intel identity, and crash recovery all flow through the
+  same path. A power-limit write path (`ctlOverclockPowerLimitSetV2` with
+  readback, unit-aware per the driver's capability block) is implemented and
+  lights up only where the driver reports the knob supported — false on this
+  iGPU, expected true on discrete Arc; field verification wanted. The honest
+  TDP finding is recorded in docs/research/intel-driver-apis.md and in the
+  app: no documented userland path answers for package-power writes on this
+  device (no IGCL power domains, OC power limit unsupported, Sysman
+  `canControl=false`, and ring-0 MSR writes are banned by project rules), so
+  the Tuning page says exactly that — the clamp is the driver-supported lever,
+  and the package budget is shared with the CPU either way. The Tuning page is
+  vendor-aware without touching the NVIDIA rendering: on Intel only the knobs
+  Afterglow actually drives appear (no degenerate 0..0 sliders), the clock-lock
+  card describes the clamp rather than the RTX 50 undervolt method, the slider
+  floor comes from the driver's own domain minimum (100 MHz here), and the
+  `caps` header now says "knobs Afterglow can drive on this device".
+
 - **Intel Arc support, milestone 2: live monitoring in the app.** The hardware
   layer is vendor-plural: `GpuManager` now initializes IGCL alongside NVML/NVAPI
   and produces a `GpuContext` per Intel GPU (numbered after the NVML devices, so

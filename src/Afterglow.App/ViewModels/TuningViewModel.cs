@@ -85,7 +85,44 @@ public partial class TuningViewModel : ObservableObject
 
     public string TempLimitNote => Capabilities.SupportsTempLimit
         ? string.Empty
-        : "Temperature-limit control isn't exposed by this driver generation; use the power limit and fan curve instead.";
+        : IsNvidiaOrDemo
+            ? "Temperature-limit control isn't exposed by this driver generation; use the power limit and fan curve instead."
+            : "Temperature-limit control isn't exposed by this device's driver; use the clock clamp instead.";
+
+    // Everything below renders the NVIDIA page exactly as it has always been
+    // (all true / historical strings); on Intel each card appears only when
+    // Afterglow actually drives that knob on this device.
+    private bool IsNvidiaOrDemo =>
+        _services.DemoMode || _gpu is null || _gpu.Vendor == Core.Hardware.GpuVendor.Nvidia;
+
+    public bool ShowCoreOffset => IsNvidiaOrDemo || Capabilities.SupportsCoreOffset;
+
+    public bool ShowMemOffset => IsNvidiaOrDemo || Capabilities.SupportsMemOffset;
+
+    public bool ShowPowerLimit => IsNvidiaOrDemo || Capabilities.SupportsPowerLimit;
+
+    public bool ShowClockLock => IsNvidiaOrDemo || Capabilities.SupportsLockedCoreClock;
+
+    /// <summary>The wizard's lock+offset trade needs both knobs.</summary>
+    public bool ShowUndervoltWizard => IsNvidiaOrDemo
+        || (Capabilities.SupportsCoreOffset && Capabilities.SupportsLockedCoreClock);
+
+    public double LockClockSliderMin =>
+        !IsNvidiaOrDemo && Capabilities.LockClockMinMHz > 0 ? Capabilities.LockClockMinMHz : 1000;
+
+    public string PageSubtitle => IsNvidiaOrDemo
+        ? "Every range below comes from the driver for this exact GPU. Values are clamped and applied knob-by-knob; offsets, power limit, and voltage boost are verified by reading back (the driver offers no getter for the clock lock — Afterglow tracks it)."
+        : "Every range below comes from the driver for this exact GPU. Values are clamped and applied knob-by-knob, and the frequency clamp is verified by reading it back from the driver.";
+
+    public string ClockLockTitle => IsNvidiaOrDemo ? "Clock lock (undervolt)" : "Clock clamp";
+
+    public string ClockLockDescription => IsNvidiaOrDemo
+        ? "Caps boost at a target clock while a positive core offset shifts the V/F curve — the GPU reaches the target at a lower voltage. The documented-API undervolt for RTX 50."
+        : "Clamps the GPU's frequency range below its stock maximum — the driver-supported lever on this device for trading peak clocks against power and heat. Applies and releases are verified by reading the range back from the driver.";
+
+    public string PowerLimitNote => !IsNvidiaOrDemo && !Capabilities.SupportsPowerLimit
+        ? "This device's driver exposes no power-limit control (probed live via IGCL). The clock clamp is the driver-supported lever for power and heat — and the package power budget is shared with the CPU either way."
+        : string.Empty;
 
     // Demo-mode ranges mirror an RTX 5090 so the whole UI is explorable.
     private static readonly TuningCapabilities DemoCapabilities = new()
@@ -126,6 +163,16 @@ public partial class TuningViewModel : ObservableObject
         OnPropertyChanged(nameof(TuneGateText));
         OnPropertyChanged(nameof(SupportsTempLimit));
         OnPropertyChanged(nameof(TempLimitNote));
+        OnPropertyChanged(nameof(ShowCoreOffset));
+        OnPropertyChanged(nameof(ShowMemOffset));
+        OnPropertyChanged(nameof(ShowPowerLimit));
+        OnPropertyChanged(nameof(ShowClockLock));
+        OnPropertyChanged(nameof(ShowUndervoltWizard));
+        OnPropertyChanged(nameof(LockClockSliderMin));
+        OnPropertyChanged(nameof(PageSubtitle));
+        OnPropertyChanged(nameof(ClockLockTitle));
+        OnPropertyChanged(nameof(ClockLockDescription));
+        OnPropertyChanged(nameof(PowerLimitNote));
         RefreshFromHardware();
     }
 
@@ -147,8 +194,26 @@ public partial class TuningViewModel : ObservableObject
         if (lockMHz is uint lc)
         {
             LockClock = lc;
+            _lockClockBeforeCoercion = null;
+        }
+        else if (!IsNvidiaOrDemo && Capabilities.MaxCoreClockMHz > 0 && LockClock > Capabilities.MaxCoreClockMHz)
+        {
+            // The default slider position (2500) can exceed an iGPU's whole
+            // range; start at the device's stock maximum instead — and
+            // remember the prior value so switching back to a GPU that can
+            // hold it doesn't inherit the iGPU's ceiling.
+            _lockClockBeforeCoercion ??= LockClock;
+            LockClock = Capabilities.MaxCoreClockMHz;
+        }
+        else if (_lockClockBeforeCoercion is double prior
+            && (IsNvidiaOrDemo || Capabilities.MaxCoreClockMHz == 0 || prior <= Capabilities.MaxCoreClockMHz))
+        {
+            LockClock = prior;
+            _lockClockBeforeCoercion = null;
         }
     }
+
+    private double? _lockClockBeforeCoercion;
 
     /// <summary>The pending values as a profile (used by Apply and by "save as profile").</summary>
     public TuningProfile ToProfile(string name) => new()

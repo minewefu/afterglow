@@ -37,10 +37,11 @@ internal static class TuneCommands
             return 0;
         }
 
-        // On Intel the all-false flags are Afterglow's not-implemented-yet
-        // policy, not the driver's answer — say which one is speaking.
+        // On Intel a flag means "Afterglow drives this knob on this device,
+        // verified by readback" — a mix of driver answers and not-implemented-
+        // yet policy, so don't label it as purely the driver speaking.
         Console.WriteLine(gpu.Vendor == GpuVendor.Intel
-            ? $"{gpu.Name} (GPU {gpu.Index}) — Afterglow tuning capabilities (tuning not implemented for Intel GPUs in this beta):"
+            ? $"{gpu.Name} (GPU {gpu.Index}) — knobs Afterglow can drive on this device (others read \"not supported\"):"
             : $"{gpu.Name} (GPU {gpu.Index}) — driver-reported tuning capabilities:");
         Console.WriteLine($"  Core offset     {(c.SupportsCoreOffset ? $"{c.CoreOffsetMinMHz}..{c.CoreOffsetMaxMHz} MHz" : "not supported")}");
         Console.WriteLine($"  Memory offset   {(c.SupportsMemOffset ? $"{c.MemOffsetMinMHz}..{c.MemOffsetMaxMHz} MHz" : "not supported")}");
@@ -85,8 +86,12 @@ internal static class TuneCommands
             Console.WriteLine($"  Voltage boost   {b}%");
         }
 
+        // NVIDIA's lock has no driver getter (the value is Afterglow-tracked);
+        // Intel's frequency clamp reads straight back from the driver.
         Console.WriteLine(lockMHz is uint lc
-            ? $"  Clock lock      210..{lc} MHz (Afterglow-tracked; the driver has no getter)"
+            ? gpu.Vendor == GpuVendor.Intel
+                ? $"  Clock lock      clamped to {lc} MHz (read back from the driver)"
+                : $"  Clock lock      210..{lc} MHz (Afterglow-tracked; the driver has no getter)"
             : "  Clock lock      none");
 
         return 0;
@@ -213,7 +218,7 @@ internal static class TuneCommands
         if (!allOk)
         {
             Console.Error.WriteLine(gpu.Vendor == GpuVendor.Intel
-                ? "Some knobs failed. Tuning is not implemented for Intel GPUs in this beta — monitoring only."
+                ? "Some knobs failed. On Intel, Afterglow drives only the knobs 'caps' lists as available; if the driver refused one of those, run elevated (administrator) for write access."
                 : "Some knobs failed. Run elevated (administrator) for write access.");
             return 1;
         }
