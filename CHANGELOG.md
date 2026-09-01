@@ -2,6 +2,18 @@
 
 ## 1.3.0-beta.1 — 2026-09-01
 
+- **Intel Arc support, milestone 5: parity confirmed where the design already
+  paid for it.** FPS capture works on Arc with zero changes — PresentMon is
+  Intel's own tool and the ETW present pipeline is vendor-neutral (verified
+  live on the B390: a presenting app captured at 240 fps with P1/1%-low
+  metrics and present-mode detection). Per-game profiles, automation rules,
+  session history, CSV logging, the overlay, crash forensics, and the MCP
+  server all ride the same vendor-neutral seams. The README now tells the
+  two-vendor truth: a dedicated "Intel Arc support (beta)" section lists what
+  is verified working and what this device honestly lacks, the Honest
+  limitations split per vendor, and the no-kernel-driver pledge names Intel's
+  documented stacks alongside NVIDIA's.
+
 - **Intel Arc support, milestone 4: the stability lab runs on Arc.** The D3D
   stress engines' adapter binding is vendor-aware: the PCI vendor id is now
   part of the binding alongside the bus (0x8086 for Arc contexts, resolved via
