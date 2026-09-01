@@ -66,12 +66,12 @@ internal static class Program
                                             agents can monitor, tune, and stability-test the
                                             GPU with typed tools (run elevated for writes).
                                             --gpu binds the whole server to one card.
+              help                          Show this help.
 
             On multi-GPU systems, --gpu binds stress/VRAM work to that card's exact
             D3D adapter (matched by PCI bus, never by adapter order).
 
             caps, get, and monitor --once accept --json for machine-readable output.
-              help                          Show this help.
             """);
         return 0;
     }
@@ -89,19 +89,38 @@ internal static class SelfTest
     {
         Console.WriteLine("Afterglow self-test");
         Console.WriteLine($"  Elevated: {IsElevated()}");
+
+        bool nvidia = DumpNvml();
+        bool igcl = SelfTestIntel.DumpIgcl();
+        bool sysman = SelfTestIntel.DumpSysman();
+
+        if (!nvidia && !igcl && !sysman)
+        {
+            Console.Error.WriteLine("No GPU stack answered: NVML, IGCL, and Level Zero Sysman all failed to initialize.");
+            return 1;
+        }
+
+        return 0;
+    }
+
+    private static bool DumpNvml()
+    {
         Console.WriteLine();
+        Console.WriteLine("=== NVIDIA NVML ===");
 
         using var nvml = NvmlApi.TryCreate(out var initStatus);
         if (nvml is null)
         {
-            Console.Error.WriteLine($"NVML initialization failed: {initStatus}");
-            return 1;
+            Console.WriteLine($"  NVML unavailable: {initStatus}");
+            // NVAPI is a separate library — still probe it so a partial NVIDIA
+            // install is reported per-capability instead of hidden.
+            return DumpNvapi([]);
         }
 
-        Console.WriteLine($"NVML initialized. Driver {nvml.GetDriverVersion()}, NVML {nvml.GetNvmlVersion()}");
+        Console.WriteLine($"  NVML initialized. Driver {nvml.GetDriverVersion()}, NVML {nvml.GetNvmlVersion()}");
 
         var devices = nvml.GetDevices();
-        Console.WriteLine($"Devices: {devices.Count}");
+        Console.WriteLine($"  Devices: {devices.Count}");
 
         foreach (var device in devices)
         {
@@ -109,10 +128,10 @@ internal static class SelfTest
         }
 
         DumpNvapi(devices);
-        return 0;
+        return true;
     }
 
-    private static void DumpNvapi(IReadOnlyList<NvmlDevice> nvmlDevices)
+    private static bool DumpNvapi(IReadOnlyList<NvmlDevice> nvmlDevices)
     {
         Console.WriteLine();
         Console.WriteLine("=== NVAPI (read-only probe) ===");
@@ -121,16 +140,27 @@ internal static class SelfTest
         if (nvapi is null)
         {
             Console.WriteLine($"  NVAPI unavailable: {initStatus}");
-            return;
+            return false;
         }
 
         var gpus = nvapi.GetGpus();
         Console.WriteLine($"  Physical GPUs: {gpus.Count}");
 
+        // Pair NVML architecture to each NVAPI GPU by PCI bus, the same key
+        // GpuManager uses — enumeration order is not a valid pairing.
+        var archByBus = new Dictionary<uint, uint>();
+        foreach (var device in nvmlDevices)
+        {
+            if (device.TryGetPciInfo(out _, out uint bus, out _, out _) == NvmlReturn.Success
+                && device.TryGetArchitecture(out uint deviceArch) == NvmlReturn.Success)
+            {
+                archByBus[bus] = deviceArch;
+            }
+        }
+
         foreach (var gpu in gpus)
         {
-            // Give the channel mapper the NVML architecture (match by order; refined by bus id later).
-            if (nvmlDevices.Count > 0 && nvmlDevices[0].TryGetArchitecture(out uint arch) == NvmlReturn.Success)
+            if (gpu.TryGetBusId(out uint pairBus) == NvapiStatus.Ok && archByBus.TryGetValue(pairBus, out uint arch))
             {
                 gpu.Architecture = arch;
             }
@@ -168,6 +198,8 @@ internal static class SelfTest
                 Console.WriteLine($"    cooler {fan.CoolerId}: {fan.Rpm} RPM, level {fan.Level}% (range {fan.MinLevel}..{fan.MaxLevel}%)");
             }
         }
+
+        return true;
     }
 
     private static void ReportNv(string label, NvapiStatus rc, string value)

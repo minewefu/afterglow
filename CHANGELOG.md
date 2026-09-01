@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.3.0-beta.1 — 2026-09-01
+
+- **Intel Arc support, milestone 1: interop layer + multi-vendor selftest.** New
+  IGCL (Intel Graphics Control Library, `ControlLib.dll`) and Level Zero Sysman
+  (`ze_loader.dll`) bindings in `Afterglow.Core/Interop`, grounded field-for-field
+  in Intel's official headers — every struct layout is pinned by unit tests against
+  sizes and interior field offsets compiled from `igcl_api.h`/`zes_api.h` themselves
+  (clang record-layout dump, procedure in docs/research/intel-driver-apis.md); on the
+  IGCL side the Size/Version protocol additionally has the driver check each struct's
+  total size at call time (Sysman's stype/pNext structs get no such runtime check —
+  the unit tests are their only net). `afterglow-cli selftest`
+  now probes three stacks independently — NVML no longer exits the self-test on a
+  machine without NVIDIA hardware — and prints every Intel capability truthfully:
+  bulk power telemetry (energy counters → watts, activity counters → utilization,
+  throttle flags), frequency domains with ranges and clamps, temperature sensors,
+  memory modules (shared vs dedicated location — the honest UMA signal), engine
+  groups, fans, power domains with PL1/PL2/PL4 limits, the per-knob overclock
+  capability report, and the V/F curve entry points. Verified live on an Arc B390
+  iGPU (OneXPlayer 3, driver 32.0.101.8991): telemetry, clocks, utilization, and
+  frequency-clamp reads all answer; the same run records what this device honestly
+  lacks — zero temperature sensors, zero fans (EC-controlled), zero IGCL power
+  domains, `bSupported=false` on every overclock knob, and `ErrorDataRead` from the
+  V/F curve reads. One trap this exposed is now load-bearing design: the OC getters
+  "succeed" with zeros even where the capability report says unsupported, so all
+  future gating keys off the capability report, never off getter status. The app
+  itself does not consume the new interop yet — that is milestone 2 (telemetry) —
+  and nothing writes to the hardware: selftest is read-only. Discrete Arc owners
+  (B-series especially): please run `afterglow-cli selftest` and paste the output
+  into a GitHub issue — the OC/power/temperature answers are expected to differ
+  from this iGPU's.
+
 ## 1.2.0-beta.4 — 2026-08-30
 
 ### Fixed — independent review of 1.2.0-beta.3 (all 8 high-severity findings)
