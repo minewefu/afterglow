@@ -54,6 +54,9 @@ public sealed class StabilityStepper
     /// <summary>Binds the burn to the tuned card on multi-GPU systems (null = largest NVIDIA).</summary>
     public uint? TargetPciBusId { get; set; }
 
+    /// <summary>PCI vendor of the card being tuned (defaults to NVIDIA).</summary>
+    public uint TargetVendorId { get; set; } = StressAdapter.NvidiaVendorId;
+
     public StepperStatus Status
     {
         get
@@ -299,7 +302,7 @@ public sealed class StabilityStepper
 
     private StressState Burn(TimeSpan duration, int offset, int? lastGood)
     {
-        using var stress = new GpuStressTest { TargetPciBusId = TargetPciBusId };
+        using var stress = new GpuStressTest { TargetPciBusId = TargetPciBusId, TargetVendorId = TargetVendorId };
         var done = new ManualResetEventSlim(false);
         StressState final = StressState.Failed;
 

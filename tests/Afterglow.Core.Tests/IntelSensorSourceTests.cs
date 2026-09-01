@@ -128,6 +128,34 @@ public class IntelIdentityTests
     }
 
     [Fact]
+    public void Shared_memory_planner_reserves_a_quarter_of_the_budget()
+    {
+        // 12 GiB budget, 1 GiB in use, plenty of free RAM → reserve 3 GiB, plan ≈ 8 GiB.
+        long gib = 1024L * 1024 * 1024;
+        long[] plan = Afterglow.Core.Stress.VramTest.PlanChunksShared(12 * gib, 1 * gib, 20 * gib);
+        Assert.NotEmpty(plan);
+        long total = plan.Sum();
+        Assert.InRange(total, 7 * gib, 8 * gib);
+
+        // A tight budget refuses instead of squeezing out a token test.
+        Assert.Empty(Afterglow.Core.Stress.VramTest.PlanChunksShared(2 * gib, 2 * gib, 20 * gib));
+    }
+
+    [Fact]
+    public void Shared_memory_planner_never_plans_past_free_physical_ram()
+    {
+        // A loaded 8 GiB machine: 5 GiB GPU budget but only 3 GiB physically
+        // free. The budget math alone would plan 3.25 GiB; the physical cap
+        // holds it to ~1.5 GiB so the test cannot page the system (and tested
+        // bytes cannot silently round-trip through the pagefile).
+        long gib = 1024L * 1024 * 1024;
+        long[] plan = Afterglow.Core.Stress.VramTest.PlanChunksShared(
+            5 * gib, gib / 4, 3 * gib);
+        Assert.NotEmpty(plan);
+        Assert.True(plan.Sum() <= 3 * gib - (long)(1.4 * gib));
+    }
+
+    [Fact]
     public void Validation_floors_follow_the_device_not_the_nvidia_defaults()
     {
         // A 150 MHz clamp is legitimate on Intel (domain floor 100 MHz) but

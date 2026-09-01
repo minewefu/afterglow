@@ -359,7 +359,11 @@ public partial class VfCurveViewModel : ObservableObject
 
         var recorder = _services.VfCurveFor(gpu.Index);
         _probeGpu = gpu;
-        _probe = new VfCurveProbe(gpu.Tuner, () => gpu.Poller.Poll()) { TargetPciBusId = gpu.PciBusId };
+        _probe = new VfCurveProbe(gpu.Tuner, () => gpu.Poller.Poll())
+        {
+            TargetPciBusId = gpu.PciBusId,
+            TargetVendorId = gpu.PciVendorId,
+        };
         _probe.ProgressChanged += progress =>
             Application.Current?.Dispatcher.BeginInvoke(() =>
             {

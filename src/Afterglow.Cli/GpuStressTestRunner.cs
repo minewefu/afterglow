@@ -16,9 +16,17 @@ internal sealed class GpuStressTestRunner : IDisposable
     /// <summary>Binds every burn in the sweep to the tuned card on multi-GPU systems.</summary>
     public uint? TargetPciBusId { get; set; }
 
+    /// <summary>PCI vendor of the card being tuned (defaults to NVIDIA).</summary>
+    public uint TargetVendorId { get; set; } = StressAdapter.NvidiaVendorId;
+
     public void Start()
     {
-        _current = new GpuStressTest { IterationsPerDispatch = Intensities[_index], TargetPciBusId = TargetPciBusId };
+        _current = new GpuStressTest
+        {
+            IterationsPerDispatch = Intensities[_index],
+            TargetPciBusId = TargetPciBusId,
+            TargetVendorId = TargetVendorId,
+        };
         _current.Start();
     }
 
@@ -28,7 +36,12 @@ internal sealed class GpuStressTestRunner : IDisposable
         _current?.StopAndWait(TimeSpan.FromSeconds(5));
         _current?.Dispose();
         _index = (_index + 1) % Intensities.Length;
-        _current = new GpuStressTest { IterationsPerDispatch = Intensities[_index], TargetPciBusId = TargetPciBusId };
+        _current = new GpuStressTest
+        {
+            IterationsPerDispatch = Intensities[_index],
+            TargetPciBusId = TargetPciBusId,
+            TargetVendorId = TargetVendorId,
+        };
         _current.Start();
     }
 

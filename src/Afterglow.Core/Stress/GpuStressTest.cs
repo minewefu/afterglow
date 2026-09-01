@@ -163,9 +163,12 @@ public sealed class GpuStressTest : IDisposable
 
     /// <summary>
     /// PCI bus of the card being tuned; binds the burn to that exact adapter.
-    /// Null keeps the largest-VRAM NVIDIA fallback (single-GPU behavior).
+    /// Null keeps the largest-VRAM fallback for the target vendor.
     /// </summary>
     public uint? TargetPciBusId { get; set; }
+
+    /// <summary>PCI vendor of the card being tuned (defaults to NVIDIA).</summary>
+    public uint TargetVendorId { get; set; } = StressAdapter.NvidiaVendorId;
 
     public event Action<StressProgress>? ProgressChanged;
 
@@ -234,13 +237,13 @@ public sealed class GpuStressTest : IDisposable
 
         try
         {
-            using var targetAdapter = StressAdapter.Select(TargetPciBusId, out string adapterName);
+            using var targetAdapter = StressAdapter.Select(TargetVendorId, TargetPciBusId, out string adapterName);
             if (targetAdapter is null)
             {
                 Report(StressState.Failed, stopwatch.Elapsed, 0, 0, 0,
                     adapterName.Length > 0
                         ? $"Adapter binding failed: {adapterName}"
-                        : "No NVIDIA adapter found — refusing to run the burn on a different GPU.");
+                        : $"No {StressAdapter.VendorName(TargetVendorId)} adapter found — refusing to run the burn on a different GPU.");
                 return;
             }
 

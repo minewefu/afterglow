@@ -69,7 +69,11 @@ internal static class VfCurveCommand
                 Console.WriteLine("Probing the V/F curve: locking each clock step under load (requires administrator)…");
             }
 
-            var vfProbe = new VfCurveProbe(gpu.Tuner, () => gpu.Poller.Poll()) { TargetPciBusId = gpu.PciBusId };
+            var vfProbe = new VfCurveProbe(gpu.Tuner, () => gpu.Poller.Poll())
+            {
+                TargetPciBusId = gpu.PciBusId,
+                TargetVendorId = gpu.PciVendorId,
+            };
             bool refused = false;
             vfProbe.ProgressChanged += progress =>
             {
@@ -104,7 +108,7 @@ internal static class VfCurveCommand
             {
                 if (drive)
                 {
-                    runner = new Stress.GpuStressTestRunner { TargetPciBusId = gpu.PciBusId };
+                    runner = new Stress.GpuStressTestRunner { TargetPciBusId = gpu.PciBusId, TargetVendorId = gpu.PciVendorId };
                     runner.Start();
                 }
 

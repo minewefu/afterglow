@@ -61,7 +61,7 @@ internal static class CertifyCommand
             return 2;
         }
 
-        var certifier = new ProfileCertifier(gpu.Tuner, store, gpu.PciBusId);
+        var certifier = new ProfileCertifier(gpu.Tuner, store, gpu.PciBusId, gpu.PciVendorId);
         var done = new ManualResetEventSlim(false);
         int lastLogCount = 0;
         CertifierStatus? final = null;

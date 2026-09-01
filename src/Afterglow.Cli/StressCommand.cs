@@ -43,7 +43,7 @@ internal static class StressCommand
             return ProbeAdapter();
         }
 
-        var (bus, busError) = CliGpu.ResolveBus(args);
+        var (bus, vendorId, busError) = CliGpu.ResolveTarget(args);
         if (busError is not null)
         {
             Console.Error.WriteLine(busError);
@@ -55,6 +55,7 @@ internal static class StressCommand
             IterationsPerDispatch = intensity,
             Pattern = pattern,
             TargetPciBusId = bus,
+            TargetVendorId = vendorId,
         };
         var done = new ManualResetEventSlim(false);
         StressProgress? final = null;
@@ -111,19 +112,24 @@ internal static class StressCommand
         using var manager = new Afterglow.Core.Hardware.GpuManager();
         if (manager.Gpus.Count == 0)
         {
-            Console.WriteLine($"No NVIDIA GPU via NVML ({manager.NvmlStatus}).");
+            Console.WriteLine($"No supported GPU found (NVML: {manager.NvmlStatus}, IGCL: {manager.IgclStatus}).");
         }
 
         foreach (var gpu in manager.Gpus)
         {
+            string source = gpu.PciVendorId == StressAdapter.NvidiaVendorId ? "NVML" : "IGCL";
             Console.WriteLine(FormattableString.Invariant(
-                $"GPU {gpu.Index}: {gpu.Name}  (NVML PCI bus {(gpu.PciBusId is { } b ? b : (object)"?")}, UUID {gpu.Uuid ?? "?"})"));
-            using var bound = StressAdapter.Select(gpu.PciBusId, out string boundDesc);
+                $"GPU {gpu.Index}: {gpu.Name}  ({source} PCI bus {(gpu.PciBusId is { } b ? b : (object)"?")}, UUID {gpu.Uuid ?? "?"})"));
+            using var bound = StressAdapter.Select(gpu.PciVendorId, gpu.PciBusId, out string boundDesc);
             Console.WriteLine($"  bus-bound D3D adapter: {(bound is null ? "FAILED" : "ok")} — {boundDesc}");
         }
 
-        using var fallback = StressAdapter.Select(null, out string fallbackDesc);
-        Console.WriteLine($"no-bus fallback (largest NVIDIA): {(fallback is null ? "none" : fallbackDesc)}");
+        // Probe the same vendor an actual unbound run would resolve, so the
+        // diagnostic describes what the engine will really do.
+        uint fallbackVendor = StressAdapter.DetectDefaultVendor();
+        string fallbackLabel = fallbackVendor == StressAdapter.NvidiaVendorId ? "largest NVIDIA" : "largest Intel";
+        using var fallback = StressAdapter.Select(fallbackVendor, null, out string fallbackDesc);
+        Console.WriteLine($"no-bus fallback ({fallbackLabel}): {(fallback is null ? "none" : fallbackDesc)}");
         return 0;
     }
 }

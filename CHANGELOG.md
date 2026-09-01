@@ -2,6 +2,26 @@
 
 ## 1.3.0-beta.1 — 2026-09-01
 
+- **Intel Arc support, milestone 4: the stability lab runs on Arc.** The D3D
+  stress engines' adapter binding is vendor-aware: the PCI vendor id is now
+  part of the binding alongside the bus (0x8086 for Arc contexts, resolved via
+  the same LUID→PCI-bus D3DKMT path, which works unchanged for Intel), so the
+  burn test, VRAM test, transition/excursion patterns, stepper, V/F probe, and
+  profile certification all target the exact card being tuned on any vendor —
+  and an unbound `stress`/`vram` run on an Intel-only machine now tests the
+  Intel GPU by default instead of failing to find an NVIDIA adapter (NVIDIA
+  machines keep the historical largest-NVIDIA fallback, byte-for-byte). The
+  VRAM test is honest about unified memory: it asks the D3D device itself
+  (`UnifiedMemoryArchitecture`) and on UMA plans against the GPU's shared
+  system-memory budget with a much larger safety reserve (a quarter of the
+  budget stays free — every byte tested is a byte taken from the OS), then
+  says exactly what it tested: "tested the GPU's shared system-memory budget
+  (UMA) — this device has no dedicated VRAM". Verified live on the OneXPlayer
+  3: a 20 s burn ran bit-exact with 0 errors, and a 25 s VRAM run detected
+  UMA, planned 9.5 GiB of the 13.4 GiB budget, and verified 55 full rounds at
+  ~20.8 GiB/s with 0 errors, printing the UMA note. Discrete-VRAM planning and
+  every NVIDIA output are unchanged.
+
 - **Intel Arc support, milestone 3: the first verified write path — the
   frequency clamp — plus the honest TDP verdict.** `ArcGpuTuner` now maps
   Afterglow's "locked core clock" knob onto IGCL's GPU frequency-range clamp

@@ -55,7 +55,13 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
         }
 
         _vram?.Dispose();
-        _vram = new VramTest { TargetPciBusId = _gpu?.PciBusId };
+        _vram = new VramTest
+        {
+            TargetPciBusId = _gpu?.PciBusId,
+            // No bound context (e.g. IGCL failed to init on an Arc machine):
+            // resolve the vendor the way an unbound CLI run would.
+            TargetVendorId = _gpu?.PciVendorId ?? Core.Stress.StressAdapter.DetectDefaultVendor(),
+        };
         _vram.ProgressChanged += progress =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnVramProgress(progress));
         VramFailed = false;
@@ -79,9 +85,13 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
                 break;
             case StressState.Stopped:
                 VramRunning = false;
+                // The engine's note (set on UMA devices) replaces the
+                // dedicated-VRAM verdict, which would overclaim there; on
+                // dedicated-VRAM cards the note is null and the historical
+                // text renders unchanged.
                 VramStatusText = progress.Rounds >= 1
                     ? $"Stopped after {progress.Elapsed:hh\\:mm\\:ss}: {gib:F1} GiB × {progress.Rounds} full " +
-                      "rounds, 0 errors — VRAM is stable at the current memory clocks."
+                      $"rounds, 0 errors — {progress.Detail ?? "VRAM is stable at the current memory clocks."}"
                     : $"Stopped after {progress.Elapsed:hh\\:mm\\:ss} before a full round completed — run " +
                       "longer for a verdict.";
                 break;
@@ -208,6 +218,7 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
             IterationsPerDispatch = (uint)Intensity,
             Pattern = SelectedPattern,
             TargetPciBusId = _gpu?.PciBusId,
+            TargetVendorId = _gpu?.PciVendorId ?? Core.Stress.StressAdapter.DetectDefaultVendor(),
         };
         _stress.ProgressChanged += progress =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnStressProgress(progress));
@@ -283,7 +294,7 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
             return;
         }
 
-        _stepper = new StabilityStepper(_gpu.Tuner) { TargetPciBusId = _gpu.PciBusId };
+        _stepper = new StabilityStepper(_gpu.Tuner) { TargetPciBusId = _gpu.PciBusId, TargetVendorId = _gpu.PciVendorId };
         _stepper.StatusChanged += status =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnStepperStatus(status));
         StepperRunning = true;

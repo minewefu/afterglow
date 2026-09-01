@@ -470,7 +470,7 @@ internal static class McpCommand
         };
         int maxMinutes = Math.Clamp(args?["max_minutes"]?.GetValue<int>() ?? 30, 5, 120);
 
-        var stepper = new StabilityStepper(gpu.Tuner) { TargetPciBusId = gpu.PciBusId };
+        var stepper = new StabilityStepper(gpu.Tuner) { TargetPciBusId = gpu.PciBusId, TargetVendorId = gpu.PciVendorId };
         var done = new ManualResetEventSlim(false);
         StepperStatus? final = null;
         stepper.StatusChanged += status =>
@@ -516,7 +516,7 @@ internal static class McpCommand
     {
         int seconds = Math.Clamp(args?["seconds"]?.GetValue<int>() ?? 90, 15, 1800);
 
-        using var vram = new VramTest { TargetPciBusId = gpu.PciBusId };
+        using var vram = new VramTest { TargetPciBusId = gpu.PciBusId, TargetVendorId = gpu.PciVendorId };
         var done = new ManualResetEventSlim(false);
         vram.ProgressChanged += progress =>
         {
@@ -580,6 +580,7 @@ internal static class McpCommand
             IterationsPerDispatch = intensity,
             Pattern = pattern,
             TargetPciBusId = gpu.PciBusId,
+            TargetVendorId = gpu.PciVendorId,
         };
         var done = new ManualResetEventSlim(false);
         StressProgress? final = null;
