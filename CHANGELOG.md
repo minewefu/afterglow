@@ -1,5 +1,132 @@
 # Changelog
 
+## 1.3.0-beta.1 — 2026-09-01
+
+- **Intel Arc support, milestone 5: parity confirmed where the design already
+  paid for it.** FPS capture works on Arc with zero changes — PresentMon is
+  Intel's own tool and the ETW present pipeline is vendor-neutral (verified
+  live on the B390: a presenting app captured at 240 fps with P1/1%-low
+  metrics and present-mode detection). Per-game profiles, automation rules,
+  session history, CSV logging, the overlay, crash forensics, and the MCP
+  server all ride the same vendor-neutral seams. The README now tells the
+  two-vendor truth: a dedicated "Intel Arc support (beta)" section lists what
+  is verified working and what this device honestly lacks, the Honest
+  limitations split per vendor, and the no-kernel-driver pledge names Intel's
+  documented stacks alongside NVIDIA's.
+
+- **Intel Arc support, milestone 4: the stability lab runs on Arc.** The D3D
+  stress engines' adapter binding is vendor-aware: the PCI vendor id is now
+  part of the binding alongside the bus (0x8086 for Arc contexts, resolved via
+  the same LUID→PCI-bus D3DKMT path, which works unchanged for Intel), so the
+  burn test, VRAM test, transition/excursion patterns, stepper, V/F probe, and
+  profile certification all target the exact card being tuned on any vendor —
+  and an unbound `stress`/`vram` run on an Intel-only machine now tests the
+  Intel GPU by default instead of failing to find an NVIDIA adapter (NVIDIA
+  machines keep the historical largest-NVIDIA fallback, byte-for-byte). The
+  VRAM test is honest about unified memory: it asks the D3D device itself
+  (`UnifiedMemoryArchitecture`) and on UMA plans against the GPU's shared
+  system-memory budget with a much larger safety reserve (a quarter of the
+  budget stays free — every byte tested is a byte taken from the OS), then
+  says exactly what it tested: "tested the GPU's shared system-memory budget
+  (UMA) — this device has no dedicated VRAM". Verified live on the OneXPlayer
+  3: a 20 s burn ran bit-exact with 0 errors, and a 25 s VRAM run detected
+  UMA, planned 9.5 GiB of the 13.4 GiB budget, and verified 55 full rounds at
+  ~20.8 GiB/s with 0 errors, printing the UMA note. Discrete-VRAM planning and
+  every NVIDIA output are unchanged.
+
+- **Intel Arc support, milestone 3: the first verified write path — the
+  frequency clamp — plus the honest TDP verdict.** `ArcGpuTuner` now maps
+  Afterglow's "locked core clock" knob onto IGCL's GPU frequency-range clamp
+  (`ctlFrequencySetRange`), the one GPU-domain control the OneXPlayer 3's
+  driver reports as controllable. Unlike NVML's lock, IGCL has a real readback
+  getter, so every clamp apply and release either reports "(verified)" from an
+  actual driver round-trip or fails loudly — a write the getter cannot confirm
+  is reported as a failure, never a silent success — and `get` on Intel reads
+  the clamp back from the driver, with a live "released" answer overriding any
+  tracked shadow. Verified live: clamping to 450 MHz returned "100..450 MHz
+  (verified)" and the core was enforced at 100 MHz under load; releasing
+  restored "100..2300 MHz (verified)" with clocks recovering immediately. Apply/Reset/panic/ForceUnlock, applied-state
+  stamping with the Intel identity, and crash recovery all flow through the
+  same path. A power-limit write path (`ctlOverclockPowerLimitSetV2` with
+  readback, unit-aware per the driver's capability block) is implemented and
+  lights up only where the driver reports the knob supported — false on this
+  iGPU, expected true on discrete Arc; field verification wanted. The honest
+  TDP finding is recorded in docs/research/intel-driver-apis.md and in the
+  app: no documented userland path answers for package-power writes on this
+  device (no IGCL power domains, OC power limit unsupported, Sysman
+  `canControl=false`, and ring-0 MSR writes are banned by project rules), so
+  the Tuning page says exactly that — the clamp is the driver-supported lever,
+  and the package budget is shared with the CPU either way. The Tuning page is
+  vendor-aware without touching the NVIDIA rendering: on Intel only the knobs
+  Afterglow actually drives appear (no degenerate 0..0 sliders), the clock-lock
+  card describes the clamp rather than the RTX 50 undervolt method, the slider
+  floor comes from the driver's own domain minimum (100 MHz here), and the
+  `caps` header now says "knobs Afterglow can drive on this device".
+
+- **Intel Arc support, milestone 2: live monitoring in the app.** The hardware
+  layer is vendor-plural: `GpuManager` now initializes IGCL alongside NVML/NVAPI
+  and produces a `GpuContext` per Intel GPU (numbered after the NVML devices, so
+  per-index history, fans, flight recorders, and the GPU selector work
+  unchanged), each with a reboot-stable `INTEL-<domain:bus:device.function>-<deviceid>`
+  identity for profile/state stamping — the IGCL LUID changes every boot and is
+  never persisted, and the full PCI location fits inside the 12-character
+  prefix per-GPU state files key on, so identical cards can never share a file. A new `IntelSensorSource` feeds the existing telemetry pipeline
+  from IGCL: core clock, board power and GPU utilization derived from the
+  driver's monotonic energy/activity counters (unit-checked; counter resets and
+  missing samples yield an honest "—", never a guess), session energy, media
+  clock, shared-memory use — the dashboard VRAM tile now says "shared" on
+  UMA iGPUs, where the figure is the GPU's allocatable budget rather than
+  dedicated VRAM. The tuning surface is behind a new `IGpuTuner` interface
+  extracted from `GpuTuner` with its exact NVIDIA signatures (that path is
+  deliberately untouched — it cannot be regression-tested on this machine);
+  the Intel implementation reports every capability false in this beta, and the
+  page gates learned a capability-aware branch that applies to non-NVIDIA GPUs
+  only (the NVIDIA gates are untouched, like the rest of that path): Tuning
+  says "monitoring only in this beta", Fans says the fans are
+  firmware-controlled, the V/F and stepper pages name the missing knobs, and
+  the `caps` header says the flags are Afterglow's not-implemented-yet policy
+  rather than calling them driver-reported. `ReadCurrent`'s power-limit slot
+  became nullable so `get` and the MCP status report "not supported"/null on
+  Intel instead of a fabricated 0 W (NVIDIA still always reads a real value
+  back). Verified live on the OneXPlayer 3: the app starts on the Arc B390
+  with a populated dashboard (550 MHz idle clock, watts, load, 1.0/13 GB
+  shared budget) and honest "—" for the temperature, fan, and voltage sensors
+  this device does not expose. `afterglow-cli monitor` works on Intel-only
+  machines (in `--json`/`--once` it primes Intel's counter-based metrics with
+  a second sample; NVIDIA output — down to its unenriched CLI field set and
+  single immediate poll — is byte-identical to before), and "No NVIDIA GPU"
+  errors became "No supported GPU"/"GPU(s) detected" across the CLI's
+  vendor-neutral enumeration paths.
+
+- **Intel Arc support, milestone 1: interop layer + multi-vendor selftest.** New
+  IGCL (Intel Graphics Control Library, `ControlLib.dll`) and Level Zero Sysman
+  (`ze_loader.dll`) bindings in `Afterglow.Core/Interop`, grounded field-for-field
+  in Intel's official headers — every struct layout is pinned by unit tests against
+  sizes and interior field offsets compiled from `igcl_api.h`/`zes_api.h` themselves
+  (clang record-layout dump, procedure in docs/research/intel-driver-apis.md); on the
+  IGCL side the Size/Version protocol additionally has the driver check each struct's
+  total size at call time (Sysman's stype/pNext structs get no such runtime check —
+  the unit tests are their only net). `afterglow-cli selftest`
+  now probes three stacks independently — NVML no longer exits the self-test on a
+  machine without NVIDIA hardware — and prints every Intel capability truthfully:
+  bulk power telemetry (energy counters → watts, activity counters → utilization,
+  throttle flags), frequency domains with ranges and clamps, temperature sensors,
+  memory modules (shared vs dedicated location — the honest UMA signal), engine
+  groups, fans, power domains with PL1/PL2/PL4 limits, the per-knob overclock
+  capability report, and the V/F curve entry points. Verified live on an Arc B390
+  iGPU (OneXPlayer 3, driver 32.0.101.8991): telemetry, clocks, utilization, and
+  frequency-clamp reads all answer; the same run records what this device honestly
+  lacks — zero temperature sensors, zero fans (EC-controlled), zero IGCL power
+  domains, `bSupported=false` on every overclock knob, and `ErrorDataRead` from the
+  V/F curve reads. One trap this exposed is now load-bearing design: the OC getters
+  "succeed" with zeros even where the capability report says unsupported, so all
+  future gating keys off the capability report, never off getter status. The app
+  itself does not consume the new interop yet — that is milestone 2 (telemetry) —
+  and nothing writes to the hardware: selftest is read-only. Discrete Arc owners
+  (B-series especially): please run `afterglow-cli selftest` and paste the output
+  into a GitHub issue — the OC/power/temperature answers are expected to differ
+  from this iGPU's.
+
 ## 1.2.0-beta.4 — 2026-08-30
 
 ### Fixed — independent review of 1.2.0-beta.3 (all 8 high-severity findings)

@@ -6,8 +6,7 @@
         <StackPanel Margin="24,18,24,24" MaxWidth="860" HorizontalAlignment="Left">
 
             <TextBlock Text="Tuning" Style="{StaticResource PageTitle}" />
-            <TextBlock Style="{StaticResource PageSubtitle}"
-                       Text="Every range below comes from the driver for this exact GPU. Values are clamped and applied knob-by-knob; offsets, power limit, and voltage boost are verified by reading back (the driver offers no getter for the clock lock — Afterglow tracks it)." />
+            <TextBlock Style="{StaticResource PageSubtitle}" Text="{Binding PageSubtitle}" />
 
             <Border Background="#33E8B33C" CornerRadius="8" Padding="12,8" Margin="0,12,0,0"
                     Visibility="{Binding CanTune, Converter={x:Static views:Converters.InverseBoolToVisibility}}">
@@ -16,7 +15,8 @@
             </Border>
 
             <!-- Core offset -->
-            <Border Style="{StaticResource Card}" Margin="0,14,0,0">
+            <Border Style="{StaticResource Card}" Margin="0,14,0,0"
+                    Visibility="{Binding ShowCoreOffset, Converter={x:Static views:Converters.BoolToVisibility}}">
                 <Grid>
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="170" />
@@ -39,7 +39,8 @@
             </Border>
 
             <!-- Memory offset -->
-            <Border Style="{StaticResource Card}" Margin="0,10,0,0">
+            <Border Style="{StaticResource Card}" Margin="0,10,0,0"
+                    Visibility="{Binding ShowMemOffset, Converter={x:Static views:Converters.BoolToVisibility}}">
                 <Grid>
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="170" />
@@ -62,7 +63,8 @@
             </Border>
 
             <!-- Power limit -->
-            <Border Style="{StaticResource Card}" Margin="0,10,0,0">
+            <Border Style="{StaticResource Card}" Margin="0,10,0,0"
+                    Visibility="{Binding ShowPowerLimit, Converter={x:Static views:Converters.BoolToVisibility}}">
                 <Grid>
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="170" />
@@ -107,13 +109,14 @@
             </Border>
 
             <!-- Clock lock / undervolt -->
-            <Border Style="{StaticResource Card}" Margin="0,10,0,0">
+            <Border Style="{StaticResource Card}" Margin="0,10,0,0"
+                    Visibility="{Binding ShowClockLock, Converter={x:Static views:Converters.BoolToVisibility}}">
                 <StackPanel>
                     <Grid>
                         <StackPanel>
-                            <TextBlock Text="Clock lock (undervolt)" FontWeight="SemiBold" FontSize="13.5" />
+                            <TextBlock Text="{Binding ClockLockTitle}" FontWeight="SemiBold" FontSize="13.5" />
                             <TextBlock FontSize="11" Foreground="{StaticResource TextFaint}" TextWrapping="Wrap"
-                                       Text="Caps boost at a target clock while a positive core offset shifts the V/F curve — the GPU reaches the target at a lower voltage. The documented-API undervolt for RTX 50." />
+                                       Text="{Binding ClockLockDescription}" />
                         </StackPanel>
                         <CheckBox Style="{StaticResource ToggleSwitch}" HorizontalAlignment="Right" VerticalAlignment="Top"
                                   IsChecked="{Binding LockEnabled}" IsEnabled="{Binding CanTune}" />
@@ -127,7 +130,7 @@
                         </Grid.ColumnDefinitions>
                         <TextBlock Text="Target max clock" FontSize="12.5" VerticalAlignment="Center" />
                         <Slider Grid.Column="1" Style="{StaticResource TuneSlider}" VerticalAlignment="Center"
-                                Minimum="1000" Maximum="{Binding Capabilities.MaxCoreClockMHz}"
+                                Minimum="{Binding LockClockSliderMin}" Maximum="{Binding Capabilities.MaxCoreClockMHz}"
                                 Value="{Binding LockClock}" TickFrequency="15" IsSnapToTickEnabled="True"
                                 IsEnabled="{Binding CanTune}" />
                         <TextBlock Grid.Column="2" Text="{Binding LockClockLabel}" FontSize="15" FontWeight="SemiBold"
@@ -137,7 +140,8 @@
             </Border>
 
             <!-- Undervolt wizard -->
-            <Border Style="{StaticResource Card}" Margin="0,10,0,0">
+            <Border Style="{StaticResource Card}" Margin="0,10,0,0"
+                    Visibility="{Binding ShowUndervoltWizard, Converter={x:Static views:Converters.BoolToVisibility}}">
                 <StackPanel>
                     <TextBlock Text="Undervolt wizard" FontWeight="SemiBold" FontSize="13.5" />
                     <TextBlock FontSize="11.5" Foreground="{StaticResource TextFaint}" TextWrapping="Wrap" Margin="0,2,0,0"
@@ -155,6 +159,21 @@
                     </StackPanel>
                 </StackPanel>
             </Border>
+
+            <TextBlock Text="{Binding PowerLimitNote}" FontSize="11.5" Foreground="{StaticResource TextFaint}"
+                       TextWrapping="Wrap" Margin="2,10,0,0">
+                <TextBlock.Style>
+                    <Style TargetType="TextBlock" BasedOn="{StaticResource {x:Type TextBlock}}">
+                        <Style.Triggers>
+                            <!-- Collapse when empty: an empty TextBlock still spends
+                                 its margin, which would shift the NVIDIA layout. -->
+                            <DataTrigger Binding="{Binding PowerLimitNote}" Value="">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </TextBlock.Style>
+            </TextBlock>
 
             <TextBlock Text="{Binding TempLimitNote}" FontSize="11.5" Foreground="{StaticResource TextFaint}"
                        TextWrapping="Wrap" Margin="2,10,0,0" />

@@ -11,7 +11,7 @@ public partial class MainViewModel : ObservableObject
 {
     private readonly AppServices _services;
     private OverlayWindow? _overlay;
-    private (int Core, int Mem, double Power, uint? Boost, uint? Lock)? _preGameState;
+    private (int Core, int Mem, double? Power, uint? Boost, uint? Lock)? _preGameState;
     private (Core.Profiles.FanMode Mode, uint FixedPct, Core.Fans.FanCurveConfig Curve)? _preGameFans;
     private Core.Hardware.GpuContext? _preGameGpu;
 
@@ -51,7 +51,11 @@ public partial class MainViewModel : ObservableObject
 
     [ObservableProperty] private string _gpuName = string.Empty;
 
-    public string DriverText { get; }
+    public string DriverText => _services.DemoMode
+        ? "Synthetic demo data"
+        : _services.SelectedGpu is { } gpu
+            ? $"{(gpu.Vendor == Core.Hardware.GpuVendor.Intel ? "Intel" : "NVIDIA")} driver {gpu.DriverVersion ?? "—"}"
+            : "GPU driver —";
 
     public bool IsElevated => _services.IsElevated;
 
@@ -69,8 +73,7 @@ public partial class MainViewModel : ObservableObject
 
         GpuName = services.DemoMode
             ? "Afterglow Demo GPU"
-            : services.SelectedGpu?.Name ?? "No NVIDIA GPU detected";
-        DriverText = services.DemoMode ? "Synthetic demo data" : $"NVIDIA driver {services.DriverVersion}";
+            : services.SelectedGpu?.Name ?? "No supported GPU detected";
 
         GpuOptions = services.Gpus.Select(g => $"GPU {g.Index} — {g.Name}").ToArray();
         _selectedGpuOption = 0;
@@ -190,6 +193,7 @@ public partial class MainViewModel : ObservableObject
 
         _services.SelectGpu(_services.Gpus[value].Index);
         GpuName = _services.SelectedGpu?.Name ?? GpuName;
+        OnPropertyChanged(nameof(DriverText));
 
         // Every page follows the selection; runs already in flight keep the
         // card they started on.
@@ -358,7 +362,7 @@ public partial class MainViewModel : ObservableObject
             Name = "pre-game state",
             CoreOffsetMHz = pre.Core,
             MemOffsetMHz = pre.Mem,
-            PowerLimitW = pre.Power > 0 ? pre.Power : null,
+            PowerLimitW = pre.Power is > 0 ? pre.Power : null,
             VoltageBoostPct = pre.Boost,
             LockedCoreClockMHz = pre.Lock,
         };

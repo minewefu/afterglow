@@ -25,6 +25,14 @@ public sealed record TuningCapabilities
     public bool SupportsLockedCoreClock { get; init; }
     public uint MaxCoreClockMHz { get; init; }
 
+    /// <summary>
+    /// Driver-reported floor for the clock lock/clamp, where one exists (Intel
+    /// frequency domains report theirs; NVML exposes none — 0 means unknown).
+    /// Omitted from JSON at 0 so NVIDIA machine-readable output is unchanged.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)]
+    public uint LockClockMinMHz { get; init; }
+
     public bool SupportsFanControl { get; init; }
     public uint FanCount { get; init; }
     public uint FanMinDutyPct { get; init; }
@@ -94,7 +102,7 @@ public sealed record ApplyResult(bool AllSucceeded, IReadOnlyList<KnobResult> Re
 /// FanControlService (continuous curves) and the CLI's explicit fan command,
 /// so profile switches can't fight the fan service.
 /// </summary>
-public sealed class GpuTuner
+public sealed class GpuTuner : IGpuTuner
 {
     private readonly NvmlDevice _nvml;
     private readonly NvapiGpu? _nvapi;
@@ -210,7 +218,7 @@ public sealed class GpuTuner
     }
 
     /// <summary>Reads the currently applied values (lock is Afterglow-tracked; see <see cref="AppliedLockMHz"/>).</summary>
-    public (int CoreOffsetMHz, int MemOffsetMHz, double PowerLimitW, uint? VoltageBoostPct, uint? LockedCoreClockMHz) ReadCurrent()
+    public (int CoreOffsetMHz, int MemOffsetMHz, double? PowerLimitW, uint? VoltageBoostPct, uint? LockedCoreClockMHz) ReadCurrent()
     {
         int core = 0, mem = 0;
         if (_nvml.TryGetClockOffset(NvmlClockType.Graphics, out var c) == NvmlReturn.Success)
@@ -975,9 +983,21 @@ public static class AppliedStateStore
                 return null; // another card's record: never adopted, never seeded from
             }
 
+            // An UNSTAMPED legacy record predates Arc write support, so it can
+            // only have been written for an NVIDIA card — an Intel identity
+            // must never adopt it (a hybrid machine upgrading from an old
+            // build would otherwise hand the NVIDIA lock to the Arc tuner).
+            if (legacy is { GpuUuid: null } && IsIntelUuid(gpuUuid))
+            {
+                return null;
+            }
+
             return legacy;
         }
     }
+
+    private static bool IsIntelUuid(string? gpuUuid) =>
+        gpuUuid is not null && gpuUuid.StartsWith("INTEL-", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Every persisted record, for startup crash scanning — per-GPU files plus
@@ -1019,7 +1039,9 @@ public static class AppliedStateStore
                 }
 
                 var legacy = ReadFile(AppPaths.AppliedStateFile);
-                if (legacy is null || legacy.GpuUuid is null || legacy.GpuUuid == gpuUuid || gpuUuid is null)
+                bool ownsLegacy = legacy is null || legacy.GpuUuid == gpuUuid || gpuUuid is null
+                    || (legacy.GpuUuid is null && !IsIntelUuid(gpuUuid));
+                if (ownsLegacy)
                 {
                     File.Delete(AppPaths.AppliedStateFile);
                 }
@@ -1030,11 +1052,19 @@ public static class AppliedStateStore
         }
     }
 
-    /// <summary>Per-GPU file name derived from the NVML UUID ("GPU-2b6ae74e-…" → stable suffix).</summary>
+    /// <summary>
+    /// Per-GPU file name derived from the GPU UUID ("GPU-2b6ae74e-…" or
+    /// "INTEL-0000:00:02.0-…" → stable suffix). Vendor prefixes are stripped so
+    /// the 12-character budget is spent on the identifying digits.
+    /// </summary>
     public static string PathFor(string gpuUuid)
     {
         var keep = new string(gpuUuid.Where(char.IsLetterOrDigit).ToArray());
-        if (keep.StartsWith("GPU", StringComparison.OrdinalIgnoreCase))
+        if (keep.StartsWith("INTEL", StringComparison.OrdinalIgnoreCase))
+        {
+            keep = "i" + keep[5..]; // keep vendor namespaces disjoint post-strip
+        }
+        else if (keep.StartsWith("GPU", StringComparison.OrdinalIgnoreCase))
         {
             keep = keep[3..];
         }
@@ -1113,10 +1143,12 @@ public static class AppliedStateStore
                 WriteFile(gpuUuid is not null ? PathFor(gpuUuid) : AppPaths.AppliedStateFile, next);
 
                 // The legacy file is superseded for this GPU from now on;
-                // leaving a stale copy would double-report crashes.
+                // leaving a stale copy would double-report crashes. An
+                // unstamped legacy record is never an Intel identity's to
+                // supersede (it predates Arc write support).
                 if (gpuUuid is not null &&
                     ReadFile(AppPaths.AppliedStateFile) is { } legacy &&
-                    (legacy.GpuUuid is null || legacy.GpuUuid == gpuUuid))
+                    ((legacy.GpuUuid is null && !IsIntelUuid(gpuUuid)) || legacy.GpuUuid == gpuUuid))
                 {
                     File.Delete(AppPaths.AppliedStateFile);
                 }

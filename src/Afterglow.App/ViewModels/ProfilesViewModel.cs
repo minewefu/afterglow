@@ -115,7 +115,7 @@ public partial class ProfilesViewModel : ObservableObject
         }
 
         var profile = Selected;
-        _certifier = new ProfileCertifier(gpu.Tuner, _services.Profiles, gpu.PciBusId);
+        _certifier = new ProfileCertifier(gpu.Tuner, _services.Profiles, gpu.PciBusId, gpu.PciVendorId);
         _certifier.StatusChanged += status =>
             System.Windows.Application.Current?.Dispatcher.BeginInvoke(() => OnCertifierStatus(status));
         CertifyRunning = true;

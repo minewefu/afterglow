@@ -41,7 +41,7 @@ internal static class McpCommand
             if (gpu is null)
             {
                 Console.Error.WriteLine(
-                    $"GPU {wantedIndex} not found — {manager.Gpus.Count} NVIDIA GPU(s) detected.");
+                    $"GPU {wantedIndex} not found — {manager.Gpus.Count} GPU(s) detected.");
                 return 2;
             }
         }
@@ -222,7 +222,7 @@ internal static class McpCommand
 
         object RequireGpu()
         {
-            return new { error = $"No NVIDIA GPU available (NVML: {manager.NvmlStatus})." };
+            return new { error = $"No supported GPU available (NVML: {manager.NvmlStatus}, IGCL: {manager.IgclStatus})." };
         }
 
         return
@@ -235,7 +235,7 @@ internal static class McpCommand
                 _ => gpu is null ? RequireGpu() : new
                 {
                     gpu = gpu.Name,
-                    driver = manager.DriverVersion,
+                    driver = gpu.DriverVersion,
                     architecture = gpu.Architecture,
                     elevated,
                     write_access = elevated,
@@ -388,8 +388,15 @@ internal static class McpCommand
         };
 
         // Schema validation errors cite generic sanity bounds; report the
-        // ranges that actually matter — this GPU's — alongside them.
-        if (profile.Validate() is string validationError)
+        // ranges that actually matter — this GPU's — alongside them. Floors
+        // come from the device where its driver reports lower ones than the
+        // NVIDIA-era defaults (Intel clamps reach 100 MHz).
+        var validationCaps = gpu.Tuner.Capabilities;
+        uint lockFloor = validationCaps.LockClockMinMHz is > 0 and < 210 ? validationCaps.LockClockMinMHz : 210;
+        double powerFloor = validationCaps is { SupportsPowerLimit: true, PowerLimitMinW: > 0 and < 50 }
+            ? validationCaps.PowerLimitMinW
+            : 50;
+        if (profile.Validate(lockFloor, powerFloor) is string validationError)
         {
             var caps = gpu.Tuner.Capabilities;
             return new
@@ -463,7 +470,7 @@ internal static class McpCommand
         };
         int maxMinutes = Math.Clamp(args?["max_minutes"]?.GetValue<int>() ?? 30, 5, 120);
 
-        var stepper = new StabilityStepper(gpu.Tuner) { TargetPciBusId = gpu.PciBusId };
+        var stepper = new StabilityStepper(gpu.Tuner) { TargetPciBusId = gpu.PciBusId, TargetVendorId = gpu.PciVendorId };
         var done = new ManualResetEventSlim(false);
         StepperStatus? final = null;
         stepper.StatusChanged += status =>
@@ -509,7 +516,7 @@ internal static class McpCommand
     {
         int seconds = Math.Clamp(args?["seconds"]?.GetValue<int>() ?? 90, 15, 1800);
 
-        using var vram = new VramTest { TargetPciBusId = gpu.PciBusId };
+        using var vram = new VramTest { TargetPciBusId = gpu.PciBusId, TargetVendorId = gpu.PciVendorId };
         var done = new ManualResetEventSlim(false);
         vram.ProgressChanged += progress =>
         {
@@ -573,6 +580,7 @@ internal static class McpCommand
             IterationsPerDispatch = intensity,
             Pattern = pattern,
             TargetPciBusId = gpu.PciBusId,
+            TargetVendorId = gpu.PciVendorId,
         };
         var done = new ManualResetEventSlim(false);
         StressProgress? final = null;

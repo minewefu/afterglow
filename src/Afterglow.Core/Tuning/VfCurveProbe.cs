@@ -27,7 +27,7 @@ public sealed record VfProbeProgress(
 /// </summary>
 public sealed class VfCurveProbe
 {
-    private readonly GpuTuner _tuner;
+    private readonly IGpuTuner _tuner;
     private readonly Func<Telemetry.GpuSnapshot> _sample;
     private volatile bool _cancel;
     private Thread? _thread;
@@ -48,7 +48,7 @@ public sealed class VfCurveProbe
 
     public bool IsRunning => _thread is { IsAlive: true };
 
-    public VfCurveProbe(GpuTuner tuner, Func<Telemetry.GpuSnapshot> sample)
+    public VfCurveProbe(IGpuTuner tuner, Func<Telemetry.GpuSnapshot> sample)
     {
         _tuner = tuner;
         _sample = sample;
@@ -56,6 +56,9 @@ public sealed class VfCurveProbe
 
     /// <summary>Binds the probe's load to the tuned card on multi-GPU systems.</summary>
     public uint? TargetPciBusId { get; set; }
+
+    /// <summary>PCI vendor of the card being tuned (defaults to NVIDIA).</summary>
+    public uint TargetVendorId { get; set; } = Stress.StressAdapter.NvidiaVendorId;
 
     public void Cancel() => _cancel = true;
 
@@ -98,7 +101,7 @@ public sealed class VfCurveProbe
         }
 
         uint? previousLock = _tuner.AppliedLockMHz;
-        using var load = new GpuStressTest { IterationsPerDispatch = 2048, TargetPciBusId = TargetPciBusId };
+        using var load = new GpuStressTest { IterationsPerDispatch = 2048, TargetPciBusId = TargetPciBusId, TargetVendorId = TargetVendorId };
         load.Start();
 
         try

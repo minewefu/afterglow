@@ -18,14 +18,14 @@ internal static class VramCommand
             }
         }
 
-        var (bus, busError) = CliGpu.ResolveBus(args);
+        var (bus, vendorId, busError) = CliGpu.ResolveTarget(args);
         if (busError is not null)
         {
             Console.Error.WriteLine(busError);
             return 1;
         }
 
-        using var vram = new VramTest { TargetPciBusId = bus };
+        using var vram = new VramTest { TargetPciBusId = bus, TargetVendorId = vendorId };
         var done = new ManualResetEventSlim(false);
         VramProgress? final = null;
 

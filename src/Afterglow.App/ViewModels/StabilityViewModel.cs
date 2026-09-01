@@ -55,7 +55,13 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
         }
 
         _vram?.Dispose();
-        _vram = new VramTest { TargetPciBusId = _gpu?.PciBusId };
+        _vram = new VramTest
+        {
+            TargetPciBusId = _gpu?.PciBusId,
+            // No bound context (e.g. IGCL failed to init on an Arc machine):
+            // resolve the vendor the way an unbound CLI run would.
+            TargetVendorId = _gpu?.PciVendorId ?? Core.Stress.StressAdapter.DetectDefaultVendor(),
+        };
         _vram.ProgressChanged += progress =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnVramProgress(progress));
         VramFailed = false;
@@ -79,9 +85,13 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
                 break;
             case StressState.Stopped:
                 VramRunning = false;
+                // The engine's note (set on UMA devices) replaces the
+                // dedicated-VRAM verdict, which would overclaim there; on
+                // dedicated-VRAM cards the note is null and the historical
+                // text renders unchanged.
                 VramStatusText = progress.Rounds >= 1
                     ? $"Stopped after {progress.Elapsed:hh\\:mm\\:ss}: {gib:F1} GiB × {progress.Rounds} full " +
-                      "rounds, 0 errors — VRAM is stable at the current memory clocks."
+                      $"rounds, 0 errors — {progress.Detail ?? "VRAM is stable at the current memory clocks."}"
                     : $"Stopped after {progress.Elapsed:hh\\:mm\\:ss} before a full round completed — run " +
                       "longer for a verdict.";
                 break;
@@ -110,11 +120,16 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
     [ObservableProperty] private double _secondsPerStep = 60;
     [ObservableProperty] private double _maxOffset = 300;
 
-    public bool CanStep => !_services.DemoMode && _services.IsElevated && _gpu is not null;
+    // Capability term for non-NVIDIA GPUs only — the NVIDIA gate is unchanged.
+    public bool CanStep => !_services.DemoMode && _services.IsElevated && _gpu is not null
+        && (_gpu.Vendor == Core.Hardware.GpuVendor.Nvidia || _gpu.Tuner.Capabilities.SupportsCoreOffset);
 
     public string StepGateText => CanStep
         ? string.Empty
-        : "The stepper applies clock offsets, so it needs a real GPU and administrator rights.";
+        : _gpu is not null && !_services.DemoMode
+            && _gpu.Vendor != Core.Hardware.GpuVendor.Nvidia && !_gpu.Tuner.Capabilities.SupportsCoreOffset
+            ? "The stepper walks the core clock offset, which isn't available on this GPU in this beta."
+            : "The stepper applies clock offsets, so it needs a real GPU and administrator rights.";
 
     public string IntensityLabel => $"{Intensity:F0} iterations/dispatch";
 
@@ -150,7 +165,14 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
     /// card it started on (its adapter was bound at start); new runs bind to
     /// the new selection.
     /// </summary>
-    public void RebindGpu() => _gpu = _services.SelectedGpu;
+    public void RebindGpu()
+    {
+        _gpu = _services.SelectedGpu;
+        // The gate depends on the selected GPU's capabilities now, so a
+        // selector switch must re-evaluate it (mixed NVIDIA + Intel machines).
+        OnPropertyChanged(nameof(CanStep));
+        OnPropertyChanged(nameof(StepGateText));
+    }
 
     private void OnSnapshot(Core.Telemetry.GpuSnapshot snapshot)
     {
@@ -196,6 +218,7 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
             IterationsPerDispatch = (uint)Intensity,
             Pattern = SelectedPattern,
             TargetPciBusId = _gpu?.PciBusId,
+            TargetVendorId = _gpu?.PciVendorId ?? Core.Stress.StressAdapter.DetectDefaultVendor(),
         };
         _stress.ProgressChanged += progress =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnStressProgress(progress));
@@ -266,12 +289,12 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
             return;
         }
 
-        if (_gpu is null)
+        if (_gpu is null || !CanStep)
         {
             return;
         }
 
-        _stepper = new StabilityStepper(_gpu.Tuner) { TargetPciBusId = _gpu.PciBusId };
+        _stepper = new StabilityStepper(_gpu.Tuner) { TargetPciBusId = _gpu.PciBusId, TargetVendorId = _gpu.PciVendorId };
         _stepper.StatusChanged += status =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnStepperStatus(status));
         StepperRunning = true;

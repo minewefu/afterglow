@@ -61,11 +61,17 @@ public partial class FansViewModel : ObservableObject
 
     partial void OnZeroRpmBelowChanged(double value) => PersistFanSettings();
 
-    public bool CanControl => _services.DemoMode || (_services.IsElevated && _gpu is not null);
+    // Capability term for non-NVIDIA GPUs only — the NVIDIA gate is unchanged.
+    public bool CanControl => _services.DemoMode
+        || (_services.IsElevated && _gpu is not null
+            && (_gpu.Vendor == Core.Hardware.GpuVendor.Nvidia || _gpu.Tuner.Capabilities.SupportsFanControl));
 
     public string GateText => CanControl
         ? string.Empty
-        : "Fan control needs administrator rights.";
+        : _gpu is not null && _gpu.Vendor != Core.Hardware.GpuVendor.Nvidia
+            && !_gpu.Tuner.Capabilities.SupportsFanControl
+            ? "This GPU's fans are firmware-controlled on this device — the driver exposes no fan interface."
+            : "Fan control needs administrator rights.";
 
     public bool HasMemJunction { get; private set; }
 

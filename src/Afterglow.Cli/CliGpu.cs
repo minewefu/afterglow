@@ -21,30 +21,33 @@ internal static class CliGpu
     }
 
     /// <summary>
-    /// Resolves `--gpu N` to that GPU's PCI bus so the D3D stress engines bind
-    /// to the exact card NVML tunes. Returns (null, null) when no --gpu was
-    /// given — the engines then fall back to the largest NVIDIA adapter, which
-    /// needs no NVML at all.
+    /// Resolves `--gpu N` to that GPU's PCI bus and vendor so the D3D stress
+    /// engines bind to the exact card being tuned. With no --gpu, the bus is
+    /// null and the engines fall back to the target vendor's largest adapter —
+    /// NVIDIA when one exists (the historical behavior, no driver stack
+    /// needed), otherwise Intel so an Intel-only machine tests its own GPU.
     /// </summary>
-    public static (uint? Bus, string? Error) ResolveBus(string[] args)
+    public static (uint? Bus, uint VendorId, string? Error) ResolveTarget(string[] args)
     {
         if (ParseIndex(args) is not { } index)
         {
-            return (null, null);
+            return (null, Core.Stress.StressAdapter.DetectDefaultVendor(), null);
         }
 
         using var manager = new GpuManager();
         var gpu = manager.Gpus.FirstOrDefault(g => g.Index == index);
         if (gpu is null)
         {
-            return (null, $"GPU {index} not found — {manager.Gpus.Count} NVIDIA GPU(s) detected.");
+            return (null, Core.Stress.StressAdapter.NvidiaVendorId,
+                $"GPU {index} not found — {manager.Gpus.Count} GPU(s) detected.");
         }
 
         if (gpu.PciBusId is null)
         {
-            return (null, $"GPU {index} ({gpu.Name}) did not report a PCI bus id; cannot bind the test to it.");
+            return (null, gpu.PciVendorId,
+                $"GPU {index} ({gpu.Name}) did not report a PCI bus id; cannot bind the test to it.");
         }
 
-        return (gpu.PciBusId, null);
+        return (gpu.PciBusId, gpu.PciVendorId, null);
     }
 }

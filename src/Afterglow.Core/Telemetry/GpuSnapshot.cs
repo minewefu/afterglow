@@ -34,6 +34,16 @@ public sealed record GpuSnapshot
     public ulong? VramUsedBytes { get; init; }
     public ulong? VramTotalBytes { get; init; }
 
+    /// <summary>
+    /// True when the GPU's memory lives in shared system RAM (UMA iGPU) — the
+    /// used/total figures are then the GPU's allocatable budget, not dedicated
+    /// VRAM. Null when unknown or not applicable (dedicated-VRAM cards).
+    /// Omitted from JSON when null so NVIDIA machine-readable output is
+    /// byte-identical to pre-Intel releases.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public bool? MemoryIsShared { get; init; }
+
     // Power
     /// <summary>Board power, instantaneous where the driver exposes it (falls back to the averaged counter).</summary>
     public double? PowerW { get; init; }

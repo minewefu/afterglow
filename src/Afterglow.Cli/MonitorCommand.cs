@@ -43,29 +43,52 @@ internal static class MonitorCommand
             }
         }
 
-        using var nvml = NvmlApi.TryCreate(out var status);
-        if (nvml is null)
+        using var manager = new Core.Hardware.GpuManager();
+        if (manager.Gpus.Count == 0)
         {
-            Console.Error.WriteLine($"NVML initialization failed: {status}");
+            Console.Error.WriteLine(
+                $"No supported GPU found (NVML: {manager.NvmlStatus}, IGCL: {manager.IgclStatus}).");
             return 1;
         }
 
-        var devices = nvml.GetDevices();
-        if (devices.Count == 0)
+        // NVIDIA GPUs get a fresh, unenriched NVML poller so this command's
+        // output stays exactly what it has always been (no NVAPI thermals or
+        // RPMs in the CLI); Intel GPUs use the context's IGCL source.
+        var pollers = manager.Gpus
+            .Select(g => g.Vendor == Core.Hardware.GpuVendor.Nvidia && g.Nvml is { } nvmlDevice
+                ? new SensorPoller(nvmlDevice)
+                : g.Poller)
+            .ToArray();
+
+        if (json || once)
         {
-            Console.Error.WriteLine("No NVIDIA GPUs found.");
-            return 1;
+            // Single-snapshot modes: Intel power/utilization only exist as
+            // deltas between two monotonic counter reads, so prime those
+            // sources and report their second sample. NVIDIA polls once,
+            // immediately, exactly as before.
+            bool anyIntel = false;
+            for (int i = 0; i < pollers.Length; i++)
+            {
+                if (manager.Gpus[i].Vendor == Core.Hardware.GpuVendor.Intel)
+                {
+                    _ = pollers[i].Poll();
+                    anyIntel = true;
+                }
+            }
+
+            if (anyIntel)
+            {
+                Thread.Sleep(150);
+            }
         }
 
         if (json)
         {
             // Machine-readable single snapshot per GPU (agent-friendly).
-            var snapshots = devices.Select(d => new SensorPoller(d).Poll()).ToArray();
+            var snapshots = pollers.Select(p => p.Poll()).ToArray();
             Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(snapshots, JsonOut));
             return 0;
         }
-
-        var pollers = devices.Select(d => new SensorPoller(d)).ToArray();
         using var logger = csvPath is null ? null : new CsvLogger(csvPath);
         logger?.Start();
 
@@ -76,7 +99,7 @@ internal static class MonitorCommand
             stop = true;
         };
 
-        var names = devices.Select(d => d.GetName() ?? $"GPU {d.Index}").ToArray();
+        var names = manager.Gpus.Select(g => g.Name).ToArray();
         bool first = true;
 
         while (!stop)

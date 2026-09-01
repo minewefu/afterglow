@@ -5,7 +5,7 @@
 <h1 align="center">Afterglow</h1>
 
 <p align="center">
-  <b>Open-source tuning and monitoring for NVIDIA RTX GPUs.</b><br/>
+  <b>Open-source tuning and monitoring for NVIDIA RTX GPUs — with Intel Arc support in beta.</b><br/>
   Overclocking, undervolting, per-fan curves, FPS metrics, per-game profiles, and a built-in
   stability lab — with no kernel drivers, no telemetry, no accounts, and no bundled bloat.
 </p>
@@ -28,8 +28,9 @@ working undervolting on RTX 50 — go unbuilt for years.
 
 Afterglow is a from-scratch, MIT-licensed answer:
 
-- **No kernel driver.** All hardware access goes through NVIDIA's own userland driver
-  interfaces (NVML — the documented library that ships in every driver — plus NVAPI).
+- **No kernel driver.** All hardware access goes through the vendors' own userland
+  driver interfaces (NVIDIA: NVML — the documented library that ships in every driver —
+  plus NVAPI; Intel: IGCL and Level Zero Sysman, both official and documented).
   Nothing to trip anticheat, nothing for malware to abuse.
 - **No injection.** FPS metrics come from Windows ETW present tracing (the Intel PresentMon
   approach used by NVIDIA FrameView and CapFrameX), and the overlay is a composited window —
@@ -183,10 +184,38 @@ Afterglow is a from-scratch, MIT-licensed answer:
 in [docs/research/competitive-landscape.md](docs/research/competitive-landscape.md).
 Corrections welcome.)*
 
+## Intel Arc support (beta)
+
+One Afterglow, two vendors: since 1.3.0-beta, the app also drives Intel GPUs through
+Intel's documented userland stacks — **IGCL** (the Intel Graphics Control Library, the
+API Arc Control was built on) for control and telemetry, with **Level Zero Sysman** as a
+second read-only source. Every capability is probed live on your exact device before the
+UI exposes it; docs/research/intel-driver-apis.md records each interface, its source,
+and what was verified on real hardware (an Arc B390 iGPU in a OneXPlayer 3 handheld).
+
+Working on the verified device: live monitoring (clocks, watts from the driver's energy
+counters, utilization, shared-memory budget, session energy), the **frequency clamp**
+as a verified write path (IGCL has a real readback getter, so clamp applies and releases
+report "(verified)" — something NVML's lock cannot do), the full stability lab (burn
+test, transition/excursion patterns, and a VRAM test that detects unified memory and
+honestly tests the shared budget instead of pretending dedicated VRAM exists), profiles
+with certification, FPS capture, and the multi-vendor `selftest`. Honestly absent *on
+that device* (each probed, not assumed): temperature sensors, fan control (EC-owned on
+handhelds), power-limit writes (no documented userland path answers; the clamp is the
+supported lever and the package budget is shared with the CPU), offsets/voltage/V-F
+control. A power-limit write path is implemented for hardware whose driver reports the
+knob — expected on discrete Arc, awaiting field confirmation. **Discrete Arc owners
+(B-series especially): run `afterglow-cli selftest` and paste the output into a GitHub
+issue** — your driver will answer differently than the verified iGPU's.
+
 ## Honest limitations
 
-- **NVIDIA GPUs only**, RTX 20-series and newer recommended; tuning requires driver **555+**
+- **NVIDIA**: RTX 20-series and newer recommended; tuning requires driver **555+**
   (the modern clock-offset API). Tested most heavily on RTX 50 (Blackwell).
+- **Intel Arc is beta**: monitoring, the frequency clamp, and the stability lab are
+  verified on one iGPU (Arc B390); discrete Arc is expected to expose more knobs and
+  needs field reports. Tuning depth is intentionally behind NVIDIA's until each knob
+  is verified by readback on real hardware.
 - **Hot spot on RTX 50** is blocked by NVIDIA in every public API. Tools that show it use
   kernel-level register access; Afterglow deliberately doesn't ship a kernel driver, so on
   Blackwell it shows the sensor as unavailable rather than pretending. (Memory junction *is*
@@ -218,7 +247,8 @@ Corrections welcome.)*
 
 ## Install
 
-**Requirements:** Windows 10/11 x64, NVIDIA driver 555 or newer.
+**Requirements:** Windows 10/11 x64. NVIDIA: driver 555 or newer. Intel: a current
+Arc-era graphics driver (the IGCL runtime ships with it).
 
 - **Installer:** grab `Afterglow-x.y.z-setup.exe` from
   [Releases](../../releases), run it (it can also register start-with-Windows).

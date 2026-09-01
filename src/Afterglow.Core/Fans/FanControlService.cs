@@ -39,7 +39,7 @@ public sealed class FanControlService : IDisposable
     private bool _weControlFans;
     private long _generation;
 
-    public FanControlService(GpuTuner tuner)
+    public FanControlService(IGpuTuner tuner)
         : this(tuner.SetAllFansRaw, tuner.RestoreAutoFansRaw, tuner.GpuUuid, tuner.Capabilities.FanMinDutyPct)
     {
     }

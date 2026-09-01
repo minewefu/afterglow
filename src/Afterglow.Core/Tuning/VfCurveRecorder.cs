@@ -253,7 +253,11 @@ public sealed class VfCurveRecorder
         }
 
         var keep = new string(gpuUuid.Where(char.IsLetterOrDigit).ToArray());
-        if (keep.StartsWith("GPU", StringComparison.OrdinalIgnoreCase))
+        if (keep.StartsWith("INTEL", StringComparison.OrdinalIgnoreCase))
+        {
+            keep = "i" + keep[5..]; // same strip rule as AppliedStateStore.PathFor
+        }
+        else if (keep.StartsWith("GPU", StringComparison.OrdinalIgnoreCase))
         {
             keep = keep[3..];
         }

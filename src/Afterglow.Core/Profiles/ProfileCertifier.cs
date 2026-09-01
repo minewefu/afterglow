@@ -31,7 +31,7 @@ public sealed record CertifierStatus(
 /// </summary>
 public sealed class ProfileCertifier
 {
-    private readonly GpuTuner _tuner;
+    private readonly IGpuTuner _tuner;
     private readonly ProfileStore _store;
     private readonly object _lock = new();
     private readonly List<string> _log = [];
@@ -41,15 +41,19 @@ public sealed class ProfileCertifier
 
     public event Action<CertifierStatus>? StatusChanged;
 
-    public ProfileCertifier(GpuTuner tuner, ProfileStore store, uint? pciBusId = null)
+    public ProfileCertifier(IGpuTuner tuner, ProfileStore store, uint? pciBusId = null,
+        uint vendorId = Stress.StressAdapter.NvidiaVendorId)
     {
         _tuner = tuner;
         _store = store;
         _pciBusId = pciBusId;
+        _vendorId = vendorId;
     }
 
     /// <summary>Binds the stress engines to the tuned card on multi-GPU systems.</summary>
     private readonly uint? _pciBusId;
+
+    private readonly uint _vendorId;
 
     public CertifierStatus Status
     {
@@ -181,7 +185,7 @@ public sealed class ProfileCertifier
             _ => StressPattern.Sustained,
         };
 
-        using var stress = new GpuStressTest { Pattern = pattern, TargetPciBusId = _pciBusId };
+        using var stress = new GpuStressTest { Pattern = pattern, TargetPciBusId = _pciBusId, TargetVendorId = _vendorId };
         var done = new ManualResetEventSlim(false);
         StressProgress? terminal = null;
 
@@ -229,7 +233,7 @@ public sealed class ProfileCertifier
 
     private (bool Passed, string Evidence, string? FailDetail) RunVramMode(int modeIndex, TimeSpan duration)
     {
-        using var vram = new VramTest { TargetPciBusId = _pciBusId };
+        using var vram = new VramTest { TargetPciBusId = _pciBusId, TargetVendorId = _vendorId };
         vram.ProgressChanged += progress =>
             Publish(true, CertificationModes.Vram, modeIndex, progress.Elapsed, duration);
         vram.Start();
@@ -271,9 +275,18 @@ public sealed class ProfileCertifier
                 "The VRAM test did not complete a full coverage round in the allotted time.");
         }
 
-        return (true, string.Create(
+        // A UMA pass must not be stamped with dedicated-VRAM meaning: the
+        // engine's honest note (null on dedicated-VRAM cards, so NVIDIA
+        // evidence is byte-identical) rides into the certification evidence.
+        string evidence = string.Create(
             CultureInfo.InvariantCulture,
-            $"{final.PlannedBytes / (double)(1L << 30):F1} GiB × {final.Rounds} rounds, 0 errors"), null);
+            $"{final.PlannedBytes / (double)(1L << 30):F1} GiB × {final.Rounds} rounds, 0 errors");
+        if (final.Detail is { Length: > 0 } note)
+        {
+            evidence += $" — {note}";
+        }
+
+        return (true, evidence, null);
     }
 
     private void StampCertification(TuningProfile profile, string mode, int seconds, string evidence)
