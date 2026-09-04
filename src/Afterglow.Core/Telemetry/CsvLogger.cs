@@ -49,9 +49,15 @@ public sealed class CsvLogger : IDisposable
 
     public CsvLogger(string? basePath = null)
     {
-        _basePath = basePath ?? Path.Combine(
+        // Resolve immediately. A bare filename ("session.csv" — the form the
+        // help text and README show) has no directory part, and Start's
+        // Directory.CreateDirectory(GetDirectoryName(...)) then threw
+        // ArgumentException on the empty string and took the process down with a
+        // raw stack trace. Resolving to a full path also keeps rotation and
+        // CurrentFile unambiguous if the working directory changes mid-run.
+        _basePath = Path.GetFullPath(basePath ?? Path.Combine(
             AppPaths.LogsDir,
-            $"afterglow-{DateTime.Now:yyyyMMdd-HHmmss}.csv");
+            $"afterglow-{DateTime.Now:yyyyMMdd-HHmmss}.csv"));
     }
 
     public bool IsRunning
@@ -74,7 +80,14 @@ public sealed class CsvLogger : IDisposable
                 return;
             }
 
-            Directory.CreateDirectory(Path.GetDirectoryName(_basePath)!);
+            // _basePath is always rooted (see the constructor), so this has a
+            // directory part; the guard keeps a drive root from throwing.
+            string dir = Path.GetDirectoryName(_basePath) ?? string.Empty;
+            if (dir.Length > 0)
+            {
+                Directory.CreateDirectory(dir);
+            }
+
             OpenWriter(_basePath);
         }
     }

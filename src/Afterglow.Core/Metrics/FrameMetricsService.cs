@@ -24,6 +24,14 @@ public sealed class FrameMetricsService : IDisposable
         public required string Application { get; init; }
         public readonly ConcurrentDictionary<string, ChainWindow> Chains = new();
         public double LastSeenMs;
+
+        /// <summary>
+        /// Wall clock (<see cref="Environment.TickCount64"/>) of the last frame.
+        /// <see cref="LastSeenMs"/> is a PresentMon timeline stamp, which simply
+        /// stops advancing when capture stops — comparing it against itself can
+        /// never detect staleness, so freshness needs a clock that keeps running.
+        /// </summary>
+        public long LastSeenTicks;
     }
 
     private readonly PresentMonSession _session;
@@ -66,6 +74,7 @@ public sealed class FrameMetricsService : IDisposable
         chain.LastSeenMs = e.TimestampMs;
         chain.PresentMode = e.PresentMode;
         entry.LastSeenMs = e.TimestampMs;
+        Volatile.Write(ref entry.LastSeenTicks, Environment.TickCount64);
         Volatile.Write(ref _lastEventMs, e.TimestampMs);
 
         // Opportunistic cleanup: drop processes idle for >60 s.
@@ -86,26 +95,40 @@ public sealed class FrameMetricsService : IDisposable
         }
     }
 
+    /// <summary>
+    /// How long after the last frame a process's numbers stop counting as live.
+    /// Past this, the overlay and dashboard must show nothing rather than keep
+    /// repainting the final average as though the game were still running.
+    /// </summary>
+    private static readonly long StaleAfterMs = 2000;
+
+    private static bool IsFresh(ProcessEntry entry) =>
+        Environment.TickCount64 - Volatile.Read(ref entry.LastSeenTicks) <= StaleAfterMs;
+
     /// <summary>The process whose stats the overlay/UI should show.</summary>
     public int? ResolveTargetPid()
     {
-        if (SelectedProcessId is int selected && _processes.ContainsKey(selected))
+        // Freshness is checked on every branch. The selected/foreground branches
+        // had no age test at all, so a game that stopped presenting — or a
+        // capture the user stopped — kept serving its last numbers forever.
+        if (SelectedProcessId is int selected
+            && _processes.TryGetValue(selected, out var selectedEntry) && IsFresh(selectedEntry))
         {
             return selected;
         }
 
-        if (ForegroundProcessId is int foreground && _processes.ContainsKey(foreground))
+        if (ForegroundProcessId is int foreground
+            && _processes.TryGetValue(foreground, out var foregroundEntry) && IsFresh(foregroundEntry))
         {
             return foreground;
         }
 
         // Fall back to the busiest recently-active process.
-        double now = Volatile.Read(ref _lastEventMs);
         int? best = null;
         int bestFrames = 0;
         foreach (var (pid, entry) in _processes)
         {
-            if (now - Volatile.Read(ref entry.LastSeenMs) > 5000)
+            if (!IsFresh(entry))
             {
                 continue;
             }
@@ -138,9 +161,29 @@ public sealed class FrameMetricsService : IDisposable
         return best;
     }
 
-    public (TrackedApp App, FrameWindowStats Stats)? GetStats(int pid)
+    /// <summary>Whether the process has presented within the freshness window.</summary>
+    public bool IsLive(int pid) => _processes.TryGetValue(pid, out var entry) && IsFresh(entry);
+
+    /// <param name="pid">The process to report on.</param>
+    /// <param name="requireFresh">
+    /// True (the live readouts) withholds a window nothing has presented into
+    /// recently. False is for a report over a FINISHED capture — the CLI's
+    /// end-of-run summary — where a game that quit a few seconds before the
+    /// window closed still has its whole frame window retained and the
+    /// freshness gate would throw the captured statistics away.
+    /// </param>
+    public (TrackedApp App, FrameWindowStats Stats)? GetStats(int pid, bool requireFresh = true)
     {
         if (!_processes.TryGetValue(pid, out var entry))
+        {
+            return null;
+        }
+
+        // Nothing has presented recently: report "no stats" rather than the last
+        // computed average. Every caller treats non-null as live data, so a
+        // stale window here became a frozen FPS number painted indefinitely on
+        // the overlay and the dashboard tile.
+        if (requireFresh && !IsFresh(entry))
         {
             return null;
         }
@@ -193,5 +236,9 @@ public sealed class FrameMetricsService : IDisposable
     {
         _session.FramePresented -= OnFrame;
         _session.Dispose();
+
+        // Capture is over: drop the windows so nothing can serve their contents
+        // as a current reading afterwards.
+        _processes.Clear();
     }
 }

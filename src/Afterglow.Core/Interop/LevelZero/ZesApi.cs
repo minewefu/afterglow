@@ -24,6 +24,8 @@ public sealed class ZesApi
     /// </summary>
     public static ZesApi? TryCreate(out ZeResult status)
     {
+        Afterglow.Core.Interop.VendorLibraryResolver.EnsureInstalled();
+
         try
         {
             status = ZesNative.zesInit(0);

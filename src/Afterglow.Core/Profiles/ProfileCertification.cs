@@ -23,12 +23,26 @@ public sealed record ProfileCertification
     public string Evidence { get; init; } = string.Empty;
 
     /// <summary>
-    /// NVIDIA driver version the pass ran on. Offset stability is partly a
-    /// property of the driver's clock management, so a driver update makes the
-    /// certification stale. Null on certifications from builds that predate
-    /// this field — those stay valid rather than silently expiring.
+    /// Driver version the pass ran on, for the GPU it ran on. Offset stability
+    /// is partly a property of the driver's clock management, so a driver update
+    /// makes the certification stale. Null on certifications from builds that
+    /// predate this field — those stay valid rather than silently expiring.
     /// </summary>
     public string? DriverVersion { get; init; }
+
+    /// <summary>
+    /// UUID of the GPU this pass ran on, so staleness is judged against THAT
+    /// card's driver.
+    /// <para>
+    /// The version was previously compared against one process-wide string that
+    /// preferred NVML's. On a hybrid Intel + NVIDIA machine — the configuration
+    /// this release exists to support — an Arc certification was therefore
+    /// stamped with the NVIDIA driver version: an Intel driver update left it
+    /// looking valid, and an NVIDIA update falsely invalidated it. Null on older
+    /// records, which fall back to the global comparison as before.
+    /// </para>
+    /// </summary>
+    public string? GpuUuid { get; init; }
 }
 
 /// <summary>The four certification modes and validity rules.</summary>
@@ -49,6 +63,20 @@ public static class CertificationModes
     public static string? CurrentDriverVersion { get; set; }
 
     /// <summary>
+    /// Current driver version per GPU UUID, set at startup by <c>GpuManager</c>.
+    /// Consulted first so each card's certifications are judged against its own
+    /// driver stack.
+    /// </summary>
+    public static IReadOnlyDictionary<string, string> DriverVersionByGpu { get; set; } =
+        new Dictionary<string, string>();
+
+    /// <summary>The driver version to compare a certification against.</summary>
+    public static string? CurrentDriverFor(string? gpuUuid) =>
+        gpuUuid is { Length: > 0 } uuid && DriverVersionByGpu.TryGetValue(uuid, out string? version)
+            ? version
+            : CurrentDriverVersion;
+
+    /// <summary>
     /// A certification counts only when it was earned at the profile's current
     /// offsets — the values that actually get applied — and on the driver
     /// that is running now (an update changes clock management under the
@@ -57,8 +85,14 @@ public static class CertificationModes
     public static bool IsValidFor(this ProfileCertification cert, TuningProfile profile) =>
         cert.CoreOffsetMHz == profile.CoreOffsetMHz &&
         cert.MemOffsetMHz == profile.MemOffsetMHz &&
-        (cert.DriverVersion is null || CurrentDriverVersion is null ||
-         string.Equals(cert.DriverVersion, CurrentDriverVersion, StringComparison.Ordinal));
+        IsDriverCurrent(cert);
+
+    private static bool IsDriverCurrent(ProfileCertification cert)
+    {
+        string? current = CurrentDriverFor(cert.GpuUuid);
+        return cert.DriverVersion is null || current is null ||
+               string.Equals(cert.DriverVersion, current, StringComparison.Ordinal);
+    }
 
     public static ProfileCertification? ValidCertification(this TuningProfile profile, string mode) =>
         profile.Certifications.LastOrDefault(c =>

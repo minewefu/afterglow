@@ -26,12 +26,52 @@ public interface IGpuTuner
     /// <summary>Stable identity profiles and applied state are stamped with.</summary>
     string? GpuUuid { get; }
 
-    /// <summary>Tracked clock lock (no driver getter exists on any vendor path).</summary>
+    /// <summary>
+    /// The clock lock Afterglow APPLIED — never a ceiling merely observed from
+    /// the driver (NVML has no getter; IGCL does, see <see cref="LockIsDriverReadable"/>,
+    /// and there an observed factory ceiling reads as null here). The probe
+    /// restores this value after a sweep, so it must be something Afterglow put on.
+    /// </summary>
     uint? AppliedLockMHz { get; }
+
+    /// <summary>
+    /// True when <c>ReadCurrent().LockedCoreClockMHz</c> comes from a real driver
+    /// readback rather than an in-process shadow. Only a driver-backed value can
+    /// witness a change made from outside this process — a reset by an
+    /// automation rule, a TDR recovery, or another tool — so callers that need
+    /// to detect such a change must not rely on the lock unless this is true.
+    /// False on NVML (no locked-clock getter exists); true on IGCL.
+    /// </summary>
+    bool LockIsDriverReadable => false;
+
+    /// <summary>
+    /// The card's stable applied-state key (UUID, or the index fallback for a
+    /// card the driver gives no UUID) — the key a V/F probe records an
+    /// unreleased pin under. Set by the GPU manager. A verified lock release or
+    /// re-apply resolves that record, so the store reflects the hardware rather
+    /// than the last front-end that touched it: the CLI's own printed remedy
+    /// (`set --lock-clock off`) used to leave the App's "may still be pinned"
+    /// banner up on every launch.
+    /// </summary>
+    string? ProbeRecordKey { get => null; set { } }
+
+    /// <summary>
+    /// The highest clock a lock can be pinned at: the domain maximum, or on a
+    /// driver that reads the range back, the released ceiling once observed —
+    /// a factory ceiling below the domain maximum cannot be exceeded, and a
+    /// sweep that tries is refused at its last target.
+    /// </summary>
+    uint MaxLockableClockMHz => Capabilities.MaxCoreClockMHz;
 
     /// <summary>
     /// The currently applied values. PowerLimitW is null when the device has
     /// no readable power limit (the NVIDIA tuner always reads one back).
+    /// LockedCoreClockMHz is an OBSERVATION — on a driver with a readback
+    /// getter it is whatever ceiling the driver reports, factory or foreign
+    /// clamp included — and must never be fed back into a profile as the lock
+    /// to preserve; that is <see cref="AppliedLockMHz"/>. Carrying the observed
+    /// value forward wrote an Arc factory ceiling back as a clamp with written
+    /// provenance, which no release could then adopt.
     /// </summary>
     (int CoreOffsetMHz, int MemOffsetMHz, double? PowerLimitW, uint? VoltageBoostPct, uint? LockedCoreClockMHz) ReadCurrent();
 

@@ -138,7 +138,9 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
 
     public bool HasCrashReport => _services.LastCrashReport is not null;
 
-    public string CrashReportHeadline => _services.LastCrashReport?.Headline ?? string.Empty;
+    public string CrashReportHeadline => _services.LastCrashReport is { } r
+        ? r.GpuName is { } name ? $"[GPU {r.GpuIndex} — {name}] {r.Headline}" : r.Headline
+        : string.Empty;
 
     public string CrashReportText => _services.LastCrashReport?.ReportText ??
         "No crash captured. If a session ever ends in a hard reset, the flight recorder's last seconds " +
@@ -149,7 +151,7 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
     {
         if (_services.LastCrashReport is { } report)
         {
-            Clipboard.SetText(report.ReportText);
+            ClipboardSafe.Copy(report.ReportText);
         }
     }
 
@@ -167,7 +169,34 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
     /// </summary>
     public void RebindGpu()
     {
+        var previous = _gpu;
         _gpu = _services.SelectedGpu;
+
+        // A verdict belongs to the card it was measured on. OnSnapshot switches
+        // the live telemetry line to the new card immediately, and the view
+        // renders it in the same panel as these strings — so leaving them made
+        // "Stopped after 00:10:00 with 0 errors — stable under this load" sit
+        // under GPU 1's live readings for a card that was never burned. The V/F
+        // page already clears its own for exactly this reason.
+        if (previous is not null && previous.Index != _gpu?.Index && !AnyRunActive)
+        {
+            StressStatusText = string.Empty;
+            VramStatusText = string.Empty;
+            StepperPhaseText = string.Empty;
+            StepperLog = string.Empty;
+        }
+        else if (previous is not null && previous.Index != _gpu?.Index)
+        {
+            // Still running on the old card. Clear the finished verdicts anyway —
+            // they belong to that card, not this one — and say where the live run
+            // is instead of leaving its readings to be read as the new card's.
+            StressStatusText = string.Empty;
+            VramStatusText = string.Empty;
+            StepperLog = string.Empty;
+            StepperPhaseText = $"Still running on GPU {previous.Index} — {previous.Name}; " +
+                               "its results stay on that card.";
+        }
+
         // The gate depends on the selected GPU's capabilities now, so a
         // selector switch must re-evaluate it (mixed NVIDIA + Intel machines).
         OnPropertyChanged(nameof(CanStep));
@@ -186,9 +215,14 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
         {
             string hot = snapshot.HotSpotTempC is double hs ? $" (hot {hs:F0}°)" : string.Empty;
             string mem = snapshot.MemJunctionTempC is double mj ? $" · mem {mj:F0}°C" : string.Empty;
+
+            // Absent sensors read "—". Folding them in as 0 put "0°C · 0 W ·
+            // fans 0%" on screen throughout a burn on a device that exposes no
+            // temperature, power or fan sensors — three measurements that were
+            // never taken, shown next to real ones.
             LiveStatsText =
-                $"{snapshot.CoreClockMHz ?? 0} MHz · {snapshot.GpuTempC ?? 0}°C{hot}{mem} · " +
-                $"{snapshot.PowerW ?? 0:F0} W · fans {snapshot.MaxFanPercent ?? 0}%";
+                $"{Show(snapshot.CoreClockMHz, "F0")} MHz · {Show(snapshot.GpuTempC, "F0")}°C{hot}{mem} · " +
+                $"{Show(snapshot.PowerW, "F0")} W · fans {Show(snapshot.MaxFanPercent, "F0")}%";
         });
     }
 
@@ -229,6 +263,49 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
         _stress.Start();
     }
 
+    /// <summary>How long a burn must run before the word "stable" is earned.</summary>
+    private static readonly TimeSpan MinimumVerdictTime = TimeSpan.FromSeconds(60);
+
+    /// <summary>A reading this device does not expose renders as "—", never as 0.</summary>
+    private static string Show(double? value, string format) =>
+        value is { } d ? d.ToString(format, System.Globalization.CultureInfo.CurrentCulture) : "—";
+
+    /// <summary>
+    /// The verdict for a burn that ended cleanly. "Stable under this load" used
+    /// to be printed no matter how briefly the run went — a two-second burn read
+    /// the same as a ten-minute one — and a transition/excursion run stopped
+    /// before its first cycle fell into the *sustained* wording, describing a
+    /// regime it never entered. The VRAM branch already gates on completed
+    /// rounds; this holds the burn to the same standard, and says what was
+    /// actually measured when the run was too short to conclude anything.
+    /// </summary>
+    private static string StoppedVerdict(StressProgress progress)
+    {
+        string ran = $"Stopped after {progress.Elapsed:hh\\:mm\\:ss} with 0 errors";
+
+        // The evidence rule — work done, cycles completed — is the engine's own,
+        // the same one the CLI, MCP and certifier apply, so this page cannot
+        // disagree with them about what a run proved. The minimum duration
+        // below is this page's own threshold for the word "stable".
+        if (progress.VerdictGap is { } gap)
+        {
+            return $"{ran}, but {gap}.";
+        }
+
+        if (progress.IsCyclic)
+        {
+            return progress.Elapsed >= MinimumVerdictTime
+                ? $"{ran} across {progress.Transitions} clock excursions — stable in this regime."
+                : $"{ran} across {progress.Transitions} clock excursions — too short for a verdict " +
+                  $"(this pattern needs at least {MinimumVerdictTime.TotalSeconds:F0} s and several excursions).";
+        }
+
+        return progress.Elapsed >= MinimumVerdictTime
+            ? $"{ran} — stable under this load."
+            : $"{ran} over {progress.TotalDispatches} dispatches — too short for a stability verdict " +
+              $"(run at least {MinimumVerdictTime.TotalSeconds:F0} s).";
+    }
+
     private void OnStressProgress(StressProgress progress)
     {
         StressElapsedText = $"{progress.Elapsed:hh\\:mm\\:ss}";
@@ -250,10 +327,7 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
                 break;
             case StressState.Stopped:
                 StressRunning = false;
-                StressStatusText = progress.Transitions > 0
-                    ? $"Stopped after {progress.Elapsed:hh\\:mm\\:ss} with 0 errors across {progress.Transitions} " +
-                      "clock excursions — stable in this regime."
-                    : $"Stopped after {progress.Elapsed:hh\\:mm\\:ss} with 0 errors — stable under this load.";
+                StressStatusText = StoppedVerdict(progress);
                 break;
             case StressState.ArtifactDetected:
                 StressRunning = false;
@@ -317,11 +391,9 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
         // restore happened if the run was still unwinding when time ran out.
         // Ask everything to stop first, then wait once: the stepper's unwind
         // and the burn/VRAM teardowns then overlap instead of adding up.
-        _stepper?.Cancel();
-        _stress?.Stop();
-        _vram?.Stop();
+        RequestStop();
 
-        if (_stepper is { } stepper && !stepper.CancelAndWait(TimeSpan.FromSeconds(15)))
+        if (!WaitForStop(TimeSpan.FromSeconds(15)))
         {
             Core.Diagnostics.Log.Warn(
                 "Stepper did not finish stopping within 15 s of shutdown — the offset it was testing may still be " +
@@ -331,6 +403,42 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
         _stress?.Dispose();
         _vram?.Dispose();
     }
+
+    /// <summary>
+    /// Asks everything on this page to stop, without waiting. Separated from
+    /// <see cref="WaitForStop"/> so a caller can ask several subsystems to stop
+    /// and then wait once, with their unwinds overlapping.
+    /// </summary>
+    public void RequestStop()
+    {
+        _stepper?.Cancel();
+        _stress?.Stop();
+        _vram?.Stop();
+    }
+
+    /// <summary>
+    /// Waits, bounded, for a stepper run to finish unwinding. False means it was
+    /// still running at the timeout — so its offset may still be applied and it
+    /// may still write to the GPU.
+    /// </summary>
+    public bool WaitForStop(TimeSpan timeout)
+    {
+        // All three, sharing one deadline. Waiting only on the stepper left a
+        // plain burn running while a panic reset stripped the settings under it —
+        // and that burn then published "… — stable under this load" for a run
+        // whose second half executed at stock clocks. Same false-verdict class as
+        // the stepper case, one object over.
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        TimeSpan Left() => timeout - clock.Elapsed is { Ticks: > 0 } left ? left : TimeSpan.Zero;
+
+        bool stopped = _stepper is not { } stepper || stepper.CancelAndWait(Left());
+        stopped &= _stress is not { } stress || stress.StopAndWait(Left());
+        stopped &= _vram is not { } vram || vram.StopAndWait(Left());
+        return stopped;
+    }
+
+    /// <summary>True while a stepper run or a burn/VRAM test is in flight here.</summary>
+    public bool AnyRunActive => StepperRunning || StressRunning || VramRunning;
 
     private void OnStepperStatus(StepperStatus status)
     {
@@ -344,8 +452,24 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
             { Running: true } =>
                 $"Testing {(status.CurrentOffsetMHz >= 0 ? "+" : string.Empty)}{status.CurrentOffsetMHz} MHz — " +
                 $"{status.StepElapsed:mm\\:ss} / {status.StepDuration:mm\\:ss}",
+            { ResultOffsetMHz: int result, StartOffsetRestored: false } =>
+                $"Finished — stable core offset: {(result >= 0 ? "+" : string.Empty)}{result} MHz, but the " +
+                "closing write of it was refused; check the Tuning page.",
             { ResultOffsetMHz: int result } =>
                 $"Finished — stable core offset: {(result >= 0 ? "+" : string.Empty)}{result} MHz",
+
+            // A failed or cancelled run's headline is where the card was LEFT.
+            // The MCP payload was fixed to carry this; the app's status line is
+            // its twin, and "failed" alone hid a card still at the crashed offset.
+            { StartOffsetRestored: false } =>
+                $"{Capitalize(status.Phase)} — the starting offset could NOT be restored; this GPU may still " +
+                $"be at {(status.CurrentOffsetMHz >= 0 ? "+" : string.Empty)}{status.CurrentOffsetMHz} MHz. " +
+                "Reset it from the Tuning page.",
+            { Phase: "cancelled", StartOffsetRestored: true } => "Cancelled — starting offset restored.",
+            { Phase: "failed", StartOffsetRestored: true } =>
+                "Stopped without a result — starting offset restored. See the log below.",
+            { Phase: "cancelled" } => "Cancelled. See the log below.",
+            { Phase: "failed" } => "Stopped without a result. See the log below.",
             _ => status.Phase,
         };
         StepperProgress = status.StepDuration.TotalSeconds > 0
@@ -353,4 +477,7 @@ public partial class StabilityViewModel : ObservableObject, IDisposable
             : 0;
         StepperLog = string.Join(Environment.NewLine, status.Log.TakeLast(14));
     }
+
+    private static string Capitalize(string text) =>
+        text.Length == 0 ? text : char.ToUpperInvariant(text[0]) + text[1..];
 }

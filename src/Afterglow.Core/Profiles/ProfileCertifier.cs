@@ -19,7 +19,19 @@ public sealed record CertifierStatus(
     TimeSpan ModeDuration,
     IReadOnlyList<string> Log,
     bool? Passed,
-    string? FailedMode);
+    string? FailedMode,
+
+    /// <summary>
+    /// Whether the GPU was actually returned to driver defaults after a failure.
+    /// <para>
+    /// Null means no reset was attempted on this path — which is the case for an
+    /// apply failure, where a partially applied profile is still on the card.
+    /// The UI used to assert "the GPU was reset to driver defaults" for every
+    /// failure, including that one, and the reset's own return value was
+    /// discarded so a refused reset read exactly like a successful one.
+    /// </para>
+    /// </summary>
+    bool? ResetSucceeded = null);
 
 /// <summary>
 /// Certification wizard: applies a saved profile, then runs all four stability
@@ -101,14 +113,14 @@ public sealed class ProfileCertifier
 
     private void Publish(
         bool running, string phase, int modeIndex, TimeSpan elapsed, TimeSpan duration,
-        bool? passed = null, string? failedMode = null)
+        bool? passed = null, string? failedMode = null, bool? resetSucceeded = null)
     {
         CertifierStatus status;
         lock (_lock)
         {
             status = new CertifierStatus(
                 running, phase, modeIndex, CertificationModes.All.Count, elapsed, duration,
-                _log.ToArray(), passed, failedMode);
+                _log.ToArray(), passed, failedMode, resetSucceeded);
             _status = status;
         }
 
@@ -154,7 +166,28 @@ public sealed class ProfileCertifier
             {
                 Log($"{ModeTitle(mode)} FAILED: {failDetail}");
                 Log("Resetting to driver defaults — this configuration just proved unstable.");
-                _ = _tuner.ResetToDefaults();
+
+                // The reset's answer decides what may be claimed. Discarding it
+                // let a driver that refused every knob — the usual state right
+                // after the reset this failure implies — produce a UI line
+                // asserting the GPU was back at defaults while it still held the
+                // settings that had just proved unstable.
+                var reset = _tuner.ResetToDefaults();
+                if (!reset.AllSucceeded)
+                {
+                    Log($"The reset did NOT fully succeed ({reset.Summary}). This GPU may still be running the " +
+                        "configuration that just failed — reset it from the Tuning page and verify.");
+                }
+
+                Publish(false, "failed", i, TimeSpan.Zero, TimeSpan.Zero, passed: false, failedMode: mode,
+                    resetSucceeded: reset.AllSucceeded);
+                return;
+            }
+
+            if (ProfileWasReset(profile) is string drift)
+            {
+                Log($"{ModeTitle(mode)} cannot be certified: {drift}.");
+                Log("Nothing is stamped — the burn did not run against these settings.");
                 Publish(false, "failed", i, TimeSpan.Zero, TimeSpan.Zero, passed: false, failedMode: mode);
                 return;
             }
@@ -175,6 +208,93 @@ public sealed class ProfileCertifier
         Publish(false, "done", CertificationModes.All.Count, TimeSpan.Zero, TimeSpan.Zero, passed: true);
     }
 
+    /// <summary>
+    /// A certification only means something if the profile was actually applied
+    /// for the burn that earned it. Over the ~6 minutes of a four-mode run an
+    /// automation rule, a TDR panic-reset, or another Afterglow surface can put
+    /// the GPU back to stock, and nothing suppressed or noticed that — the
+    /// remaining modes then passed against stock clocks and the profile was
+    /// stamped stable on evidence gathered from settings it never ran at.
+    /// <para>
+    /// Deliberately narrow: it fires only when EVERY knob the profile asked for
+    /// reads as stock, which is the signature of a reset. A single value that
+    /// merely differs (the apply engine clamps to the driver's range) is not
+    /// treated as drift, so a legitimately clamped profile is never failed.
+    /// </para>
+    /// </summary>
+    private string? ProfileWasReset(TuningProfile profile)
+    {
+        var (core, mem, _, _, lockMHz) = _tuner.ReadCurrent();
+        var caps = _tuner.Capabilities;
+
+        // Witnesses must be knobs whose value is read back from the driver AND
+        // whose stock value is unambiguous. Offsets qualify: 0 means stock.
+        // The clock lock qualifies only where the driver actually reads it back
+        // (IGCL does; NVML has no locked-clock getter, so there it is an
+        // in-process shadow no external reset ever clears) — and on Intel the
+        // clamp is the ONLY knob there is, so without it this check had nothing
+        // to look at and was dead code on the one vendor verified on hardware.
+        //
+        // The power limit is deliberately NOT a witness even though both vendors
+        // read it back: a reset restores it to the board default, and profiles
+        // routinely carry that same default, so "back at stock" and "still
+        // applied" are indistinguishable there. Using it would fail the first
+        // mode of most certifications.
+        // A clamp the profile never asked for is also disqualifying, in the
+        // opposite direction: the burn would then run — and be stamped — under a
+        // clock cap that is not part of what is being certified. Only checkable
+        // where the driver reads the lock back.
+        // One corroborating re-read serves both witnesses below: a third driver
+        // round-trip per call bought nothing the second had not already read.
+        (int Core, int Mem, uint? Lock)? secondRead = null;
+        if (_tuner.LockIsDriverReadable && profile.LockedCoreClockMHz is null && lockMHz is not null)
+        {
+            // Corroborate, as the stock witness below does: one glitched range
+            // read, or a race with another reader on the same tuner, must not
+            // throw away a mode that just burned for 90 s.
+            var (coreAgain, memAgain, _, _, lockAgain) = _tuner.ReadCurrent();
+            secondRead = (coreAgain, memAgain, lockAgain);
+            if (lockAgain is uint stray)
+            {
+                return $"the GPU is clamped to {stray} MHz, which this profile does not ask for — a burn under an " +
+                    "unrequested clock cap cannot certify these settings";
+            }
+        }
+
+        bool wantedCore = caps.SupportsCoreOffset && profile.CoreOffsetMHz != 0;
+        bool wantedMem = caps.SupportsMemOffset && profile.MemOffsetMHz != 0;
+        bool wantedLock = _tuner.LockIsDriverReadable && profile.LockedCoreClockMHz is not null;
+        if (!wantedCore && !wantedMem && !wantedLock)
+        {
+            return null;
+        }
+
+        bool Stock(int c, int m, uint? l) =>
+            (!wantedCore || c == 0) && (!wantedMem || m == 0) && (!wantedLock || l is null);
+
+        bool allStock = Stock(core, mem, lockMHz);
+
+        // A failed getter also reads back as 0/null, and aborting a certification
+        // on one transient failure would discard every mode already earned.
+        // Corroborate before calling it drift: a real reset stays reset.
+        if (allStock)
+        {
+            var (core2, mem2, lock2) = secondRead ?? ReadAgain();
+            allStock = Stock(core2, mem2, lock2);
+        }
+
+        (int, int, uint?) ReadAgain()
+        {
+            var (c, m, _, _, l) = _tuner.ReadCurrent();
+            return (c, m, l);
+        }
+
+        return allStock
+            ? "the GPU is back at stock, so the profile stopped being applied mid-run " +
+              "(an automation rule, TDR recovery, or another Afterglow surface reset it)"
+            : null;
+    }
+
     private (bool Passed, string Evidence, string? FailDetail) RunStressMode(
         string mode, int modeIndex, TimeSpan duration)
     {
@@ -185,7 +305,12 @@ public sealed class ProfileCertifier
             _ => StressPattern.Sustained,
         };
 
-        using var stress = new GpuStressTest { Pattern = pattern, TargetPciBusId = _pciBusId, TargetVendorId = _vendorId };
+        using var stress = new GpuStressTest
+        {
+            Pattern = pattern,
+            TargetPciBusId = _pciBusId,
+            TargetVendorId = _vendorId,
+        };
         var done = new ManualResetEventSlim(false);
         StressProgress? terminal = null;
 
@@ -208,12 +333,40 @@ public sealed class ProfileCertifier
             }
         }
 
-        stress.StopAndWait(TimeSpan.FromSeconds(5));
+        // A burn that never acknowledged its stop is NOT a pass. Its progress is
+        // a stale mid-run snapshot, and any corruption that happened since the
+        // last periodic verify was never checked — so there is no verdict to
+        // stamp. Certification refuses rather than inventing a clean result.
+        bool stoppedCleanly = stress.StopAndWait(TimeSpan.FromSeconds(30));
         var final = terminal ?? stress.Progress;
 
         if (final.State is StressState.ArtifactDetected or StressState.DeviceLost or StressState.Failed)
         {
             return (false, string.Empty, final.Detail ?? final.State.ToString());
+        }
+
+        if (!stoppedCleanly)
+        {
+            return (false, string.Empty,
+                "The burn did not stop within 30 s, so its result is a stale mid-run snapshot with no " +
+                "final verification — no stability verdict can be drawn from it.");
+        }
+
+        if (final.State is not StressState.Stopped)
+        {
+            return (false, string.Empty,
+                $"The burn ended in an unexpected state ({final.State}) — no stability verdict can be drawn from it.");
+        }
+
+        // The engine's own evidence rule: load dispatches actually ran (the
+        // total counts a one-off reference pass, so it is 1 even when the load
+        // loop never did), and a cycling mode completed at least one cycle. The
+        // transition mode used to be stamped on "0 clock transitions, 0 errors"
+        // — a regime the run never entered.
+        if (final.VerdictGap is { } gap)
+        {
+            return (false, string.Empty,
+                $"{char.ToUpperInvariant(gap[0])}{gap[1..]} — no certification can be stamped from it.");
         }
 
         string evidence = pattern switch
@@ -233,7 +386,11 @@ public sealed class ProfileCertifier
 
     private (bool Passed, string Evidence, string? FailDetail) RunVramMode(int modeIndex, TimeSpan duration)
     {
-        using var vram = new VramTest { TargetPciBusId = _pciBusId, TargetVendorId = _vendorId };
+        using var vram = new VramTest
+        {
+            TargetPciBusId = _pciBusId,
+            TargetVendorId = _vendorId,
+        };
         vram.ProgressChanged += progress =>
             Publish(true, CertificationModes.Vram, modeIndex, progress.Elapsed, duration);
         vram.Start();
@@ -261,12 +418,29 @@ public sealed class ProfileCertifier
             }
         }
 
-        vram.StopAndWait(TimeSpan.FromSeconds(10));
+        bool stoppedCleanly = vram.StopAndWait(TimeSpan.FromSeconds(30));
         var final = vram.Progress;
 
         if (final.State is StressState.ArtifactDetected or StressState.DeviceLost or StressState.Failed)
         {
             return (false, string.Empty, final.Detail ?? final.State.ToString());
+        }
+
+        // Same rule as the burn: an abandoned run leaves a stale snapshot
+        // behind, and a stale snapshot is not evidence of stability.
+        if (!stoppedCleanly)
+        {
+            return (false, string.Empty,
+                "The VRAM test did not stop within 30 s, so its result is a stale mid-run snapshot — " +
+                "no stability verdict can be drawn from it.");
+        }
+
+        // Same terminal-state guard the burn twin got: only a run that reached
+        // Stopped produced a result worth reading.
+        if (final.State is not StressState.Stopped)
+        {
+            return (false, string.Empty,
+                $"The VRAM test ended in an unexpected state ({final.State}) — no stability verdict can be drawn from it.");
         }
 
         if (final.Rounds < 1)
@@ -305,7 +479,8 @@ public sealed class ProfileCertifier
                 CoreOffsetMHz = profile.CoreOffsetMHz,
                 MemOffsetMHz = profile.MemOffsetMHz,
                 Evidence = evidence,
-                DriverVersion = CertificationModes.CurrentDriverVersion,
+                GpuUuid = _tuner.GpuUuid,
+                DriverVersion = CertificationModes.CurrentDriverFor(_tuner.GpuUuid),
             });
             _store.Save(stored with { Certifications = kept, ModifiedAt = DateTimeOffset.Now });
         }

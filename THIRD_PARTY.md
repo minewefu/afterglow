@@ -28,3 +28,13 @@ The NVAPI interface IDs and structure layouts used by `Afterglow.Core` are
 constants published by open-source projects (LibreHardwareMonitor, MPL-2.0;
 NvAPIWrapper, MIT) and were re-declared in this codebase from those references —
 see `docs/research/driver-apis.md` for the full provenance table.
+
+The IGCL and Level Zero Sysman structure layouts in
+`Afterglow.Core/Interop/Igcl` and `Afterglow.Core/Interop/LevelZero` were
+transcribed field-for-field from Intel's own published headers — `igcl_api.h`
+(Intel Graphics Control Library, MIT) and `zes_api.h` (oneAPI Level Zero, MIT) —
+and are pinned by unit tests against compiler record-layout dumps of those
+headers. No Intel code is copied or linked; both runtime libraries
+(`ControlLib.dll`, `ze_loader.dll`) ship with the Intel graphics driver and are
+loaded from System32 at run time. See `docs/research/intel-driver-apis.md` for
+the per-interface provenance table and the dump procedure.

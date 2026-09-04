@@ -38,6 +38,30 @@ public sealed class GpuContext
     /// </summary>
     public string? Uuid { get; init; }
 
+    /// <summary>
+    /// The identity settings and records are keyed by: the UUID, or an index
+    /// fallback when the driver reports none. One formula for the fan settings,
+    /// the probe-lock records and anything else that must name a card — two
+    /// copies had already drifted on culture.
+    /// </summary>
+    public string StableKey =>
+        Uuid ?? string.Create(System.Globalization.CultureInfo.InvariantCulture, $"index:{Index}");
+
+    /// <summary>
+    /// Why Afterglow cannot read this card's core voltage, or null when the
+    /// answer rests with the driver's own telemetry. On NVIDIA the voltage
+    /// comes only through NVAPI, so a card without a bus-paired NVAPI handle
+    /// has no voltage source here at all — an Afterglow limitation that the
+    /// CLI and the V/F page used to report as "this driver does not report
+    /// core voltage", steering users away from the actual fix.
+    /// </summary>
+    public string? CoreVoltageUnavailableReason =>
+        Vendor == GpuVendor.Nvidia && Nvapi is null
+            ? "core voltage on NVIDIA is read through NVAPI, which is not available for this card " +
+              "(nvapi64.dll could not be loaded, or the card could not be bus-paired) — an Afterglow " +
+              "limitation, not the driver's"
+            : null;
+
     /// <summary>PCI bus number — binds stress/VRAM tests to this physical card.</summary>
     public uint? PciBusId { get; init; }
 
@@ -160,6 +184,19 @@ public sealed class GpuManager : IDisposable
         {
             foreach (var device in _igcl.GetDevices())
             {
+                // IGCL enumerates graphics adapters, not only Intel ones. Stamping
+                // every one of them 0x8086 minted a phantom "Intel" GPU for another
+                // vendor's card: its tuner would talk IGCL to a device that is not
+                // Intel, and the stress engines — which bind by vendor id plus bus —
+                // would hunt for an Intel adapter on that card's bus and either miss
+                // or land on the wrong one. Trust the device's own vendor id.
+                if (device.PciVendorId != Stress.StressAdapter.IntelVendorId)
+                {
+                    Diagnostics.Log.Warn(
+                        $"IGCL enumerated a non-Intel adapter ({device.Name}, vendor 0x{device.PciVendorId:X4}); skipping it.");
+                    continue;
+                }
+
                 string uuid = IntelUuid(device);
                 contexts.Add(new GpuContext
                 {
@@ -170,18 +207,43 @@ public sealed class GpuManager : IDisposable
                     Poller = new IntelSensorSource(device, nextIndex),
                     Tuner = new ArcGpuTuner(device, uuid),
                     Uuid = uuid,
-                    PciBusId = device.Bdf.Bus,
-                    PciVendorId = 0x8086,
+
+                    // Only publish a bus the driver actually reported. A guessed
+                    // 0 here silently disabled the stress engines' own "cannot
+                    // bind, refusing to guess" refusal and let a burn land on
+                    // whichever adapter happened to sit on bus 0.
+                    PciBusId = device.BdfValid ? device.Bdf.Bus : null,
+                    PciVendorId = device.PciVendorId,
                     DriverVersion = device.DriverVersion,
                 });
                 nextIndex++;
             }
         }
 
+        // The tuner resolves a V/F probe's pin record on every verified lock
+        // release, and that record is keyed by the card's stable key — which a
+        // UUID-less NVIDIA tuner cannot derive on its own.
+        foreach (var context in contexts)
+        {
+            context.Tuner.ProbeRecordKey = context.StableKey;
+        }
+
         Gpus = contexts;
 
-        // Certification staleness is checked against one global driver version;
-        // use the primary GPU's stack (NVIDIA when present, else Intel).
+        // Per-GPU first: on a hybrid machine each card's certifications must be
+        // judged against ITS driver, not one process-wide string that preferred
+        // NVML's. The global stays as the fallback for records with no GPU stamp
+        // and for demo mode.
+        var driverByGpu = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var context in contexts)
+        {
+            if (context.Uuid is { Length: > 0 } uuid && context.DriverVersion is { Length: > 0 } version)
+            {
+                driverByGpu[uuid] = version;
+            }
+        }
+
+        Profiles.CertificationModes.DriverVersionByGpu = driverByGpu;
         Profiles.CertificationModes.CurrentDriverVersion =
             DriverVersion ?? contexts.FirstOrDefault()?.DriverVersion;
     }
@@ -195,6 +257,18 @@ public sealed class GpuManager : IDisposable
     /// </summary>
     internal static string IntelUuid(IgclDevice device)
     {
+        // Without a driver-reported BDF the location would be a fabricated
+        // 0000:00:00.0 that two different cards would share — and share state
+        // files under. Say "location unknown" in the identity instead, so it can
+        // never collide with a real location-derived one.
+        if (!device.BdfValid)
+        {
+            Diagnostics.Log.Warn(
+                $"No PCI location for {device.Name}; its identity falls back to enumeration order " +
+                "and is not stable across hardware changes.");
+            return $"INTEL-noloc{device.Index:x2}-{device.PciDeviceId:X4}";
+        }
+
         uint domain = 0;
         if (device.TryGetPciProperties(out var pci) == CtlResult.Success)
         {

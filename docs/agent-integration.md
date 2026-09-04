@@ -65,9 +65,21 @@ afterglow-cli caps --json          # capabilities/ranges
 afterglow-cli monitor --once --json# one telemetry snapshot per GPU
 afterglow-cli get --json           # currently applied values
 afterglow-cli set --core-offset 150 --mem-offset 500   # human-readable per-knob results, exit code 0/1
-afterglow-cli stress --seconds 60  # exit code 0 = stable, 1 = errors/reset
+afterglow-cli stress --seconds 60  # exit code 0 = stable, 1 = errors/reset/aborted/no verdict (no work, or no cycle completed)
 afterglow-cli reset
 ```
+
+**Exit codes.** `0` = success (for the test commands: the run completed and passed).
+`1` = the operation ran and failed — for a stability test that means computation
+errors, a driver reset, or a run that was aborted before its window elapsed.
+`2` = **the arguments were rejected and nothing ran at all** — an unknown option,
+an unparseable or out-of-range value, an unknown `--pattern`, or a `--gpu` index
+that is not a whole number. `3` = the command ran but produced no usable result
+(for example `vfcurve` on a GPU whose driver reports no core voltage).
+
+Treat `2` as a bug in the invocation, never as a hardware verdict: no GPU was
+tested, so it says nothing about stability. Only `1` from a test command that
+actually ran means "unstable".
 
 ## Safety notes for agent authors
 

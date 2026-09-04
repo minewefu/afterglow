@@ -217,8 +217,18 @@ public partial class DashboardViewModel : ObservableObject
         VoltageText = s.CoreVoltageMv is double v ? $"{v:F0}" : "—";
         PerfStateText = s.PerfState is uint ps ? $"P{ps}" : string.Empty;
         ThrottleMarginText = s.ThrottleMarginC is int m ? $"{m}°C headroom to throttle" : string.Empty;
-        EnergyText = s.EnergyWh is double e ? $"{e:F1} Wh session energy" : string.Empty;
+        // The counter is cumulative since the driver loaded (see
+        // GpuSnapshot.EnergyWh), not since this Afterglow session started —
+        // calling it "session energy" invited the reading that it measured this
+        // sitting, when on a machine up for days it is a far larger number.
+        EnergyText = s.EnergyWh is double e ? $"{e:F1} Wh since driver load" : string.Empty;
 
+        // These two were the only tiles whose assignment was conditional; their
+        // eleven neighbours all fall to "—" when the sensor goes quiet. So one
+        // lost tick after a TDR, or switching the selector from a dGPU with fans
+        // to an iGPU without, left the PREVIOUS card's VRAM and fan duty on
+        // screen next to live telemetry for the new one — a reading from
+        // hardware that was not being read.
         if (s is { VramUsedBytes: ulong used, VramTotalBytes: ulong total } && total > 0)
         {
             // On a shared-memory iGPU the figure is the GPU's allocatable
@@ -227,6 +237,11 @@ public partial class DashboardViewModel : ObservableObject
             VramText = $"{used / 1024.0 / 1024.0 / 1024.0:F1} / {total / 1024.0 / 1024.0 / 1024.0:F0} GB{shared}";
             VramFraction = (double)used / total;
         }
+        else
+        {
+            VramText = "—";
+            VramFraction = 0;
+        }
 
         if (s.FanPercents is { Count: > 0 } fans)
         {
@@ -234,6 +249,11 @@ public partial class DashboardViewModel : ObservableObject
             FanRpmText = s.FanRpms is { Count: > 0 } rpms
                 ? string.Join("  ", rpms.Select(r => $"{r}"))+" RPM"
                 : string.Join("/", fans.Select(f => $"{f}%"));
+        }
+        else
+        {
+            FanText = "—";
+            FanRpmText = string.Empty;
         }
 
         // Throttle chips
@@ -278,7 +298,13 @@ public partial class DashboardViewModel : ObservableObject
         var stats = _services.FrameMetrics.GetTargetStats();
         if (stats is null)
         {
+            // Blank the values, not just the visibility flag. A binding or a
+            // layout that still shows this row would otherwise render the last
+            // app's FPS indefinitely — the same stale reading the tiles above
+            // were fixed for.
             HasFps = false;
+            FpsAppText = string.Empty;
+            FpsText = "—";
             return;
         }
 

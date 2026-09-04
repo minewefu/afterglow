@@ -42,8 +42,8 @@ public sealed class AppliedStateStoreTests : IDisposable
     [Fact]
     public void Two_gpus_keep_independent_records()
     {
-        AppliedStateStore.Record(Profile("card A"), allSucceeded: true, lockedClock: 2800, UuidA);
-        AppliedStateStore.Record(Profile("card B"), allSucceeded: true, lockedClock: null, UuidB);
+        AppliedStateStore.Record(Profile("card A"), allSucceeded: true, lockWrittenByAfterglow: 2800, UuidA);
+        AppliedStateStore.Record(Profile("card B"), allSucceeded: true, lockWrittenByAfterglow: null, UuidB);
 
         var a = AppliedStateStore.Load(UuidA);
         var b = AppliedStateStore.Load(UuidB);
@@ -58,11 +58,11 @@ public sealed class AppliedStateStoreTests : IDisposable
     public void Legacy_single_file_is_read_until_superseded_then_retired()
     {
         // A record written the pre-multi-GPU way (no uuid → legacy file).
-        AppliedStateStore.Record(Profile("legacy"), allSucceeded: true, lockedClock: 2700, gpuUuid: null);
+        AppliedStateStore.Record(Profile("legacy"), allSucceeded: true, lockWrittenByAfterglow: 2700, gpuUuid: null);
         Assert.Equal("legacy", AppliedStateStore.Load(UuidA)!.ProfileName);
 
         // First per-GPU write supersedes and retires the legacy file.
-        AppliedStateStore.Record(Profile("fresh"), allSucceeded: true, lockedClock: null, UuidA);
+        AppliedStateStore.Record(Profile("fresh"), allSucceeded: true, lockWrittenByAfterglow: null, UuidA);
         Assert.False(File.Exists(AppPaths.AppliedStateFile));
         Assert.Equal("fresh", AppliedStateStore.Load(UuidA)!.ProfileName);
 

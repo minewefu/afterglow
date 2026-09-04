@@ -194,7 +194,7 @@ UI exposes it; docs/research/intel-driver-apis.md records each interface, its so
 and what was verified on real hardware (an Arc B390 iGPU in a OneXPlayer 3 handheld).
 
 Working on the verified device: live monitoring (clocks, watts from the driver's energy
-counters, utilization, shared-memory budget, session energy), the **frequency clamp**
+counters, utilization, shared-memory budget, energy since driver load), the **frequency clamp**
 as a verified write path (IGCL has a real readback getter, so clamp applies and releases
 report "(verified)" — something NVML's lock cannot do), the full stability lab (burn
 test, transition/excursion patterns, and a VRAM test that detects unified memory and

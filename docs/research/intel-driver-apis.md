@@ -71,8 +71,11 @@ Key facts:
   units). **The V1/V2 getters can "succeed" and return zeros even when the
   capability report says unsupported** — verified on this device — so support gating
   keys off `bSupported`, never off getter status. Writes require
-  `ctlOverclockWaiverSet` first (the driver refuses otherwise); Afterglow calls it
-  only after the user accepts an in-app warning. V2 entry points
+  `ctlOverclockWaiverSet` first (the driver refuses otherwise); Afterglow signs it
+  automatically from `ArcGpuTuner` immediately before the first overclock write of
+  a session, and reports failure to sign as a failed knob. (There is no separate
+  in-app warning gate: the tuning page's own elevation and range gates are the
+  consent surface.) V2 entry points
   (`...SetV2`) are unit-agnostic — the authoritative unit is the knob's `units`
   field; V1 entry points use fixed units (MHz / mV / **milliwatts** / °C).
 - **Power domains** (`ctlEnumPowerDomains` → `ctlPowerGetLimits`/`SetLimits`):
@@ -157,6 +160,15 @@ counters unsupported.
   observed enforced at **100 MHz under load** — the driver enforces the clamp.
   Release via `SetRange(-1, -1)` (the header's "factory value" sentinel) also
   verified: readback returned `100..2300 MHz` and clocks recovered immediately.
+  Re-verified independently on 2026-09-01 through the shipped 1.3.0-beta.1 CLI on
+  the same device: `set --lock-clock 150` reported `100..150 MHz (verified)` and
+  `monitor` showed the core pinned at **150 MHz**; `set --lock-clock off` reported
+  `released to 100..2300 MHz (verified)` and clocks recovered to 950 MHz. This
+  corroborates the GitHub release notes for 1.3.0-beta.1, which state the clamp
+  was "verified down to 150 MHz and back" — that phrase lives in the published
+  release body, not in this repository, which is why it does not appear elsewhere
+  here. 150 MHz is a tested clamp value, not the domain minimum: the driver
+  reports the GPU domain as 100..2300 MHz.
   Note the header's warning that the -1 restore returns to the *factory* max,
   which can sit below the hardware max — release verification therefore checks
   that the clamp we applied is gone, not that the hardware max returned, and

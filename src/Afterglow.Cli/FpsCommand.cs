@@ -1,4 +1,3 @@
-using System.Globalization;
 using Afterglow.Core.Metrics;
 
 namespace Afterglow.Cli;
@@ -9,13 +8,16 @@ internal static class FpsCommand
     public static int Run(string[] args)
     {
         int seconds = 15;
-        for (int i = 1; i < args.Length - 1; i++)
+        if (CliArgs.Validate(args, "fps") is string argError)
         {
-            if (args[i] == "--seconds" &&
-                int.TryParse(args[i + 1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int s))
-            {
-                seconds = Math.Clamp(s, 3, 600);
-            }
+            Console.Error.WriteLine(argError);
+            return 2;
+        }
+
+        if (CliArgs.TryInt(args, "--seconds", 3, 600, ref seconds) is string secondsError)
+        {
+            Console.Error.WriteLine(secondsError);
+            return 2;
         }
 
         using var service = new FrameMetricsService(TimeSpan.FromSeconds(Math.Max(seconds, 10)));
@@ -50,17 +52,26 @@ internal static class FpsCommand
         Console.WriteLine($"Presenting apps seen: {apps.Count}");
         foreach (var app in apps.Take(10))
         {
-            var stats = service.GetStats(app.ProcessId);
+            // A report over a finished capture, not a live readout: a game that
+            // quit a few seconds before the window closed still has its whole
+            // frame window retained, and the freshness gate that blanks the
+            // overlay used to withhold it here — thousands of captured frames
+            // printed with no statistics. The staleness is labelled instead.
+            var stats = service.GetStats(app.ProcessId, requireFresh: false);
             if (stats is null)
             {
-                Console.WriteLine($"  {app.Application,-34} pid {app.ProcessId,-7} {app.RecentFrames} frames (not enough for stats)");
+                Console.WriteLine(
+                    $"  {app.Application,-34} pid {app.ProcessId,-7} {app.RecentFrames} frames (not enough frames for stats)");
                 continue;
             }
 
             var s = stats.Value.Stats;
+            string liveness = service.IsLive(app.ProcessId)
+                ? string.Empty
+                : "  (stopped presenting before the capture ended)";
             Console.WriteLine(
                 $"  {app.Application,-34} pid {app.ProcessId,-7} {s.AverageFps,7:F1} fps  " +
-                $"P1 {s.P1Fps,6:F1}  1%low {s.Low1Fps,6:F1}  ft {s.AverageFrametimeMs,6:F2} ms  [{app.PresentMode}]");
+                $"P1 {s.P1Fps,6:F1}  1%low {s.Low1Fps,6:F1}  ft {s.AverageFrametimeMs,6:F2} ms  [{app.PresentMode}]{liveness}");
         }
 
         var target = service.GetTargetStats();

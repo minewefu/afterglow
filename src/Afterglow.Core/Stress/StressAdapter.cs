@@ -20,6 +20,18 @@ public static class StressAdapter
     public const uint NvidiaVendorId = 0x10DE;
     public const uint IntelVendorId = 0x8086;
 
+    /// <summary>
+    /// Marker embedded in the adapter description when the adapter was chosen
+    /// without a PCI bus to bind to and more than one candidate existed — i.e.
+    /// the pick is a guess. Unbound stress runs accept that; anything that
+    /// attributes a RESULT to a specific card (certification above all) must not.
+    /// </summary>
+    public const string UnboundGuessMarker = "unverified card";
+
+    /// <summary>True when a description from <see cref="Select"/> names a guessed adapter.</summary>
+    public static bool IsUnboundGuess(string description) =>
+        description.Contains(UnboundGuessMarker, StringComparison.Ordinal);
+
     /// <summary>Legacy selection: the NVIDIA adapter with the most VRAM.</summary>
     public static IDXGIAdapter1? SelectNvidia(out string description) =>
         Select(null, out description);
@@ -95,7 +107,12 @@ public static class StressAdapter
                     }
                 }
 
-                description = candidates[pick].Name;
+                // Historical unbound behaviour (largest VRAM), preserved exactly.
+                // The name is flagged as a guess when it WAS one, so callers that
+                // must not guess — certification above all — can refuse.
+                description = candidates.Count > 1
+                    ? $"{candidates[pick].Name} ({UnboundGuessMarker}: {candidates.Count} {vendorName} adapters, no PCI bus to bind to)"
+                    : candidates[pick].Name;
             }
 
             var chosen = candidates[pick].Adapter;

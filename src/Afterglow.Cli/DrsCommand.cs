@@ -1,4 +1,3 @@
-using System.Globalization;
 using Afterglow.Core.Interop.Nvapi;
 
 namespace Afterglow.Cli;
@@ -18,6 +17,26 @@ internal static class DrsCommand
         bool? lowLatency = null;
         bool clear = false;
 
+        // Check first, then parse. `default: break;` below meant `drs --exe
+        // game.exe --fps-cap 60` (the option is --cap) performed no write at all
+        // and exited 0, so a per-game profile the user believed was applied
+        // simply was not.
+        if (CliArgs.Validate(args, "drs") is string argError)
+        {
+            Console.Error.WriteLine(argError);
+            return 2;
+        }
+
+        // Same rule as --seconds elsewhere: a value that does not parse, or is
+        // out of range, is an error — not a silent fall-through to the read-only
+        // branch (nothing written, exit 0), and not a silent clamp that turned
+        // `--cap -5` into cap=0 (uncapped) and reported it as applied.
+        if (CliArgs.TryInt(args, "--cap", 0, 1000, ref cap) is string capError)
+        {
+            Console.Error.WriteLine($"{capError} Nothing was written.");
+            return 2;
+        }
+
         for (int i = 1; i < args.Length; i++)
         {
             switch (args[i])
@@ -25,16 +44,33 @@ internal static class DrsCommand
                 case "--exe" when i + 1 < args.Length:
                     exe = args[++i];
                     break;
-                case "--cap" when i + 1 < args.Length &&
-                    int.TryParse(args[i + 1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int c):
-                    cap = Math.Clamp(c, 0, 1000);
+                case "--cap":
+                    // Parsed and range-checked above; only skip the value here.
                     i++;
                     break;
                 case "--vsync" when i + 1 < args.Length:
                     vsync = args[++i].ToLowerInvariant();
+                    if (vsync is not ("default" or "on" or "off"))
+                    {
+                        Console.Error.WriteLine(
+                            $"Unknown --vsync value '{vsync}' (expected default, on or off). Nothing was written.");
+                        return 2;
+                    }
+
                     break;
                 case "--low-latency" when i + 1 < args.Length:
-                    lowLatency = args[++i].Equals("on", StringComparison.OrdinalIgnoreCase);
+                    // "on" or "off" only: anything else silently meant "off",
+                    // so `--low-latency yes` turned the feature OFF and said so
+                    // as though that had been asked for.
+                    string latencyArg = args[++i].ToLowerInvariant();
+                    if (latencyArg is not ("on" or "off"))
+                    {
+                        Console.Error.WriteLine(
+                            $"Unknown --low-latency value '{latencyArg}' (expected on or off). Nothing was written.");
+                        return 2;
+                    }
+
+                    lowLatency = latencyArg == "on";
                     break;
                 case "--clear":
                     clear = true;

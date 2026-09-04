@@ -12,6 +12,7 @@ public partial class MainViewModel : ObservableObject
     private readonly AppServices _services;
     private OverlayWindow? _overlay;
     private (int Core, int Mem, double? Power, uint? Boost, uint? Lock)? _preGameState;
+    private uint? _preGameLock;
     private (Core.Profiles.FanMode Mode, uint FixedPct, Core.Fans.FanCurveConfig Curve)? _preGameFans;
     private Core.Hardware.GpuContext? _preGameGpu;
 
@@ -95,7 +96,19 @@ public partial class MainViewModel : ObservableObject
             DateTimeOffset.Now - crash.CrashedAt < TimeSpan.FromHours(72))
         {
             ShowForensicsBanner = true;
-            ForensicsBannerText = $"Last session ended in a crash. {crash.Headline}";
+            // Name the card the evidence came from: the offsets and load state in
+            // the report belong to exactly one GPU, and on a multi-GPU machine an
+            // unlabelled verdict reads as a statement about the whole system.
+            string card = crash.GpuName is { } name ? $" [GPU {crash.GpuIndex} — {name}]" : string.Empty;
+
+            // Show the verdict's own headline rather than prefixing a flat
+            // assertion onto it. The staleness verdict deliberately says the
+            // evidence "cannot be tied to what the GPU was doing when this
+            // session ended" — asserting "Last session ended in a crash."
+            // directly above that contradicted the classifier one file over, and
+            // widening the correlation window made that pairing reachable for
+            // sessions that did not crash at all.
+            ForensicsBannerText = $"Last session ended without a clean shutdown.{card} {crash.Headline}";
         }
 
         _automation.UpdateRules(services.Settings.AutomationRules);
@@ -338,6 +351,10 @@ public partial class MainViewModel : ObservableObject
 
         _preGameGpu = gpu;
         _preGameState = gpu.Tuner.ReadCurrent();
+        // The lock to put back is the one Afterglow APPLIED; ReadCurrent's
+        // element is an observation (on Arc a factory ceiling reads as one),
+        // and restoring it wrote that ceiling back as a clamp.
+        _preGameLock = gpu.Tuner.AppliedLockMHz;
         _preGameFans = Fans.CurrentConfig;
         var result = ApplyProfileFull(profile, gameContext: true);
         TrayAlert?.Invoke(
@@ -364,7 +381,7 @@ public partial class MainViewModel : ObservableObject
             MemOffsetMHz = pre.Mem,
             PowerLimitW = pre.Power is > 0 ? pre.Power : null,
             VoltageBoostPct = pre.Boost,
-            LockedCoreClockMHz = pre.Lock,
+            LockedCoreClockMHz = _preGameLock,
         };
         // Built from ReadCurrent, which cannot see per-point offsets, so this
         // restore must not be read as "the user wants no curve".
@@ -478,8 +495,51 @@ public partial class MainViewModel : ObservableObject
         }
     }
 
-    /// <summary>Hotkey: reset everything to driver defaults immediately.</summary>
+    /// <summary>
+    /// Hotkey: reset everything to driver defaults immediately.
+    /// <para>
+    /// Anything actively driving the GPU is stopped FIRST. A stepper mid-step
+    /// does not notice a reset: it keeps burning, and the rest of that step runs
+    /// at stock clocks, so the offset the reset just removed is scored as having
+    /// passed — a stability verdict from evidence gathered while the setting was
+    /// not applied, later published as the stable offset and handed to MCP
+    /// agents. Its next iteration then re-writes the very offset that was reset.
+    /// A V/F probe likewise re-pins the clock the reset just released.
+    /// <see cref="OnDriverReset"/> already refused to fight a running stepper;
+    /// this path did not.
+    /// </para>
+    /// </summary>
     public void PanicReset()
+    {
+        // Asking is instant, so it happens on the calling thread: a run stops
+        // advancing the moment the key is pressed.
+        bool wasActive = Stability.AnyRunActive || VfCurve.ProbeRunning;
+        Stability.RequestStop();
+        VfCurve.RequestProbeStop();
+
+        if (!wasActive)
+        {
+            CompletePanicReset(stopped: true);
+            return;
+        }
+
+        // Something is running, and unwinding it can take seconds — the stepper's
+        // offset restore alone retries three times over ~4.5 s. This method is
+        // invoked from the window's message pump (HotkeyService.WndProc), so
+        // waiting here would freeze the UI and the hotkey handler itself. Wait
+        // off the pump instead and report the real outcome when it is known.
+        _ = System.Threading.Tasks.Task.Run(() =>
+        {
+            var budget = TimeSpan.FromSeconds(8);
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            bool stopped = Stability.WaitForStop(budget);
+            var left = budget - clock.Elapsed;
+            stopped &= VfCurve.CancelProbeAndWait(left > TimeSpan.Zero ? left : TimeSpan.Zero);
+            CompletePanicReset(stopped);
+        });
+    }
+
+    private void CompletePanicReset(bool stopped)
     {
         foreach (var gpu in _services.Gpus)
         {
@@ -491,8 +551,23 @@ public partial class MainViewModel : ObservableObject
             fans.SetAuto();
         }
 
-        TrayAlert?.Invoke("Afterglow", "Panic reset: all tuning returned to driver defaults.");
-        Tuning.RefreshFromHardware();
+        void Finish()
+        {
+            TrayAlert?.Invoke("Afterglow", stopped
+                ? "Panic reset: all tuning returned to driver defaults."
+                : "Panic reset: tuning returned to driver defaults, but a stability run or V/F probe was still " +
+                  "stopping and may re-apply settings. Check the Stability page.");
+            Tuning.RefreshFromHardware();
+        }
+
+        if (System.Windows.Application.Current?.Dispatcher is { } dispatcher && !dispatcher.CheckAccess())
+        {
+            dispatcher.BeginInvoke(Finish);
+        }
+        else
+        {
+            Finish();
+        }
     }
 
     /// <summary>Hotkey: apply the Nth saved profile (alphabetical).</summary>
@@ -579,14 +654,22 @@ public partial class MainViewModel : ObservableObject
         }
 
         // Per-GPU records: any card with an unclean record raises the banner
-        // (reset-after-crash already resets every GPU).
-        var unclean = AppliedStateStore.LoadAll().FirstOrDefault(s => !s.CleanShutdown);
+        // (reset-after-crash already resets every GPU). A probe pin is the
+        // graver of the two stories and is announced first — whichever record
+        // enumerated first used to win, so a second card's pin was shown as an
+        // ordinary unclean exit and dismissed with it.
+        var uncleanAll = AppliedStateStore.LoadAll().Where(s => !s.CleanShutdown).ToList();
+        var unclean = uncleanAll.FirstOrDefault(s => s.ProbeLockPending) ?? uncleanAll.FirstOrDefault();
         if (unclean is not null)
         {
             ShowCrashBanner = true;
-            CrashBannerText =
-                $"Afterglow didn't shut down cleanly last time (profile '{unclean.ProfileName}' was applied " +
-                $"{unclean.AppliedAt:g}). If the system crashed, resetting to driver defaults is recommended.";
+            string others = uncleanAll.Count > 1 ? $" {uncleanAll.Count} GPU records are affected." : string.Empty;
+            CrashBannerText = (unclean.ProbeLockPending
+                ? $"A V/F probe could not release its clock lock ({unclean.AppliedAt:g}); the GPU may still be " +
+                  "pinned at an exact frequency. Resetting to driver defaults is recommended."
+                : $"Afterglow didn't shut down cleanly last time (profile '{unclean.ProfileName}' was applied " +
+                  $"{unclean.AppliedAt:g}). If the system crashed, resetting to driver defaults is recommended.")
+                + others;
         }
     }
 
@@ -597,6 +680,14 @@ public partial class MainViewModel : ObservableObject
         {
             _ = gpu.Tuner.ResetToDefaults();
         }
+
+        // No sweep of probe-lock records here: each tuner resolves its own
+        // card's record (by the stable key the GPU manager gave it) when its
+        // clock-lock reset verifiably lands — and only then. Resolving every
+        // index-keyed record unconditionally erased the only trace of a pin on
+        // a card whose reset the driver had just refused, and a record for a
+        // card that is absent right now is the only trace of a lock nobody
+        // released.
 
         foreach (var fans in _services.FanControl.Values)
         {
@@ -611,8 +702,10 @@ public partial class MainViewModel : ObservableObject
     private void DismissCrashBanner()
     {
         // Keep the applied-state file (it still tracks the clock lock, which can
-        // survive at the driver level); just stop treating it as a crash.
-        AppliedStateStore.MarkCleanShutdown();
+        // survive at the driver level); just stop treating it as a crash. The
+        // user is explicitly waving the warning off, so a probe's unresolved
+        // pin is dismissed with it.
+        AppliedStateStore.MarkCleanShutdown(resolveProbeLocks: true);
         ShowCrashBanner = false;
     }
 
@@ -652,7 +745,9 @@ public partial class MainViewModel : ObservableObject
                     break;
                 case "reset":
                     PanicReset();
-                    action = "all tuning reset to driver defaults";
+                    action = Stability.AnyRunActive || VfCurve.ProbeRunning
+                        ? "stopping the running stability task, then resetting all tuning to driver defaults"
+                        : "all tuning reset to driver defaults";
                     break;
                 default:
                     action = "no action taken (rule misconfigured)";

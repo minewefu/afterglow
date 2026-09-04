@@ -131,7 +131,20 @@ public partial class ProfilesViewModel : ObservableObject
             : status.Passed == true
                 ? "Certified across all four modes — marked stable."
                 : status.FailedMode is { } failed
-                    ? $"Failed during {failed} — the GPU was reset to driver defaults."
+                    // Say what happened, not what was intended. This line
+                    // asserted a reset for every failure — including the "apply"
+                    // path, which attempts none and leaves a partially applied
+                    // profile on the card.
+                    ? failed == "apply"
+                        ? "Failed while applying the profile — it may be partly applied. " +
+                          "Reset from the Tuning page before retrying."
+                        : status.ResetSucceeded switch
+                        {
+                            true => $"Failed during {failed} — the GPU was reset to driver defaults.",
+                            false => $"Failed during {failed}, and the reset did NOT fully succeed — " +
+                                     "this GPU may still be running the failing settings.",
+                            null => $"Failed during {failed}.",
+                        }
                     : status.Phase;
         CertifyProgress = status.Running && status.ModeDuration.TotalSeconds > 0
             ? Math.Clamp(

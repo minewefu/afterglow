@@ -263,7 +263,9 @@ public struct ZesEngineStats
 /// </summary>
 internal static class ZesNative
 {
-    private const string Lib = "ze_loader.dll";
+    // The resolver pins this name to System32; a private copy here could drift
+    // from the resolver's and silently hand the load back to default probing.
+    private const string Lib = VendorLibraryResolver.ZeLoaderLib;
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern ZeResult zesInit(uint flags);

@@ -157,6 +157,14 @@ public partial class TuningViewModel : ObservableObject
     public void RebindGpu()
     {
         _gpu = _services.SelectedGpu;
+
+        // "Applied: core offset +150 MHz" is a statement about the card it was
+        // written to. RefreshFromHardware below re-reads the NEW card's sliders,
+        // so leaving this line standing put the previous card's apply result
+        // over the new card's freshly read values.
+        ApplyResultText = string.Empty;
+        LastApplyFailed = false;
+
         Capabilities = _gpu?.Tuner.Capabilities ?? DemoCapabilities;
         OnPropertyChanged(nameof(Capabilities));
         OnPropertyChanged(nameof(CanTune));
@@ -185,13 +193,18 @@ public partial class TuningViewModel : ObservableObject
             return;
         }
 
-        var (core, mem, power, boost, lockMHz) = _gpu.Tuner.ReadCurrent();
+        var (core, mem, power, boost, _) = _gpu.Tuner.ReadCurrent();
         CoreOffset = core;
         MemOffset = mem;
         PowerLimit = power is > 0 ? power.Value : Capabilities.PowerLimitDefaultW;
         VoltageBoost = boost ?? 0;
-        LockEnabled = lockMHz is not null;
-        if (lockMHz is uint lc)
+        // The lock box reflects the lock Afterglow APPLIED, not ReadCurrent's
+        // observed element: on Arc a factory ceiling below the domain maximum
+        // reads as a lock there, and ticking the box with it made the next
+        // Apply write the ceiling back as a clamp with written provenance.
+        uint? appliedLock = _gpu.Tuner.AppliedLockMHz;
+        LockEnabled = appliedLock is not null;
+        if (appliedLock is uint lc)
         {
             LockClock = lc;
             _lockClockBeforeCoercion = null;
@@ -199,11 +212,18 @@ public partial class TuningViewModel : ObservableObject
         else if (!IsNvidiaOrDemo && Capabilities.MaxCoreClockMHz > 0 && LockClock > Capabilities.MaxCoreClockMHz)
         {
             // The default slider position (2500) can exceed an iGPU's whole
-            // range; start at the device's stock maximum instead — and
+            // range; start just below the device's stock maximum instead — and
             // remember the prior value so switching back to a GPU that can
             // hold it doesn't inherit the iGPU's ceiling.
+            //
+            // Just below, not at: a clamp AT the maximum is the unrestricted
+            // range, which the engine refuses as a no-op. Landing exactly there
+            // meant ticking "Lock clock" and pressing Apply without touching the
+            // slider always failed.
             _lockClockBeforeCoercion ??= LockClock;
-            LockClock = Capabilities.MaxCoreClockMHz;
+            LockClock = Math.Max(
+                Capabilities.LockClockMinMHz,
+                Capabilities.MaxCoreClockMHz - LockClockCeilingMarginMHz);
         }
         else if (_lockClockBeforeCoercion is double prior
             && (IsNvidiaOrDemo || Capabilities.MaxCoreClockMHz == 0 || prior <= Capabilities.MaxCoreClockMHz))
@@ -212,6 +232,14 @@ public partial class TuningViewModel : ObservableObject
             _lockClockBeforeCoercion = null;
         }
     }
+
+    /// <summary>
+    /// How far below the device maximum the lock slider is parked when the
+    /// current value exceeds the device's range. A clamp at the maximum is the
+    /// unrestricted range and is refused as a no-op, so the default position
+    /// must sit below it.
+    /// </summary>
+    private const uint LockClockCeilingMarginMHz = 50;
 
     private double? _lockClockBeforeCoercion;
 

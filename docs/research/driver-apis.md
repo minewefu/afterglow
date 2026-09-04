@@ -123,8 +123,11 @@ FunctionNotFound=-136. `NvAPI_ShortString` = char[64].
 - **V/F curve writes** (`SetClockBoostTable` / boost locks): not accepted on
   Blackwell (driver rejects; also reported by press covering NV-UV). Afterglow's
   shipping undervolt path is therefore lock-and-offset (documented NVML APIs).
-  The boost-table/VFP interfaces tabled above are recorded for a future,
-  pre-Blackwell-only per-point curve editor — that feature is **roadmap, not
+  The boost-table/VFP interfaces tabled above now back the shipped `vfpoints`
+  command and the app's V/F points panel (read, per-point offsets, and the
+  flatten undervolt), gated on the driver actually exposing them — which it does
+  on RTX 50 for the OFFSET path even though whole-table writes are refused. What
+  remains **roadmap, not
   shipped**, and would be capability-probed before ever being exposed.
 - **Voltage**: reference Blackwell exposes only NVIDIA's small core-voltage
   boost (~20 mV class); vendor-specific unlocks (MSI) go through PWM ICs that

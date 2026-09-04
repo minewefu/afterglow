@@ -725,7 +725,9 @@ public struct CtlPowerEnergyCounter
 /// </summary>
 internal static unsafe class IgclNative
 {
-    private const string Lib = "ControlLib.dll";
+    // The resolver pins this name to System32; a private copy here could drift
+    // from the resolver's and silently hand the load back to default probing.
+    private const string Lib = VendorLibraryResolver.IgclLib;
 
     // --- Lifecycle -----------------------------------------------------------
 

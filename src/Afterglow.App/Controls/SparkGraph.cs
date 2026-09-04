@@ -277,8 +277,14 @@ public sealed class SparkGraph : FrameworkElement
         double stepX = width / (capacity - 1);
 
         double MapY(double v) =>
-            height - ((Math.Clamp(double.IsNaN(v) ? min : v, min, max) - min) / (max - min) * (height - 2)) - 1;
+            height - ((Math.Clamp(v, min, max) - min) / (max - min) * (height - 2)) - 1;
 
+        // A missing sample is a gap in the line, not a reading at the bottom of
+        // the scale. Substituting `min` for NaN drew a solid, filled line pinned
+        // to the axis floor — on a card with no memory-junction sensor that was a
+        // convincing flat "25 °C" trace across the whole window, for a sensor
+        // that does not exist. The hover readout already said "—" for the same
+        // points, so the drawn line was the only surface that lied.
         void DrawSeries(IReadOnlyList<double> series, Pen pen, Brush fill)
         {
             int n = Math.Min(series.Count, capacity);
@@ -291,21 +297,75 @@ public sealed class SparkGraph : FrameworkElement
             double sx = width - ((n - 1) * stepX);
             var lineGeometry = new StreamGeometry();
             var fillGeometry = new StreamGeometry();
+            bool drewAnything = false;
             using (var line = lineGeometry.Open())
             using (var fill2 = fillGeometry.Open())
             {
-                var p0 = new Point(sx, MapY(series[off]));
-                line.BeginFigure(p0, false, false);
-                fill2.BeginFigure(new Point(p0.X, height), true, true);
-                fill2.LineTo(p0, false, false);
-                for (int i = 1; i < n; i++)
+                bool open = false;
+                var runStart = default(Point);
+                int runLength = 0;
+
+                // A figure with no segments strokes nothing — round caps do not
+                // change that — so an isolated valid sample between two dropped
+                // polls would vanish from the trace while the hover readout still
+                // showed its value. Closing a one-sample run with a zero-length
+                // segment gives the round cap something to draw: a dot.
+                void CloseRun(int lastIndex)
                 {
-                    var p = new Point(sx + (i * stepX), MapY(series[off + i]));
-                    line.LineTo(p, true, false);
-                    fill2.LineTo(p, false, false);
+                    if (!open)
+                    {
+                        return;
+                    }
+
+                    if (runLength == 1)
+                    {
+                        line.LineTo(runStart, true, false);
+                    }
+
+                    fill2.LineTo(new Point(sx + (lastIndex * stepX), height), false, false);
+                    open = false;
+                    runLength = 0;
                 }
 
-                fill2.LineTo(new Point(width, height), false, false);
+                for (int i = 0; i < n; i++)
+                {
+                    double value = series[off + i];
+                    if (double.IsNaN(value))
+                    {
+                        CloseRun(i - 1);
+                        continue;
+                    }
+
+                    var p = new Point(sx + (i * stepX), MapY(value));
+                    if (!open)
+                    {
+                        line.BeginFigure(p, false, false);
+                        fill2.BeginFigure(new Point(p.X, height), true, true);
+                        fill2.LineTo(p, false, false);
+                        open = true;
+                        drewAnything = true;
+                        runStart = p;
+                        runLength = 1;
+                    }
+                    else
+                    {
+                        line.LineTo(p, true, false);
+                        fill2.LineTo(p, false, false);
+                        runLength++;
+                    }
+
+                    if (i == n - 1)
+                    {
+                        CloseRun(i);
+                    }
+                }
+            }
+
+            // Every sample in the window was missing: draw nothing at all rather
+            // than an empty-looking baseline.
+            if (!drewAnything)
+            {
+                return;
             }
 
             lineGeometry.Freeze();
@@ -424,7 +484,7 @@ public sealed class SparkGraph : FrameworkElement
     {
         if (_linePen is null)
         {
-            _linePen = new Pen(Stroke, 1.6) { LineJoin = PenLineJoin.Round };
+            _linePen = new Pen(Stroke, 1.6) { LineJoin = PenLineJoin.Round, StartLineCap = PenLineCap.Round, EndLineCap = PenLineCap.Round };
             _linePen.Freeze();
         }
 
@@ -437,7 +497,7 @@ public sealed class SparkGraph : FrameworkElement
         {
             if (_linePen2 is null)
             {
-                _linePen2 = new Pen(stroke2, 1.6) { LineJoin = PenLineJoin.Round };
+                _linePen2 = new Pen(stroke2, 1.6) { LineJoin = PenLineJoin.Round, StartLineCap = PenLineCap.Round, EndLineCap = PenLineCap.Round };
                 _linePen2.Freeze();
             }
 

@@ -15,6 +15,13 @@ namespace Afterglow.App;
 public partial class App : Application
 {
     private AppServices? _services;
+
+    /// <summary>
+    /// --demo / --screenshot: a throwaway process that starts the services but
+    /// applies nothing to real hardware, and must not touch the applied-state
+    /// record the resident instance owns.
+    /// </summary>
+    private bool _ephemeralRun;
     private MainViewModel? _mainViewModel;
     private TrayService? _tray;
     private HotkeyService? _hotkeys;
@@ -61,6 +68,7 @@ public partial class App : Application
 
         bool demo = args.Contains("--demo");
         string? screenshotPath = GetArgValue(e.Args, "--screenshot");
+        _ephemeralRun = demo || screenshotPath is not null;
         string? page = GetArgValue(e.Args, "--page");
 
         // Single instance: two Afterglows would fight over fan control, hotkeys,
@@ -342,6 +350,22 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        // A process that never started the services has nothing to mark. WPF's
+        // Shutdown() still runs OnExit, so every early exit — the single-instance
+        // short-circuit, --register-startup, the self-elevation relaunch — used
+        // to rewrite the applied-state record to "clean". A second process
+        // launched while the real one is tuning would therefore erase the
+        // resident instance's pending record, and the next launch would show no
+        // banner for a card that is still tuned. The ACL on %ProgramData%\Afterglow
+        // blocks the unelevated case, but the installer's elevated post-install
+        // launch is not unelevated. (--demo and --screenshot DO start the
+        // services; they are excluded from the mark below via _ephemeralRun.)
+        if (_services is null)
+        {
+            base.OnExit(e);
+            return;
+        }
+
         _exitRequested = true;
         _tooltipTimer?.Stop();
         _hotkeys?.Dispose();
@@ -352,8 +376,44 @@ public partial class App : Application
         // path restores the offset the run started from. Applying writes a fresh
         // record with CleanShutdown = false, so restoring after MarkCleanShutdown
         // would fake a crash on the next launch.
+        // Ask the probe to stop BEFORE waiting on the stepper, as PanicReset
+        // does: its cancel is only a flag, and requesting it afterwards left a
+        // mid-sweep probe pinning the clock through the whole 15 s stepper wait.
+        _mainViewModel?.VfCurve.RequestProbeStop();
         _mainViewModel?.Stability.Dispose();
-        AppliedStateStore.MarkCleanShutdown();
+
+        // Same hazard, same window: the V/F probe pins the core clock at an
+        // EXACT frequency and undoes it only in its worker's finally block. That
+        // worker is a background thread, so exiting mid-probe used to kill it
+        // without restoring anything and leave the GPU pinned until reboot.
+        bool probeClockRestored = _mainViewModel?.VfCurve.CancelProbeAndWait(TimeSpan.FromSeconds(10)) ?? true;
+
+        // An elevated --screenshot run for the README, or a --demo session closed
+        // beside a tuning instance, reached this line with services started and
+        // rewrote the resident instance's record to "clean". Neither applies
+        // anything to real hardware, so neither has anything to mark.
+        if (!_ephemeralRun)
+        {
+            AppliedStateStore.MarkCleanShutdown();
+        }
+
+        // A probe whose restore failed has already persisted its own record,
+        // and MarkCleanShutdown leaves probe-lock records unclean, so the App
+        // composes nothing here. The one case the probe cannot record for
+        // itself is a join that timed out with the worker still unwinding: the
+        // card it was pinning leaves this session at an exact frequency with
+        // nothing on file, so record THAT card — whatever an earlier probe on
+        // another card left behind is already the store's.
+        if (!probeClockRestored && !_ephemeralRun &&
+            _mainViewModel?.VfCurve is { } vfCurve &&
+            vfCurve.ActiveProbeKey is { } active &&
+            !vfCurve.ActiveProbeClockSettled) // a worker past its restore has already written the truth
+        {
+            Core.Diagnostics.Log.Warn(
+                "The V/F probe was still unwinding at shutdown; recording the card it was pinning as unclean " +
+                "so the next launch warns that the GPU may still be clock-locked.");
+            AppliedStateStore.RecordProbeLockPending(active);
+        }
         _services?.Dispose();
         _activationSignal?.Dispose();
         _singleInstanceMutex?.Dispose();

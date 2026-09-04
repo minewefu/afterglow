@@ -130,5 +130,7 @@ that voltage.
 - `nvmlDeviceSetMemoryLockedClocks` is intentionally never used: on Blackwell it acts as a
   global performance cap (documented upstream in LACT issue #1128). Memory tuning is
   offset-only.
-- Per-point V/F curve writes (`SetClockBoostTable`) are rejected by the driver on RTX 50;
-  undervolting uses the supported clock-lock + offset method.
+- Whole-table V/F curve writes (`SetClockBoostTable`) are rejected by the driver on RTX 50.
+  The per-point OFFSET interface is accepted and is what the shipped `vfpoints` command and
+  the app's V/F points panel use, every write verified by reading the table back (see §5).
+  The profile-level undervolt path remains the supported clock-lock + offset method.

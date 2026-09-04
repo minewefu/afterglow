@@ -26,8 +26,28 @@ internal static class Program
             "vfpoints" => VfPointsCommand.Run(args),
             "mcp" => McpCommand.Run(args),
             "help" or "--help" or "-h" => Help(),
+            "version" or "--version" or "-v" => Version(),
             _ => Fail($"Unknown command '{command}'. Run 'afterglow-cli help'."),
         };
+    }
+
+    /// <summary>
+    /// The informational version carries the full semantic version and commit
+    /// (e.g. "1.3.0-beta.1+5bd7901…"); the assembly version alone drops the
+    /// prerelease tag, which is exactly what a bug report needs to include.
+    /// </summary>
+    private static int Version()
+    {
+        var assembly = typeof(Program).Assembly;
+        string version = assembly
+            .GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+            .OfType<System.Reflection.AssemblyInformationalVersionAttribute>()
+            .FirstOrDefault()?.InformationalVersion
+            ?? assembly.GetName().Version?.ToString(3)
+            ?? "unknown";
+
+        Console.WriteLine($"afterglow-cli {version}");
+        return 0;
     }
 
     private static int Help()
@@ -38,7 +58,7 @@ internal static class Program
             Commands:
               selftest                      Probe the GPU and report per-capability support.
               monitor [--interval ms]       Live sensor readout (Ctrl+C to stop).
-                      [--csv file] [--once]
+                      [--csv file] [--once] [--gpu N]
               caps [--gpu N]                Show driver-reported tuning ranges.
               get [--gpu N]                 Show currently applied offsets/limits.
               set [--gpu N] [options]       Apply tuning (requires administrator):
@@ -66,10 +86,11 @@ internal static class Program
                                             agents can monitor, tune, and stability-test the
                                             GPU with typed tools (run elevated for writes).
                                             --gpu binds the whole server to one card.
+              version                       Print the version and exit.
               help                          Show this help.
 
             On multi-GPU systems, --gpu binds stress/VRAM work to that card's exact
-            D3D adapter (matched by PCI bus, never by adapter order).
+            D3D adapter (matched by PCI vendor id and bus, never by adapter order).
 
             caps, get, and monitor --once accept --json for machine-readable output.
             """);

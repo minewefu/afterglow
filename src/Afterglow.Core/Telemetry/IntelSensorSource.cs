@@ -8,7 +8,9 @@ namespace Afterglow.Core.Telemetry;
 /// already renders. Power and utilization only exist as deltas between two
 /// monotonic counters, so the first poll after start reports them as null.
 /// Component handles are enumerated once in the constructor (IGCL handles stay
-/// valid for the API's lifetime) and Poll runs only on the telemetry thread.
+/// valid for the API's lifetime). <see cref="Poll"/> is called from more than
+/// one thread — the telemetry loop, the V/F probe's sampler, and the CLI/MCP
+/// priming paths — so the counter state the deltas are computed from is guarded.
 /// </summary>
 public sealed class IntelSensorSource : ISensorSource
 {
@@ -20,6 +22,7 @@ public sealed class IntelSensorSource : ISensorSource
     private readonly bool _memoryIsShared;
     private readonly IReadOnlyList<(nint Handle, CtlTempSensor Type)> _tempSensors;
 
+    private readonly object _deltaLock = new();
     private CtlPowerTelemetry _last;
     private bool _hasLast;
 
@@ -88,23 +91,32 @@ public sealed class IntelSensorSource : ISensorSource
                 energyWh = t.GpuEnergyCounter.AsDouble() / 3600.0;
             }
 
-            if (_hasLast && t.TimeStamp.Supported != 0 && _last.TimeStamp.Supported != 0)
+            // The previous sample is a multi-word struct read and written by
+            // whichever threads call Poll — the telemetry loop, the V/F probe's
+            // sampler, and the CLI/MCP priming paths all do. Unsynchronized,
+            // one caller could read a half-updated counter pair and compute a
+            // nonsense delta, which the guards below turn into a fabricated
+            // 0 W / 0 % rather than an honest "—". Deltas are cheap; take the lock.
+            lock (_deltaLock)
             {
-                // After a long gap (system sleep, driver outage) the delta is a
-                // true average over the whole gap but would be recorded as one
-                // instantaneous tick — misleading in every graph and log. Treat
-                // such a sample as a re-prime instead: 30 s is 3× the longest
-                // poll interval TelemetryService allows.
-                double dt = t.TimeStamp.AsDouble() - _last.TimeStamp.AsDouble();
-                if (dt <= 30.0)
+                if (_hasLast && t.TimeStamp.Supported != 0 && _last.TimeStamp.Supported != 0)
                 {
-                    powerW = PowerFromEnergyCounters(_last.GpuEnergyCounter, t.GpuEnergyCounter, dt);
-                    gpuUtil = UtilFromActivityCounters(_last.GlobalActivityCounter, t.GlobalActivityCounter, dt);
+                    // After a long gap (system sleep, driver outage) the delta is a
+                    // true average over the whole gap but would be recorded as one
+                    // instantaneous tick — misleading in every graph and log. Treat
+                    // such a sample as a re-prime instead: 30 s is 3× the longest
+                    // poll interval TelemetryService allows.
+                    double dt = t.TimeStamp.AsDouble() - _last.TimeStamp.AsDouble();
+                    if (dt <= 30.0)
+                    {
+                        powerW = PowerFromEnergyCounters(_last.GpuEnergyCounter, t.GpuEnergyCounter, dt);
+                        gpuUtil = UtilFromActivityCounters(_last.GlobalActivityCounter, t.GlobalActivityCounter, dt);
+                    }
                 }
-            }
 
-            _last = t;
-            _hasLast = true;
+                _last = t;
+                _hasLast = true;
+            }
         }
 
         double? coreVoltageMv = null;

@@ -80,8 +80,7 @@ public sealed class AppServices : IDisposable
     }
 
     /// <summary>Settings key for one GPU's fan configuration.</summary>
-    public static string FanKeyFor(GpuContext gpu) =>
-        gpu.Uuid ?? string.Create(System.Globalization.CultureInfo.InvariantCulture, $"index:{gpu.Index}");
+    public static string FanKeyFor(GpuContext gpu) => gpu.StableKey;
 
     /// <summary>
     /// The persisted fan configuration for one GPU: its own entry when present,
@@ -210,6 +209,8 @@ public sealed class AppServices : IDisposable
             var curveRecorder = new Core.Tuning.VfCurveRecorder
             {
                 DeviceIndex = gpu.Index,
+                GpuUuid = gpu.Uuid,
+                VendorId = gpu.PciVendorId,
                 PersistPath = Core.Tuning.VfCurveRecorder.PathFor(
                     gpu.Uuid, isPrimary: gpu.Index == manager.Gpus[0].Index),
             };
@@ -245,12 +246,36 @@ public sealed class AppServices : IDisposable
 
             try
             {
-                // A machine crash ends every stream at once; the first stream
-                // with findings names the report (primary checked first).
+                // A machine crash ends every stream at once, so EVERY card's log
+                // has to be read. Stopping at the first non-null result always
+                // picked the primary (it is iterated first) and reported ITS
+                // offsets and load state — so a stock, idle primary produced
+                // "not an overclocking failure" while the secondary card died at
+                // +250 MHz under load, its log then rotated away unexamined.
+                // Prefer the card that was actually tuned at the time of death.
+                Core.Diagnostics.CrashReport? bestReport = null;
+
+                // Every card's stream ended at the same crash, so one System-log
+                // walk serves all of them; without the scope each card paid for
+                // its own, synchronously, before the main window existed.
+                using var sharedEvidence = Core.Diagnostics.CrashForensics.ShareSystemLogQueries();
                 foreach (var gpu in manager.Gpus)
                 {
-                    crashReport ??= Core.Diagnostics.CrashForensics.AnalyzePreviousSession(FlightDirFor(gpu));
+                    var report = Core.Diagnostics.CrashForensics.AnalyzePreviousSession(
+                        FlightDirFor(gpu),
+                        string.Create(System.Globalization.CultureInfo.InvariantCulture, $"GPU {gpu.Index} — {gpu.Name}"));
+                    if (report is null)
+                    {
+                        continue;
+                    }
+
+                    report = report with { GpuIndex = gpu.Index, GpuName = gpu.Name };
+                    bestReport = bestReport is null || (report.TuningApplied && !bestReport.TuningApplied)
+                        ? report
+                        : bestReport;
                 }
+
+                crashReport ??= bestReport;
 
                 foreach (var gpu in manager.Gpus)
                 {
@@ -337,14 +362,21 @@ public sealed class AppServices : IDisposable
 
         GameWatcher.Dispose();
         TdrWatchdog.Dispose();
+
+        // Telemetry FIRST. Its SnapshotTaken subscription drives the fan curve,
+        // and stopping the fans while snapshots are still arriving let one land
+        // after the release and command the fans again — leaving the card on
+        // manual fans after exit. FrameMetrics is disposed here too because its
+        // teardown waits on PresentMon for up to two seconds, which used to sit
+        // between the fan release and the poller still feeding it.
+        FrameMetrics.Dispose();
+        ActiveCsvLogger?.Dispose();
+        Telemetry.Dispose();
+
         foreach (var fans in FanControl.Values)
         {
             fans.Dispose();
         }
-
-        FrameMetrics.Dispose();
-        ActiveCsvLogger?.Dispose();
-        Telemetry.Dispose();
         foreach (var flightRecorder in Flights.Values)
         {
             flightRecorder.Dispose();

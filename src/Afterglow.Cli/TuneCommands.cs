@@ -16,6 +16,12 @@ internal static class TuneCommands
 
     public static int Caps(string[] args)
     {
+        if (CliArgs.Validate(args, "caps") is string argError)
+        {
+            Console.Error.WriteLine(argError);
+            return 2;
+        }
+
         using var manager = new GpuManager();
         if (SelectGpu(manager, args) is not { } gpu)
         {
@@ -55,6 +61,12 @@ internal static class TuneCommands
 
     public static int Get(string[] args)
     {
+        if (CliArgs.Validate(args, "get") is string argError)
+        {
+            Console.Error.WriteLine(argError);
+            return 2;
+        }
+
         using var manager = new GpuManager();
         if (SelectGpu(manager, args) is not { } gpu)
         {
@@ -62,14 +74,22 @@ internal static class TuneCommands
         }
 
         var (core, mem, power, boost, lockMHz) = gpu.Tuner.ReadCurrent();
+        var caps = gpu.Tuner.Capabilities;
+
+        // A knob this device does not expose has no "current value": printing 0
+        // there is the same fabrication the power-limit slot was made nullable
+        // to avoid, and it directly contradicts what `caps` says one line over.
+        // NVIDIA supports both offsets, so its output is unchanged.
+        int? coreOffset = caps.SupportsCoreOffset ? core : null;
+        int? memOffset = caps.SupportsMemOffset ? mem : null;
 
         if (args.Contains("--json"))
         {
             Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(new
             {
                 gpu = gpu.Name,
-                core_offset_mhz = core,
-                mem_offset_mhz = mem,
+                core_offset_mhz = coreOffset,
+                mem_offset_mhz = memOffset,
                 power_limit_w = power,
                 voltage_boost_pct = boost,
                 lock_clock_mhz = lockMHz,
@@ -78,8 +98,8 @@ internal static class TuneCommands
         }
 
         Console.WriteLine($"{gpu.Name} (GPU {gpu.Index}) — current applied state:");
-        Console.WriteLine($"  Core offset     {core} MHz");
-        Console.WriteLine($"  Memory offset   {mem} MHz");
+        Console.WriteLine($"  Core offset     {(coreOffset is int co ? $"{co} MHz" : "not supported")}");
+        Console.WriteLine($"  Memory offset   {(memOffset is int mo ? $"{mo} MHz" : "not supported")}");
         Console.WriteLine($"  Power limit     {(power is double p ? $"{p:F0} W" : "not supported")}");
         if (boost is uint b)
         {
@@ -104,6 +124,15 @@ internal static class TuneCommands
         uint? lockClock = null, voltageBoost = null, tempLimit = null;
         bool unlock = false;
         string? fan = null;
+
+        // Declared in CliArgs.Options like every other command, so the option
+        // surface is covered by the contract test and a missing value is
+        // reported by the shared checker rather than a hand-typed copy of it.
+        if (CliArgs.Validate(args, "set") is string argError)
+        {
+            Console.Error.WriteLine(argError);
+            return 2;
+        }
 
         for (int i = 1; i < args.Length; i++)
         {
@@ -144,7 +173,7 @@ internal static class TuneCommands
                     i++;
                     break;
                 case "--gpu":
-                    i++;
+                    i++; // value checked by CliArgs.Validate / CliGpu.TryParseIndex
                     break;
                 default:
                     Console.Error.WriteLine($"Unknown or malformed option '{arg}'.");
@@ -172,25 +201,63 @@ internal static class TuneCommands
             MemOffsetMHz = memOffset ?? current.MemOffsetMHz,
             PowerLimitW = powerLimit,
             TempLimitC = tempLimit,
-            // An unspecified --lock-clock preserves the currently tracked lock.
-            LockedCoreClockMHz = unlock ? null : (lockClock ?? current.LockedCoreClockMHz),
+            // An unspecified --lock-clock preserves the lock Afterglow APPLIED —
+            // not ReadCurrent's element, which on Arc is a driver observation:
+            // carrying a factory ceiling forward wrote it as a clamp with
+            // written provenance that no release could ever adopt again.
+            LockedCoreClockMHz = unlock ? null : (lockClock ?? gpu.Tuner.AppliedLockMHz),
             VoltageBoostPct = voltageBoost,
         };
 
-        var result = gpu.Tuner.Apply(profile);
-        bool allOk = result.AllSucceeded;
-        foreach (var knob in result.Results)
-        {
-            Console.WriteLine($"  {(knob.Applied ? "ok  " : "FAIL")} {knob.Knob,-18} {knob.Detail}");
-        }
-
-        // Explicit `--lock-clock off` always issues the driver release, even when no
-        // lock is tracked (one can outlive a crashed session until reboot).
+        // An explicit `--lock-clock off` is a direct instruction, so issue the
+        // driver release FIRST — including for a clamp this session did not
+        // apply, which Apply deliberately declines to touch and reports as a
+        // failure. Running it afterwards printed that refusal and then the
+        // successful release for one user-requested operation, and exited 1 on a
+        // release that worked. Releasing first also leaves nothing for Apply's
+        // lock-less path to find, so it stays quiet.
+        bool alreadyReleased = false;
+        KnobResult? refusedRelease = null;
         if (unlock)
         {
-            var knob = gpu.Tuner.ForceUnlock();
+            var unlockKnob = gpu.Tuner.ForceUnlock();
+            if (unlockKnob.Applied)
+            {
+                Console.WriteLine($"  ok   {unlockKnob.Knob,-18} {unlockKnob.Detail}");
+                alreadyReleased = true;
+            }
+            else
+            {
+                // A refused release leaves the clamp tracked, so Apply's
+                // lock-less path retries it below; its knob line is the one
+                // verdict. Printing this refusal too gave two FAIL lines — or a
+                // FAIL followed by "ok … released (verified)" and exit 1.
+                refusedRelease = unlockKnob;
+            }
+        }
+
+        var result = gpu.Tuner.Apply(profile);
+        bool applyReleased = result.Results.Any(k => k.Knob == "clock lock" && k.Applied);
+        if (refusedRelease is { } refused && !result.Results.Any(k => k.Knob == "clock lock"))
+        {
+            // Apply found nothing to retry (nothing tracked), so the explicit
+            // refusal is the only account of the release.
+            Console.WriteLine($"  FAIL {refused.Knob,-18} {refused.Detail}");
+        }
+
+        bool allOk = result.AllSucceeded && (!unlock || alreadyReleased || applyReleased);
+        foreach (var knob in result.Results)
+        {
+            // A bare `--lock-clock off` carries no other knob, so the engine's
+            // "nothing in this profile applies" note is expected here and would
+            // read as though the release had not happened. It still counts
+            // toward the result; it just is not news worth printing.
+            if (unlock && knob.Applied && knob.Knob == "profile")
+            {
+                continue;
+            }
+
             Console.WriteLine($"  {(knob.Applied ? "ok  " : "FAIL")} {knob.Knob,-18} {knob.Detail}");
-            allOk &= knob.Applied;
         }
 
         // Fans are commanded directly (not part of profile apply).
@@ -251,14 +318,15 @@ internal static class TuneCommands
             return null;
         }
 
-        uint index = 0;
-        for (int i = 1; i < args.Length - 1; i++)
+        // Same rule as everywhere else: an unusable --gpu is an error, not a
+        // silent write to GPU 0. This is the tuning-write path.
+        if (!CliGpu.TryParseIndex(args, out uint? parsedIndex, out string? gpuArgError))
         {
-            if (args[i] == "--gpu" && uint.TryParse(args[i + 1], out uint g))
-            {
-                index = g;
-            }
+            Console.Error.WriteLine(gpuArgError);
+            return null;
         }
+
+        uint index = parsedIndex ?? 0;
 
         var gpu = manager.Gpus.FirstOrDefault(g => g.Index == index);
         if (gpu is null)

@@ -174,12 +174,18 @@ public sealed class SensorPoller : ISensorSource
         {
             fanPercents = new uint[_fanCount];
             bool any = false;
+            var lastRc = NvmlReturn.Unknown;
             for (uint f = 0; f < _fanCount; f++)
             {
-                if (_device.TryGetFanSpeed(f, out uint pct) == NvmlReturn.Success)
+                var rc = _device.TryGetFanSpeed(f, out uint pct);
+                if (rc == NvmlReturn.Success)
                 {
                     fanPercents[f] = pct;
                     any = true;
+                }
+                else
+                {
+                    lastRc = rc;
                 }
             }
 
@@ -189,7 +195,13 @@ public sealed class SensorPoller : ISensorSource
             }
             else
             {
-                _fans = Cap.Unsupported;
+                // Latch "unsupported" only on a return code that MEANS
+                // unsupported — the same rule every other sensor here follows.
+                // Latching on any failure meant one GpuIsLost tick after a TDR
+                // permanently marked this GPU fanless for the process, so the
+                // FANS tile froze on its pre-crash reading beside a live "%"
+                // while every other tile honestly read "—".
+                MarkIfUnsupported(ref _fans, lastRc);
                 fanPercents = null;
             }
         }

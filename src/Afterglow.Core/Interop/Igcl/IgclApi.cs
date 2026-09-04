@@ -31,6 +31,8 @@ public sealed class IgclApi : IDisposable
     /// </summary>
     public static IgclApi? TryCreate(out CtlResult status)
     {
+        Afterglow.Core.Interop.VendorLibraryResolver.EnsureInstalled();
+
         var args = new CtlInitArgs
         {
             Size = (uint)Unsafe.SizeOf<CtlInitArgs>(),
@@ -113,7 +115,8 @@ public sealed class IgclDevice
 {
     private readonly nint _handle;
 
-    private IgclDevice(nint handle, uint index, in CtlDeviceAdapterProperties properties, ulong luid, string name)
+    private IgclDevice(
+        nint handle, uint index, in CtlDeviceAdapterProperties properties, ulong luid, string name, bool bdfValid)
     {
         _handle = handle;
         Index = index;
@@ -122,6 +125,7 @@ public sealed class IgclDevice
         PciDeviceId = properties.PciDeviceId;
         DriverVersionRaw = properties.DriverVersion;
         Bdf = properties.AdapterBdf;
+        BdfValid = bdfValid;
         IsIntegrated = (properties.GraphicsAdapterProperties & CtlDeviceAdapterProperties.FlagIntegrated) != 0;
         Luid = luid;
     }
@@ -140,6 +144,14 @@ public sealed class IgclDevice
 
     /// <summary>PCI bus/device/function as reported in the adapter properties.</summary>
     public CtlAdapterBdf Bdf { get; }
+
+    /// <summary>
+    /// True when <see cref="Bdf"/> came from the Version 2 properties block that
+    /// actually carries it. False after the Version 0 fallback, where the field
+    /// stays zero and is indistinguishable from a genuine 00:00.0 — callers must
+    /// not use the location for identity or adapter binding when this is false.
+    /// </summary>
+    public bool BdfValid { get; }
 
     public bool IsIntegrated { get; }
 
@@ -167,11 +179,19 @@ public sealed class IgclDevice
         };
 
         CtlResult rc;
+
+        // Only the Version 2 properties block carries AdapterBdf. When the
+        // runtime rejects it and we fall back to Version 0, the BDF stays zero —
+        // which is a real PCI location (00:00.0), so callers could not tell
+        // "not reported" from "genuinely on bus 0" and were publishing a
+        // fabricated location as the card's identity and stress-binding key.
+        bool bdfValid = true;
         try
         {
             rc = IgclNative.ctlGetDeviceProperties(handle, ref properties);
             if (rc == CtlResult.ErrorUnsupportedVersion)
             {
+                bdfValid = false;
                 properties.Version = 0;
                 rc = IgclNative.ctlGetDeviceProperties(handle, ref properties);
             }
@@ -187,7 +207,14 @@ public sealed class IgclDevice
         }
 
         string name = FromAnsi(properties.Name, 100);
-        return new IgclDevice(handle, index, in properties, luid, name);
+        if (!bdfValid)
+        {
+            Afterglow.Core.Diagnostics.Log.Warn(
+                $"IGCL runtime rejected the Version 2 adapter properties for {name}; " +
+                "its PCI location is unknown and will not be used for identity or stress binding.");
+        }
+
+        return new IgclDevice(handle, index, in properties, luid, name, bdfValid);
     }
 
     private static CtlResult Guard(Func<CtlResult> call)
@@ -544,9 +571,16 @@ public sealed class IgclDevice
     }
 
     /// <summary>
-    /// Signs the driver's overclocking waiver for this session. Afterglow calls
-    /// this only after the user has accepted the in-app warning - the driver
-    /// refuses most overclock writes until it is set.
+    /// Signs the driver's overclocking waiver for this session; the driver
+    /// refuses overclock-block writes with
+    /// <see cref="CtlResult.ErrorCoreOverclockWaiverNotSet"/> until it is set.
+    /// <para>
+    /// <see cref="Afterglow.Core.Tuning.ArcGpuTuner"/> signs it lazily, immediately
+    /// before the first overclock write it makes - always an explicit,
+    /// elevation-gated change the user asked for - and never while probing, so a
+    /// read-only session signs nothing. The frequency clamp is a frequency-domain
+    /// call, needs no waiver, and does not go through here.
+    /// </para>
     /// </summary>
     public CtlResult TrySetOverclockWaiver() =>
         Guard(() => IgclNative.ctlOverclockWaiverSet(_handle));

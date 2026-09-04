@@ -18,6 +18,12 @@ internal static class VfPointsCommand
 {
     public static int Run(string[] args)
     {
+        if (CliArgs.Validate(args, "vfpoints") is string argError)
+        {
+            Console.Error.WriteLine(argError);
+            return 2;
+        }
+
         using var manager = new GpuManager();
         if (manager.Gpus.Count == 0)
         {
@@ -25,7 +31,12 @@ internal static class VfPointsCommand
             return 1;
         }
 
-        uint gpuIndex = CliGpu.ParseIndex(args) ?? manager.Gpus[0].Index;
+        if (!CliGpu.TryIndexOrFirst(args, manager.Gpus[0].Index, out uint gpuIndex, out string? gpuArgError))
+        {
+            Console.Error.WriteLine(gpuArgError);
+            return 2;
+        }
+
         var gpu = manager.Gpus.FirstOrDefault(g => g.Index == gpuIndex);
         if (gpu is null)
         {

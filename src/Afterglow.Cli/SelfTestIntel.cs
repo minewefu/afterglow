@@ -40,12 +40,18 @@ internal static class SelfTestIntel
         Console.WriteLine();
         Console.WriteLine($"--- Intel GPU {d.Index}: {d.Name} ---");
         Console.WriteLine($"  PCI ids:     0x{d.PciVendorId:X4}:0x{d.PciDeviceId:X4}{(d.IsIntegrated ? " (integrated)" : " (discrete)")}");
-        Console.WriteLine($"  BDF:         {d.Bdf.Bus:x2}:{d.Bdf.Device:x2}.{d.Bdf.Function}");
+        // The other three consumers already gate on BdfValid; without it selftest
+        // printed a fabricated "00:00.0" as measured fact on a runtime that
+        // rejects the Version 2 properties block — the same condition on which
+        // `stress --gpu N` refuses to run.
+        Console.WriteLine(d.BdfValid
+            ? $"  BDF:         {d.Bdf.Bus:x2}:{d.Bdf.Device:x2}.{d.Bdf.Function}"
+            : "  BDF:         — (the driver did not report a PCI location)");
         Console.WriteLine($"  Driver:      {d.DriverVersion}");
         Console.WriteLine($"  LUID:        0x{d.Luid:X}");
 
         ReportCtl("PCI properties", d.TryGetPciProperties(out var pci),
-            $"gen{pci.MaxSpeed.Gen} x{pci.MaxSpeed.Width}, ReBAR {(pci.ResizableBarEnabled != 0 ? "on" : "off")}");
+            $"gen{Known(pci.MaxSpeed.Gen)} x{Known(pci.MaxSpeed.Width)}, ReBAR {(pci.ResizableBarEnabled != 0 ? "on" : "off")}");
 
         DumpIgclTelemetry(d);
         DumpIgclComponents(d);
@@ -141,10 +147,15 @@ internal static class SelfTestIntel
         foreach (var (handle, props) in modules)
         {
             string location = props.Location == CtlMemLocation.Device ? "DEDICATED (device)" : "SHARED (system)";
-            Console.WriteLine($"    {location}, type {props.Type}, bus {props.BusWidth}-bit x{props.NumChannels}, physical {Gib(props.PhysicalSize)}");
+            Console.WriteLine($"    {location}, type {Known(props.Type)}, bus {Known(props.BusWidth)}-bit x{Known(props.NumChannels)}, physical {KnownGib(props.PhysicalSize)}");
             if (IgclDevice.TryGetMemoryState(handle, out var state) == CtlResult.Success)
             {
-                Console.WriteLine($"      used {Gib(state.Total - state.Free)} / {Gib(state.Total)}");
+                // Free can exceed Total when the driver reports the pair
+                // inconsistently; unsigned subtraction then underflowed into a
+                // 16-exabyte "used" figure printed as fact.
+                Console.WriteLine(state.Free <= state.Total
+                    ? $"      used {Gib(state.Total - state.Free)} / {Gib(state.Total)}"
+                    : $"      used — / {Gib(state.Total)} (driver reported free > total)");
             }
 
             var bwRc = IgclDevice.TryGetMemoryBandwidth(handle, out var bw);
@@ -186,7 +197,7 @@ internal static class SelfTestIntel
             string reading = rcRpm == CtlResult.Success
                 ? (rpm >= 0 ? $"{rpm} RPM" : "unmeasurable (-1)")
                 : $"[{rcRpm}]";
-            Console.WriteLine($"    canControl={props.CanControl != 0}, maxRPM={props.MaxRpm}, tablePoints={props.MaxPoints}, now {reading}");
+            Console.WriteLine($"    canControl={props.CanControl != 0}, maxRPM={Known(props.MaxRpm)}, tablePoints={Known(props.MaxPoints)}, now {reading}");
         }
 
         var powerDomains = d.GetPowerDomains();
@@ -199,10 +210,18 @@ internal static class SelfTestIntel
             if (rcE == CtlResult.Success)
             {
                 Thread.Sleep(100);
-                if (IgclDevice.TryGetEnergyCounter(handle, out var e2) == CtlResult.Success && e2.TimestampUs > e1.TimestampUs)
+                // Both fields are unsigned: a counter that wrapped or reset
+                // between the two reads underflows to an astronomical delta and
+                // prints it as a real wattage. Require it to have advanced.
+                if (IgclDevice.TryGetEnergyCounter(handle, out var e2) == CtlResult.Success
+                    && e2.TimestampUs > e1.TimestampUs && e2.EnergyUj >= e1.EnergyUj)
                 {
                     double watts = (e2.EnergyUj - e1.EnergyUj) / (double)(e2.TimestampUs - e1.TimestampUs);
                     Console.WriteLine($"      energy counter -> {watts:F1} W");
+                }
+                else if (rcE == CtlResult.Success)
+                {
+                    Console.WriteLine("      energy counter -> did not advance between reads (no reading)");
                 }
             }
             else
@@ -344,10 +363,15 @@ internal static class SelfTestIntel
         foreach (var (handle, props) in modules)
         {
             string location = props.Location == ZesMemLocation.Device ? "DEDICATED (device)" : "SHARED (system)";
-            Console.WriteLine($"    {location}, type {props.Type}, bus {props.BusWidth}-bit x{props.NumChannels}, physical {Gib(props.PhysicalSize)}");
+            Console.WriteLine($"    {location}, type {Known(props.Type)}, bus {Known(props.BusWidth)}-bit x{Known(props.NumChannels)}, physical {KnownGib(props.PhysicalSize)}");
             if (ZesDevice.TryGetMemoryState(handle, out var state) == ZeResult.Success)
             {
-                Console.WriteLine($"      used {Gib(state.Total - state.Free)} / {Gib(state.Total)}");
+                // Free can exceed Total when the driver reports the pair
+                // inconsistently; unsigned subtraction then underflowed into a
+                // 16-exabyte "used" figure printed as fact.
+                Console.WriteLine(state.Free <= state.Total
+                    ? $"      used {Gib(state.Total - state.Free)} / {Gib(state.Total)}"
+                    : $"      used — / {Gib(state.Total)} (driver reported free > total)");
             }
 
             var bwRc = ZesDevice.TryGetMemoryBandwidth(handle, out var bw);
@@ -474,4 +498,20 @@ internal static class SelfTestIntel
     private static string Mw(int milliwatts) => milliwatts < 0 ? "n/a" : $"{milliwatts / 1000.0:F1} W";
 
     private static string Gib(ulong bytes) => $"{bytes / 1024.0 / 1024.0 / 1024.0:F1} GiB";
+
+    /// <summary>Physical size, where the header documents 0 as "unknown".</summary>
+    private static string KnownGib(ulong bytes) => bytes == 0 ? "—" : Gib(bytes);
+
+    /// <summary>
+    /// A driver field that carries "unknown" as a sentinel, rendered as "—".
+    /// IGCL and Sysman use -1 for unknown widths/lanes/generations, and Sysman's
+    /// memory type reports int.MaxValue for unknown. Printing them raw produced
+    /// "gen-1 x-1", "bus -1-bit x-1" and "type 2147483647" — sentinels dressed
+    /// up as measurements, in the one command whose entire purpose is reporting
+    /// truthfully what a device does and does not expose.
+    /// </summary>
+    private static string Known(int value) =>
+        value < 0 || value == int.MaxValue
+            ? "—"
+            : value.ToString(System.Globalization.CultureInfo.InvariantCulture);
 }

@@ -15,7 +15,11 @@ public sealed record VramProgress(
     int Rounds,
     long ErrorCount,
     double GiBPerSecond,
-    string? Detail);
+    string? Detail)
+{
+    /// <summary>Twin of <see cref="StressProgress.IsHardwareVerdict"/>: the test ran and the card misbehaved.</summary>
+    public bool IsHardwareVerdict => State is StressState.ArtifactDetected or StressState.DeviceLost;
+}
 
 /// <summary>
 /// Full-capacity VRAM test: allocates as much of the card's memory budget as
@@ -104,6 +108,21 @@ public sealed class VramTest : IDisposable
 
     /// <summary>PCI vendor of the card being tuned (defaults to NVIDIA).</summary>
     public uint TargetVendorId { get; set; } = StressAdapter.NvidiaVendorId;
+
+    /// <summary>
+    /// Permit running on an adapter that could only be GUESSED (no PCI bus to
+    /// bind to and more than one candidate of the vendor).
+    /// <para>
+    /// Defaults to false — refusing — because almost every caller attributes the
+    /// result to a specific card. The safe behaviour has to be the default: as
+    /// an opt-IN it was set on the certifier and forgotten on the MCP engine and
+    /// the Stability page, which is how an agent could still be handed
+    /// stable:true for a card the run never bound to. Only a deliberately
+    /// unbound exploratory run — CLI `vram` with no --gpu, where the historical
+    /// largest-VRAM fallback is the documented behaviour — sets this true.
+    /// </para>
+    /// </summary>
+    public bool AllowUnboundGuess { get; set; }
 
     public event Action<VramProgress>? ProgressChanged;
 
@@ -232,10 +251,15 @@ public sealed class VramTest : IDisposable
 
     public void Stop() => _stop = true;
 
-    public void StopAndWait(TimeSpan timeout)
+    /// <summary>
+    /// Blocks until the worker has finished. Returns false when it was STILL
+    /// RUNNING at the timeout: the run was abandoned, so <see cref="Progress"/>
+    /// is a stale mid-run snapshot and must never be read as a clean pass.
+    /// </summary>
+    public bool StopAndWait(TimeSpan timeout)
     {
         _stop = true;
-        _thread?.Join(timeout);
+        return _thread?.Join(timeout) ?? true;
     }
 
     private void Report(
@@ -268,6 +292,14 @@ public sealed class VramTest : IDisposable
                     adapterName.Length > 0
                         ? $"Adapter binding failed: {adapterName}"
                         : $"No {StressAdapter.VendorName(TargetVendorId)} adapter found — refusing to run the VRAM test on a different GPU.");
+                return;
+            }
+
+            if (!AllowUnboundGuess && StressAdapter.IsUnboundGuess(adapterName))
+            {
+                Report(StressState.Failed, stopwatch.Elapsed, 0, 0, 0, 0, 0,
+                    $"Cannot tell which card this would test ({adapterName}) — refusing, because the " +
+                    "result would be attributed to a specific GPU.");
                 return;
             }
 
@@ -423,10 +455,13 @@ public sealed class VramTest : IDisposable
                                 $"round {rounds + 1}, chunk {i + 1}/{buffers.Count}");
                         }
 
-                        if (_stop)
-                        {
-                            break;
-                        }
+                        // Deliberately NOT breaking on _stop before the readback:
+                        // the verify dispatches that did run have already counted
+                        // any mismatches into the error buffer, and leaving the
+                        // round here threw those away — a stopped run reported
+                        // "0 errors" while the GPU had in fact just recorded some.
+                        // Errors already found are reported whether or not the
+                        // round completed; the stop is honoured right after.
 
                         // One tiny readback per round: the error counter.
                         context.CopyResource(errStaging, errBuffer);
@@ -469,6 +504,13 @@ public sealed class VramTest : IDisposable
                                       $"(first at element {firstIndex} of the failing chunk) — memory errors at the " +
                                       "current memory clock/offset. Lower the memory offset.");
                             return;
+                        }
+
+                        // Only a fully verified pass counts as a round; a stop
+                        // partway through leaves the sweep incomplete.
+                        if (_stop)
+                        {
+                            break;
                         }
 
                         rounds++;

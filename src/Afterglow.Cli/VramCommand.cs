@@ -1,4 +1,3 @@
-using System.Globalization;
 using Afterglow.Core.Stress;
 
 namespace Afterglow.Cli;
@@ -9,13 +8,16 @@ internal static class VramCommand
     public static int Run(string[] args)
     {
         int seconds = 120;
-        for (int i = 1; i < args.Length - 1; i++)
+        if (CliArgs.Validate(args, "vram") is string argError)
         {
-            if (args[i] == "--seconds" &&
-                int.TryParse(args[i + 1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int s))
-            {
-                seconds = Math.Clamp(s, 15, 86_400);
-            }
+            Console.Error.WriteLine(argError);
+            return 2;
+        }
+
+        if (CliArgs.TryInt(args, "--seconds", 15, 86_400, ref seconds) is string secondsError)
+        {
+            Console.Error.WriteLine(secondsError);
+            return 2;
         }
 
         var (bus, vendorId, busError) = CliGpu.ResolveTarget(args);
@@ -25,7 +27,15 @@ internal static class VramCommand
             return 1;
         }
 
-        using var vram = new VramTest { TargetPciBusId = bus, TargetVendorId = vendorId };
+        using var vram = new VramTest
+        {
+            TargetPciBusId = bus,
+            TargetVendorId = vendorId,
+
+            // Same rule as `stress`: only a deliberately unbound run keeps the
+            // historical fallback.
+            AllowUnboundGuess = bus is null,
+        };
         var done = new ManualResetEventSlim(false);
         VramProgress? final = null;
 
@@ -47,9 +57,11 @@ internal static class VramCommand
         Console.WriteLine(
             $"VRAM test: fill + verify as much of the card as the OS will safely give out, " +
             $"for {seconds} s (at least one full round). Ctrl+C aborts.");
+        bool aborted = false;
         Console.CancelKeyPress += (_, e) =>
         {
             e.Cancel = true;
+            aborted = true;
             vram.Stop();
         };
 
@@ -57,6 +69,7 @@ internal static class VramCommand
 
         // Run for the window, but always complete at least one full round.
         var start = DateTime.UtcNow;
+        bool stoppedCleanly = true;
         while (!done.IsSet)
         {
             if (done.Wait(TimeSpan.FromMilliseconds(500)))
@@ -68,7 +81,7 @@ internal static class VramCommand
             double elapsed = (DateTime.UtcNow - start).TotalSeconds;
             if ((elapsed >= seconds && p.Rounds >= 1) || elapsed >= seconds * 3)
             {
-                vram.StopAndWait(TimeSpan.FromSeconds(10));
+                stoppedCleanly = vram.StopAndWait(TimeSpan.FromSeconds(30));
                 break;
             }
         }
@@ -84,7 +97,25 @@ internal static class VramCommand
             Console.WriteLine($"  {detail}");
         }
 
-        bool passed = final.State is StressState.Stopped or StressState.Running && final.Rounds >= 1;
+        // An abandoned run is not a pass: the figures above are a stale mid-run
+        // snapshot and nothing was verified after them.
+        if (!stoppedCleanly)
+        {
+            Console.Error.WriteLine(
+                "  The VRAM test did not stop within 30 s — the figures above are a stale mid-run " +
+                "snapshot, not a completed run.");
+            return 1;
+        }
+
+        if (aborted)
+        {
+            Console.Error.WriteLine(
+                "  Aborted before the requested window elapsed — this is not a pass. " +
+                "The figures above cover only the part that ran.");
+            return 1;
+        }
+
+        bool passed = final.State is StressState.Stopped && final.Rounds >= 1;
         return passed ? 0 : 1;
     }
 }

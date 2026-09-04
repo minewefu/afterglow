@@ -231,7 +231,11 @@ public sealed class GpuTuner : IGpuTuner
             mem = m.ClockOffsetMHz;
         }
 
-        _ = _nvml.TryGetEnforcedPowerLimit(out uint mw);
+        // A discarded return code published a failed read as a real "0 W"
+        // through `get`, `--json` and the MCP state tool. Absent is absent.
+        double? powerW = _nvml.TryGetEnforcedPowerLimit(out uint mw) == NvmlReturn.Success
+            ? mw / 1000.0
+            : null;
 
         uint? boost = null;
         if (_nvapi is not null && _nvapi.TryGetVoltageBoostPercent(out uint b) == NvapiStatus.Ok)
@@ -239,7 +243,7 @@ public sealed class GpuTuner : IGpuTuner
             boost = b;
         }
 
-        return (core, mem, mw / 1000.0, boost, AppliedLockMHz);
+        return (core, mem, powerW, boost, AppliedLockMHz);
     }
 
     /// <summary>
@@ -306,6 +310,24 @@ public sealed class GpuTuner : IGpuTuner
     }
 
     /// <summary>Returns every knob this engine owns to driver defaults.</summary>
+    /// <inheritdoc />
+    public string? ProbeRecordKey { get; set; }
+
+    /// <summary>
+    /// A verified lock release or re-apply proves any V/F probe pin on this
+    /// card is gone; the store's probe record must say so, or the App raises
+    /// "the GPU may still be pinned" on every launch after `set --lock-clock
+    /// off` or `reset` freed the card (neither front-end can clear a record
+    /// keyed by the index fallback, which only the tuner knows belongs to it).
+    /// </summary>
+    private void ResolveProbeRecord()
+    {
+        if ((ProbeRecordKey ?? _gpuUuid) is { } key)
+        {
+            AppliedStateStore.ResolveProbeLock(key);
+        }
+    }
+
     public ApplyResult ResetToDefaults()
     {
         lock (_applyLock)
@@ -336,6 +358,7 @@ public sealed class GpuTuner : IGpuTuner
             if (unlockRc == NvmlReturn.Success)
             {
                 _appliedLockMHz = null;
+                ResolveProbeRecord(); // the lock is gone whatever the other knobs do
             }
 
             if (unlockRc is not NvmlReturn.NotSupported and not NvmlReturn.FunctionNotFound)
@@ -364,7 +387,16 @@ public sealed class GpuTuner : IGpuTuner
             RestoreAutoFans(results);
 
             bool all = results.All(r => r.Applied);
-            AppliedStateStore.Clear(_gpuUuid);
+
+            // Only a reset that fully landed may erase the applied-state record.
+            // Clearing it after a PARTIAL reset threw away the one thing that
+            // tells the next launch what is still on this card — the record
+            // exists precisely for the case where the driver refused to undo it.
+            if (all)
+            {
+                AppliedStateStore.Clear(_gpuUuid);
+            }
+
             Log.Info($"Reset to defaults: {(all ? "ok" : "PARTIAL")}");
             return new ApplyResult(all, results);
         }
@@ -386,6 +418,39 @@ public sealed class GpuTuner : IGpuTuner
         }
     }
 
+    /// <summary>
+    /// Confirms a core-offset write by reading it back. Returns null when the
+    /// offset is confirmed, otherwise the sentence to append to the failure.
+    /// <para>
+    /// The two V/F-point paths re-write the global core offset after clearing
+    /// the table it shares, and reported that re-write from the driver's return
+    /// code alone — the exact accept-but-ignore case <see cref="ApplyOffset"/>
+    /// guards against a few hundred lines below with "driver accepted the call
+    /// but readback shows N MHz". The getter was already in scope in both.
+    /// </para>
+    /// </summary>
+    private bool ConfirmCoreOffset(int expected, out string? problem)
+    {
+        problem = null;
+        if (_nvml.TryGetClockOffset(NvmlClockType.Graphics, out var after) != NvmlReturn.Success)
+        {
+            // Unverified, not failed — the same rule ApplyOffset follows: it
+            // omits "(verified)" when the getter does not answer rather than
+            // declaring a write bad. Failing here would report a clear that
+            // worked as broken whenever a transient read failed.
+            return true;
+        }
+
+        if (after.ClockOffsetMHz == expected)
+        {
+            problem = "verified";
+            return true;
+        }
+
+        problem = $"but the core offset reads back as {after.ClockOffsetMHz} MHz, not {expected} MHz";
+        return false;
+    }
+
     /// <summary>Clears all per-point curve offsets (UI/CLI entry point).</summary>
     public KnobResult ClearVfPointOffsets()
     {
@@ -396,10 +461,74 @@ public sealed class GpuTuner : IGpuTuner
                 return KnobResult.Fail("V/F points", "per-point curve control is not supported on this GPU/driver");
             }
 
+            // Capture the global core offset BEFORE the clear. The all-zero
+            // table write lands on the same table the global offset lives in and
+            // can take it down with the per-point deltas, so reading afterwards
+            // returns the very 0 we would be trying to undo — restoring it would
+            // then print "0 MHz core offset re-applied" over the user's live
+            // +150 MHz. A getter that does not answer means we cannot promise a
+            // restore, so nothing is re-applied and the result says so.
+            int? offsetBeforeClear = null;
+            if (Capabilities.SupportsCoreOffset)
+            {
+                offsetBeforeClear = _nvml.TryGetClockOffset(NvmlClockType.Graphics, out var before) == NvmlReturn.Success
+                    ? before.ClockOffsetMHz
+                    : null;
+            }
+
             var rc = _nvapi.TryClearVfpPointOffsets();
-            return rc == NvapiStatus.Ok
-                ? KnobResult.Ok("V/F points", "cleared")
-                : KnobResult.Fail("V/F points", rc.ToString());
+            if (rc != NvapiStatus.Ok)
+            {
+                return KnobResult.Fail("V/F points", rc.ToString());
+            }
+
+            // Same contract as the profile-apply twin below: a write the driver
+            // accepted is not a write that took. Reporting "cleared" off the
+            // return code alone meant a clear the driver ignored still printed ok.
+            if (_nvapi.TryGetVfpPoints(out var after) != NvapiStatus.Ok)
+            {
+                return KnobResult.Fail("V/F points", "the removal could not be verified — the table did not read back");
+            }
+
+            if (VfPointPlanner.HasPerPointShape(after))
+            {
+                return KnobResult.Fail("V/F points", "per-point offsets could not be removed");
+            }
+
+            // A zeroed table reads 0 whether or not the clear took the global
+            // offset with it, so no comparison could detect the loss — re-write
+            // the pre-clear value unconditionally, exactly as the apply path does.
+            string detail = "cleared (verified)";
+            if (offsetBeforeClear is int restore)
+            {
+                var reRc = _nvml.TrySetClockOffset(NvmlClockType.Graphics, restore);
+                if (reRc != NvmlReturn.Success)
+                {
+                    return KnobResult.Fail(
+                        "V/F points",
+                        $"{detail}, but the {restore} MHz core offset could not be written again " +
+                        $"afterwards ({reRc}) — check it on the Tuning page");
+                }
+
+                if (!ConfirmCoreOffset(restore, out string? offsetNote))
+                {
+                    return KnobResult.Fail("V/F points", $"{detail}, {offsetNote} — check it on the Tuning page");
+                }
+
+                detail += offsetNote == "verified"
+                    ? $"; {restore} MHz core offset re-applied (verified)"
+                    : $"; {restore} MHz core offset re-applied (readback unavailable)";
+            }
+            else if (Capabilities.SupportsCoreOffset)
+            {
+                // Never silently write a guessed 0 over a live offset.
+                return KnobResult.Fail(
+                    "V/F points",
+                    $"{detail}, but the core offset could not be read beforehand, so it was not restored — " +
+                    "the clear may have zeroed it. Check it on the Tuning page");
+            }
+
+            return KnobResult.Ok("V/F points", detail);
         }
     }
 
@@ -496,17 +625,34 @@ public sealed class GpuTuner : IGpuTuner
         string detail = "per-point offsets removed (this profile recorded none)";
         if (Capabilities.SupportsCoreOffset)
         {
-            var reRc = _nvml.TrySetClockOffset(NvmlClockType.Graphics, profile.CoreOffsetMHz);
+            // Clamp to the driver's range exactly as the offset knob does, and
+            // re-use that value for both the write and the readback. Writing the
+            // raw profile value and then comparing against it meant a profile
+            // carrying an out-of-range offset produced a readback "mismatch"
+            // against a value the driver was never going to store — a failure
+            // report for a write that landed correctly.
+            var (clampedOffset, _) = TuningMath.ClampOffset(
+                profile.CoreOffsetMHz, Capabilities.CoreOffsetMinMHz, Capabilities.CoreOffsetMaxMHz);
+
+            var reRc = _nvml.TrySetClockOffset(NvmlClockType.Graphics, clampedOffset);
             if (reRc != NvmlReturn.Success)
             {
                 results.Add(KnobResult.Fail(
                     knob,
-                    $"{detail}, but the {profile.CoreOffsetMHz} MHz core offset could not be written again " +
+                    $"{detail}, but the {clampedOffset} MHz core offset could not be written again " +
                     $"afterwards ({reRc}) — check it on the Tuning page"));
                 return;
             }
 
-            detail += $"; core offset re-applied at {profile.CoreOffsetMHz} MHz";
+            if (!ConfirmCoreOffset(clampedOffset, out string? offsetNote))
+            {
+                results.Add(KnobResult.Fail(knob, $"{detail}, {offsetNote} — check it on the Tuning page"));
+                return;
+            }
+
+            detail += offsetNote == "verified"
+                ? $"; core offset re-applied at {clampedOffset} MHz (verified)"
+                : $"; core offset re-applied at {clampedOffset} MHz (readback unavailable)";
         }
 
         results.Add(KnobResult.Ok(knob, detail));
@@ -687,6 +833,7 @@ public sealed class GpuTuner : IGpuTuner
             if (rc == NvmlReturn.Success)
             {
                 _appliedLockMHz = lockMHz;
+                ResolveProbeRecord(); // a range lock this process wrote supersedes any probe pin
             }
 
             string detail = rc == NvmlReturn.InvalidArgument
@@ -704,6 +851,7 @@ public sealed class GpuTuner : IGpuTuner
             if (rc == NvmlReturn.Success)
             {
                 _appliedLockMHz = null;
+                ResolveProbeRecord();
             }
 
             Report(results, "clock lock", rc, $"removed (was {RangeLockFloorMHz}..{previous} MHz)");
@@ -760,6 +908,7 @@ public sealed class GpuTuner : IGpuTuner
             if (rc == NvmlReturn.Success)
             {
                 _appliedLockMHz = null;
+                ResolveProbeRecord();
             }
 
             return rc == NvmlReturn.Success
@@ -870,6 +1019,13 @@ public sealed class GpuTuner : IGpuTuner
 /// </summary>
 public static class AppliedStateStore
 {
+    /// <summary>
+    /// The pending-record name for a V/F probe that could not put the clock
+    /// state back — the text the next-launch banner displays. One constant, so
+    /// the probe, the App and the shutdown sweep cannot drift apart on it.
+    /// </summary>
+    public const string ProbeLockPendingName = "v/f probe clock lock";
+
     public sealed record AppliedState(
         string ProfileName,
         DateTimeOffset AppliedAt,
@@ -879,7 +1035,8 @@ public static class AppliedStateStore
         string? FanMode = null,
         uint? FanDuty = null,
         bool Pending = false,
-        string? GpuUuid = null);
+        string? GpuUuid = null,
+        bool ProbeLockPending = false);
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly object Lock = new();
@@ -899,7 +1056,16 @@ public static class AppliedStateStore
         });
     }
 
-    public static void Record(TuningProfile profile, bool allSucceeded, uint? lockedClock, string? gpuUuid = null)
+    /// <summary>
+    /// Records an apply. <paramref name="lockWrittenByAfterglow"/> must be a
+    /// clock lock this process wrote, or inherited from a crashed session's
+    /// record — never one merely observed from the driver. An observed factory
+    /// ceiling persisted here is loaded by the next launch as "written by
+    /// Afterglow", and the release path then refuses to adopt it forever. The
+    /// NVML tuner's shadow is only ever written by its own calls; a tuner with a
+    /// readback getter (Intel) must filter by provenance before calling this.
+    /// </summary>
+    public static void Record(TuningProfile profile, bool allSucceeded, uint? lockWrittenByAfterglow, string? gpuUuid = null)
     {
         Mutate(gpuUuid, state => (state ?? Empty(profile.Name)) with
         {
@@ -907,7 +1073,7 @@ public static class AppliedStateStore
             AppliedAt = DateTimeOffset.Now,
             AllKnobsSucceeded = allSucceeded,
             CleanShutdown = false,
-            LockedCoreClockMHz = lockedClock,
+            LockedCoreClockMHz = lockWrittenByAfterglow,
             Pending = false,
             GpuUuid = gpuUuid ?? state?.GpuUuid, // keep the stamp when this run has no UUID (see RecordPending)
         });
@@ -933,8 +1099,15 @@ public static class AppliedStateStore
         });
     }
 
-    /// <summary>App-level: marks every GPU's record (and the legacy file) as cleanly shut down.</summary>
-    public static void MarkCleanShutdown()
+    /// <summary>
+    /// App-level: marks every GPU's record (and the legacy file) as cleanly shut
+    /// down. A record whose V/F probe left a clock pin unresolved (see
+    /// <see cref="RecordProbeLockPending"/>) stays unclean — the pin outlives
+    /// the process, and the App used to re-record it after this call purely to
+    /// undo the mark — unless <paramref name="resolveProbeLocks"/> is true (the
+    /// user dismissing the banner).
+    /// </summary>
+    public static void MarkCleanShutdown(bool resolveProbeLocks = false)
     {
         lock (Lock)
         {
@@ -942,9 +1115,10 @@ public static class AppliedStateStore
             {
                 try
                 {
-                    if (ReadFile(path) is { CleanShutdown: false } state)
+                    if (ReadFile(path) is { CleanShutdown: false } state &&
+                        (resolveProbeLocks || !state.ProbeLockPending))
                     {
-                        WriteFile(path, state with { CleanShutdown = true });
+                        WriteFile(path, state with { CleanShutdown = true, ProbeLockPending = false });
                     }
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -993,6 +1167,97 @@ public static class AppliedStateStore
             }
 
             return legacy;
+        }
+    }
+
+    /// <summary>
+    /// True for the index fallback a card without a driver UUID is recorded
+    /// under (<c>index:N</c>) — a key no tuner ever loads or clears.
+    /// </summary>
+    public static bool IsIndexKey(string? key) =>
+        key is not null && key.StartsWith("index:", StringComparison.Ordinal);
+
+    /// <summary>
+    /// Records that a V/F probe left a clock pin it could not release on the
+    /// card <paramref name="key"/> (UUID or index fallback). An index key
+    /// touches only its own file: routing it through <see cref="RecordPending"/>
+    /// seeded the new file from the unstamped legacy record and retired that
+    /// record — the ONLY file a UUID-less NVIDIA tuner reads and writes — so the
+    /// tuner's tracked lock migrated to a file it never loads.
+    /// </summary>
+    public static void RecordProbeLockPending(string key)
+    {
+        if (!IsIndexKey(key))
+        {
+            // A real UUID owns its per-GPU file (and a legacy record stamped
+            // with it); the ordinary write path is the right one for it.
+            Mutate(key, state => (state ?? Empty(ProbeLockPendingName)) with
+            {
+                AppliedAt = DateTimeOffset.Now,
+                CleanShutdown = false,
+                ProbeLockPending = true,
+                GpuUuid = key,
+            });
+            return;
+        }
+
+        lock (Lock)
+        {
+            try
+            {
+                string path = PathFor(key);
+                var state = ReadFile(path) ?? Empty(ProbeLockPendingName);
+                WriteFile(path, state with
+                {
+                    AppliedAt = DateTimeOffset.Now,
+                    CleanShutdown = false,
+                    ProbeLockPending = true,
+                    GpuUuid = key,
+                });
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+            }
+        }
+    }
+
+    /// <summary>
+    /// The probe's clock pin on <paramref name="key"/> is released: an
+    /// index-fallback record is dropped outright (nothing else lives in it);
+    /// a real UUID's file only loses the probe flag — the rest of the record
+    /// (a tuning lock, fan control) is still the tuner's to track. The legacy
+    /// file is never touched (see <see cref="RecordProbeLockPending"/>).
+    /// </summary>
+    public static void ResolveProbeLock(string key)
+    {
+        lock (Lock)
+        {
+            try
+            {
+                string path = PathFor(key);
+                if (IsIndexKey(key))
+                {
+                    File.Delete(path);
+                }
+                else if (ReadFile(path) is { ProbeLockPending: true } state)
+                {
+                    if (state.ProfileName == ProbeLockPendingName)
+                    {
+                        // Born from the probe, nothing else in it. Left behind
+                        // unclean under the name "v/f probe clock lock", it
+                        // raised the generic crash banner after a clean CLI
+                        // re-probe — the CLI never marks the session clean.
+                        File.Delete(path);
+                    }
+                    else
+                    {
+                        WriteFile(path, state with { ProbeLockPending = false });
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+            }
         }
     }
 
