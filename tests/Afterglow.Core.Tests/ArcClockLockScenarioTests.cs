@@ -363,6 +363,50 @@ public sealed class ArcClockLockScenarioTests : IDisposable
     }
 
     [Fact]
+    public void An_explicit_release_is_one_operation_with_one_verdict()
+    {
+        // `--lock-clock off` / MCP unlock:true on a clamp this session never
+        // applied (another tool's): Apply releases it itself and reports one
+        // "clock lock" knob — no front-end release-then-reconcile.
+        var dev = new FakeArcDevice { Max = 1500 };
+        var tuner = Tuner(dev);
+
+        var result = tuner.Apply(NoLock(), releaseLock: true);
+
+        Assert.True(result.AllSucceeded, Describe(result));
+        Assert.Single(result.Results, k => k.Knob == "clock lock");
+        Assert.Equal((100d, 2300d), (dev.Min, dev.Max));
+        Assert.Null(tuner.ReadCurrent().LockedCoreClockMHz);
+    }
+
+    [Fact]
+    public void An_explicit_release_with_nothing_clamped_still_answers_with_one_verified_knob()
+    {
+        var dev = new FakeArcDevice();
+        var tuner = Tuner(dev);
+
+        var result = tuner.Apply(NoLock(), releaseLock: true);
+
+        Assert.True(result.AllSucceeded, Describe(result));
+        var knob = Assert.Single(result.Results, k => k.Knob == "clock lock");
+        Assert.Contains("(verified)", knob.Detail, StringComparison.Ordinal);
+        Assert.DoesNotContain(result.Results, k => k.Knob == "profile");
+    }
+
+    [Fact]
+    public void An_explicit_release_the_driver_refuses_is_one_failed_knob()
+    {
+        var dev = new FakeArcDevice { Max = 1500, RestoreResult = CtlResult.ErrorInsufficientPermissions };
+        var tuner = Tuner(dev);
+
+        var result = tuner.Apply(NoLock(), releaseLock: true);
+
+        Assert.False(result.AllSucceeded);
+        Assert.Single(result.Results, k => k.Knob == "clock lock" && !k.Applied);
+        Assert.Equal(1500u, tuner.ReadCurrent().LockedCoreClockMHz);
+    }
+
+    [Fact]
     public void Dashboard_reads_during_a_pin_do_not_make_it_unreleasable()
     {
         var dev = new FakeArcDevice();

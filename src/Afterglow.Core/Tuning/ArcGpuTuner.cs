@@ -333,7 +333,7 @@ public sealed class ArcGpuTuner : IGpuTuner
         }
     }
 
-    public ApplyResult Apply(TuningProfile profile, bool reconcileVfPoints = true)
+    public ApplyResult Apply(TuningProfile profile, bool reconcileVfPoints = true, bool releaseLock = false)
     {
         lock (_applyLock)
         {
@@ -366,7 +366,7 @@ public sealed class ArcGpuTuner : IGpuTuner
             RefuseIfRequested(profile.VoltageBoostPct is not null, "voltage boost", results);
             RefuseIfRequested(profile.MemOffsetMHz != 0, "memory offset", results);
             RefuseIfRequested(profile.CoreOffsetMHz != 0, "core offset", results);
-            ApplyLockedClock(profile.LockedCoreClockMHz, results);
+            ApplyLockedClock(profile.LockedCoreClockMHz, results, releaseLock);
             RefuseIfRequested(profile.VfPointOffsetsMHz is { Count: > 0 }, "V/F points", results);
 
             // `All` on an empty list is true, so an apply that touched nothing
@@ -554,7 +554,7 @@ public sealed class ArcGpuTuner : IGpuTuner
     public KnobResult ClearVfPointOffsets() =>
         KnobResult.Fail("V/F points", "not supported on Intel GPUs");
 
-    private void ApplyLockedClock(uint? target, List<KnobResult> results)
+    private void ApplyLockedClock(uint? target, List<KnobResult> results, bool releaseLock)
     {
         if (target is uint lockMHz)
         {
@@ -650,6 +650,14 @@ public sealed class ArcGpuTuner : IGpuTuner
         // was persisted). The shadow alone stated hardware facts nobody had read.
         if (RefreshTrackedClampFromDriver() is not uint previous)
         {
+            if (releaseLock)
+            {
+                // An explicit release with nothing tracked still goes to the
+                // driver, through the same verified release, so the request
+                // yields one verdict rather than a front-end's guess.
+                results.Add(ReleaseClampCore());
+            }
+
             return;
         }
 

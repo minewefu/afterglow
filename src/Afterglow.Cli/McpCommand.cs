@@ -514,38 +514,12 @@ internal static class McpCommand
             }
         }
 
-        // Release BEFORE applying, exactly as the CLI does. An explicit
-        // unlock:true is a direct instruction, and Apply deliberately declines to
-        // touch a clamp this session did not write — reporting that refusal as a
-        // failed knob. Applying first therefore told the agent all_succeeded:false,
-        // advising it to run a CLI command, in the same payload whose
-        // now_applied.lock_clock_mhz reads null because the release then worked.
-        // Releasing first also leaves nothing for Apply's lock-less path to find.
+        // An explicit unlock:true is one operation with one verdict, exactly as
+        // the CLI's `--lock-clock off`: Apply releases the lock itself — whether
+        // or not this session tracks one — and reports it as the "clock lock"
+        // knob, so all_succeeded reflects the release and nothing else.
+        var result = gpu.Tuner.Apply(profile, releaseLock: unlock);
         var knobs = new List<KnobResult>();
-        KnobResult? refusedRelease = null;
-        if (unlock)
-        {
-            var explicitRelease = gpu.Tuner.ForceUnlock();
-            if (explicitRelease.Applied)
-            {
-                knobs.Add(explicitRelease);
-            }
-            else
-            {
-                // A refused release leaves the clamp tracked, so Apply's
-                // lock-less path retries it; its knob is the one verdict, and
-                // it lands in the list below. Reporting both gave the agent a
-                // failed knob beside a verified release of the same lock.
-                refusedRelease = explicitRelease;
-            }
-        }
-
-        var result = gpu.Tuner.Apply(profile);
-        if (refusedRelease is { } refused && !result.Results.Any(k => k.Knob == "clock lock"))
-        {
-            knobs.Add(refused); // Apply found nothing to retry: the refusal stands, so all_succeeded reflects it
-        }
-
         foreach (var knob in result.Results)
         {
             // With the release already done and reported, Apply's leftover

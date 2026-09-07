@@ -209,43 +209,13 @@ internal static class TuneCommands
             VoltageBoostPct = voltageBoost,
         };
 
-        // An explicit `--lock-clock off` is a direct instruction, so issue the
-        // driver release FIRST — including for a clamp this session did not
-        // apply, which Apply deliberately declines to touch and reports as a
-        // failure. Running it afterwards printed that refusal and then the
-        // successful release for one user-requested operation, and exited 1 on a
-        // release that worked. Releasing first also leaves nothing for Apply's
-        // lock-less path to find, so it stays quiet.
-        bool alreadyReleased = false;
-        KnobResult? refusedRelease = null;
-        if (unlock)
-        {
-            var unlockKnob = gpu.Tuner.ForceUnlock();
-            if (unlockKnob.Applied)
-            {
-                Console.WriteLine($"  ok   {unlockKnob.Knob,-18} {unlockKnob.Detail}");
-                alreadyReleased = true;
-            }
-            else
-            {
-                // A refused release leaves the clamp tracked, so Apply's
-                // lock-less path retries it below; its knob line is the one
-                // verdict. Printing this refusal too gave two FAIL lines — or a
-                // FAIL followed by "ok … released (verified)" and exit 1.
-                refusedRelease = unlockKnob;
-            }
-        }
-
-        var result = gpu.Tuner.Apply(profile);
-        bool applyReleased = result.Results.Any(k => k.Knob == "clock lock" && k.Applied);
-        if (refusedRelease is { } refused && !result.Results.Any(k => k.Knob == "clock lock"))
-        {
-            // Apply found nothing to retry (nothing tracked), so the explicit
-            // refusal is the only account of the release.
-            Console.WriteLine($"  FAIL {refused.Knob,-18} {refused.Detail}");
-        }
-
-        bool allOk = result.AllSucceeded && (!unlock || alreadyReleased || applyReleased);
+        // An explicit `--lock-clock off` is one operation with one verdict:
+        // Apply releases the lock itself — whether or not this session tracks
+        // one — and reports it as the "clock lock" knob. Releasing from here
+        // first and letting Apply retry printed two lines for one request, or
+        // a FAIL followed by a verified release and exit 1.
+        var result = gpu.Tuner.Apply(profile, releaseLock: unlock);
+        bool allOk = result.AllSucceeded;
         foreach (var knob in result.Results)
         {
             // A bare `--lock-clock off` carries no other knob, so the engine's

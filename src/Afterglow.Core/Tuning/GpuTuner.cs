@@ -271,7 +271,7 @@ public sealed class GpuTuner : IGpuTuner
     /// profile assembled from <see cref="ReadCurrent"/> — which cannot see
     /// per-point offsets — can never delete a curve the user did not ask to lose.
     /// </param>
-    public ApplyResult Apply(TuningProfile profile, bool reconcileVfPoints = true)
+    public ApplyResult Apply(TuningProfile profile, bool reconcileVfPoints = true, bool releaseLock = false)
     {
         lock (_applyLock)
         {
@@ -304,7 +304,7 @@ public sealed class GpuTuner : IGpuTuner
             ApplyOffset(NvmlClockType.Graphics, profile.CoreOffsetMHz,
                 Capabilities.SupportsCoreOffset, Capabilities.CoreOffsetMinMHz, Capabilities.CoreOffsetMaxMHz,
                 "core offset", results);
-            ApplyLockedClock(profile.LockedCoreClockMHz, results);
+            ApplyLockedClock(profile.LockedCoreClockMHz, results, releaseLock);
 
             // Runs after the core offset above, on purpose: the global offset
             // lives in the same table and is the baseline this reconciles to.
@@ -828,7 +828,7 @@ public sealed class GpuTuner : IGpuTuner
     /// </summary>
     private const uint RangeLockFloorMHz = 210;
 
-    private void ApplyLockedClock(uint? target, List<KnobResult> results)
+    private void ApplyLockedClock(uint? target, List<KnobResult> results, bool releaseLock)
     {
         if (target is uint lockMHz)
         {
@@ -849,8 +849,13 @@ public sealed class GpuTuner : IGpuTuner
             return;
         }
 
-        // Profile carries no lock: release any active one — visibly, never silently.
-        if (_appliedLockMHz is uint previous)
+        // Profile carries no lock: release any active one — visibly, never
+        // silently. An explicit release runs whether or not a lock is tracked:
+        // NVML has no getter, so a lock another process wrote is invisible
+        // here, and the explicit request must yield exactly one verdict
+        // rather than a front-end's reconciliation of two.
+        uint? previous = _appliedLockMHz;
+        if (previous is not null || releaseLock)
         {
             var rc = _nvml.TryResetGpuLockedClocks();
             if (rc == NvmlReturn.Success)
@@ -859,7 +864,9 @@ public sealed class GpuTuner : IGpuTuner
                 ResolveProbeRecord();
             }
 
-            Report(results, "clock lock", rc, $"removed (was {RangeLockFloorMHz}..{previous} MHz)");
+            Report(results, "clock lock", rc, previous is uint was
+                ? $"removed (was {RangeLockFloorMHz}..{was} MHz)"
+                : "released (explicit)");
         }
     }
 

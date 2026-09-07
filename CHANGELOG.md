@@ -180,6 +180,13 @@ live on the Arc B390 the beta was verified on.
   otherwise only listed, so an orphan still raises the banner and Dismiss
   clears it; the legacy-file ownership heuristics that every write and clear
   used to run are deleted.
+- **An explicit unlock is one operation with one verdict.** `Apply` takes a
+  `releaseLock` option: the tuner releases the clock lock itself — whether or
+  not this session tracks one — and reports it as the "clock lock" knob. The
+  CLI's `set --lock-clock off` and MCP `apply_tuning` with `unlock: true` each
+  used to release first and then reconcile that against Apply's own release by
+  knob name, printing two lines for one request or a FAIL beside a verified
+  release; both are now a single call.
 - **The stepper refuses GPUs with no core-offset knob** instead of burning a full
   cycle at offset 0 and reporting "+0 MHz" as a confirmed stable offset — which
   `find_stable_offset` handed straight to an agent.

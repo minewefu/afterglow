@@ -73,7 +73,14 @@ public interface IGpuTuner
     /// </summary>
     (int CoreOffsetMHz, int MemOffsetMHz, double? PowerLimitW, uint? VoltageBoostPct, uint? LockedCoreClockMHz) ReadCurrent();
 
-    ApplyResult Apply(TuningProfile profile, bool reconcileVfPoints = true);
+    /// <summary>
+    /// Applies a profile. With <paramref name="releaseLock"/> the clock lock is
+    /// released whether or not this session tracks one — an explicit
+    /// <c>--lock-clock off</c> or MCP <c>unlock</c> is one operation with one
+    /// verdict, reported as the "clock lock" knob, instead of a front-end
+    /// releasing first and reconciling that against Apply's own release.
+    /// </summary>
+    ApplyResult Apply(TuningProfile profile, bool reconcileVfPoints = true, bool releaseLock = false);
 
     ApplyResult ResetToDefaults();
 

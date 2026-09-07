@@ -28,7 +28,7 @@ public class NoVerdictWithoutEvidenceTests
         /// <summary>How many times a tune was attempted — 0 proves the guard fired first.</summary>
         public int ApplyCallCount { get; private set; }
 
-        public ApplyResult Apply(TuningProfile profile, bool reconcileVfPoints = true)
+        public ApplyResult Apply(TuningProfile profile, bool reconcileVfPoints = true, bool releaseLock = false)
         {
             ApplyCallCount++;
             return new ApplyResult(true, [KnobResult.Ok("stub")]);
@@ -108,7 +108,7 @@ public class NoVerdictWithoutEvidenceTests
         public (int CoreOffsetMHz, int MemOffsetMHz, double? PowerLimitW, uint? VoltageBoostPct, uint? LockedCoreClockMHz)
             ReadCurrent() => (0, 0, null, null, null);
 
-        public ApplyResult Apply(TuningProfile profile, bool reconcileVfPoints = true) =>
+        public ApplyResult Apply(TuningProfile profile, bool reconcileVfPoints = true, bool releaseLock = false) =>
             new(false, [KnobResult.Fail("core offset", "driver refused")]);
 
         public ApplyResult ResetToDefaults() => new(true, [KnobResult.Ok("stub")]);
