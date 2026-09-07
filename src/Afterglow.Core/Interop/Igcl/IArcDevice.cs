@@ -6,7 +6,7 @@ namespace Afterglow.Core.Interop.Igcl;
 /// the overclock power-limit block. <see cref="IgclDevice"/> is the driver;
 /// the test suite substitutes an in-memory device so every clock-lock
 /// scenario — a factory ceiling below the domain maximum, a refused write, a
-/// restore that drops only the floor — runs against the real tuner instead of
+/// readback the driver truncates — runs against the real tuner instead of
 /// against an argument about it.
 /// </summary>
 public interface IArcDevice

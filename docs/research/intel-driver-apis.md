@@ -199,9 +199,13 @@ counters unsupported.
     reason the provenance-transfer tolerance is 2 MHz after rounding.
   The in-memory device the test suite uses (`FakeArcDevice`) models exactly
   these behaviours. A restore that keeps the cap is not modelled and the tuner
-  no longer carries branches for it: a release is verified by the ceiling being
-  back at the highest ceiling the process has seen, which fails a kept cap
-  without a special case should a driver ever show one.
+  carries no branch for it: after the floor gate, a release fails only when the
+  readback ceiling sits below one this process has already verified released;
+  otherwise the readback is adopted as the released ceiling — said to be
+  "verified" when the ceiling rose or reached the domain maximum or a verified
+  ceiling, and "taken as the factory ceiling" when it merely stayed where the
+  clamp was. No rule can tell a kept cap from a factory ceiling in a process
+  that has never seen higher; the measured driver makes the question moot.
 - **GPU temperature is not exposed** by either stack on this device. The dashboard
   will say so rather than substitute a number from an undocumented source.
 - The shared-memory module (location SYSTEM) is the honest signal the VRAM test

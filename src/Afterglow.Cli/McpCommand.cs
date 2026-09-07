@@ -454,16 +454,6 @@ internal static class McpCommand
     {
         var current = gpu.Tuner.ReadCurrent();
         bool unlock = args?["unlock"]?.GetValue<bool>() ?? false;
-        if (unlock && args?["lock_clock_mhz"] is not null)
-        {
-            // Two answers to one question. Dropping the lock silently returned
-            // all_succeeded:true to a request that asked for a lock.
-            return new
-            {
-                all_succeeded = false,
-                error = "'unlock' and 'lock_clock_mhz' contradict each other: pass one or the other. Nothing was applied.",
-            };
-        }
 
         var profile = new TuningProfile
         {
@@ -472,9 +462,10 @@ internal static class McpCommand
             MemOffsetMHz = args?["mem_offset_mhz"]?.GetValue<int>() ?? current.MemOffsetMHz,
             PowerLimitW = args?["power_limit_w"]?.GetValue<double>(),
             VoltageBoostPct = args?["voltage_boost_pct"]?.GetValue<uint>(),
-            LockedCoreClockMHz = unlock
-                ? null
-                : args?["lock_clock_mhz"]?.GetValue<uint>() ?? gpu.Tuner.AppliedLockMHz, // applied, never observed
+            // A lock given beside unlock:true reaches the tuner, which refuses
+            // the pair as a failed "profile" knob; the applied lock — never the
+            // observed ceiling — is carried forward otherwise.
+            LockedCoreClockMHz = args?["lock_clock_mhz"]?.GetValue<uint>() ?? (unlock ? null : gpu.Tuner.AppliedLockMHz),
         };
 
         // Schema validation errors cite generic sanity bounds; report the

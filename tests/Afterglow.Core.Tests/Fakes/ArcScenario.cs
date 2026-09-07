@@ -17,7 +17,4 @@ internal static class ArcScenario
     public static TuningProfile Lock(uint mhz) => new() { Name = "lock", LockedCoreClockMHz = mhz };
 
     public static TuningProfile NoLock() => new() { Name = "plain" };
-
-    public static string Describe(ApplyResult result) =>
-        string.Join("; ", result.Results.Select(r => $"{r.Knob}={(r.Applied ? "ok" : "FAIL")} {r.Detail}"));
 }

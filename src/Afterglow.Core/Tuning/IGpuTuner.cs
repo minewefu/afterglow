@@ -5,6 +5,15 @@ using Afterglow.Core.Profiles;
 namespace Afterglow.Core.Tuning;
 
 /// <summary>
+/// What a V/F sweep starts from (see <see cref="IGpuTuner.BeginProbe"/>).
+/// </summary>
+/// <param name="MaxClockMHz">The highest clock the sweep may pin: the domain maximum, or the released ceiling once one has been verified.</param>
+/// <param name="LockToRestoreMHz">The range lock this process had applied, which <see cref="IGpuTuner.EndProbe"/> puts back.</param>
+/// <param name="ForeignClampNote">Set when a clamp this process had not applied was released before the sweep, for the outcome text.</param>
+/// <param name="Refusal">Non-null when the card could not be prepared (a clamp that would not release); nothing was pinned.</param>
+public sealed record ProbeStart(uint MaxClockMHz, uint? LockToRestoreMHz, string? ForeignClampNote, string? Refusal = null);
+
+/// <summary>
 /// The tuning surface every vendor implements. Extracted verbatim from
 /// <see cref="GpuTuner"/> so the NVIDIA implementation keeps its exact
 /// signatures and semantics (they cannot be regression-tested on non-NVIDIA
@@ -29,8 +38,9 @@ public interface IGpuTuner
     /// <summary>
     /// The clock lock Afterglow APPLIED — never a ceiling merely observed from
     /// the driver (NVML has no getter; IGCL does, see <see cref="LockIsDriverReadable"/>,
-    /// and there an observed factory ceiling reads as null here). The probe
-    /// restores this value after a sweep, so it must be something Afterglow put on.
+    /// and there an observed factory ceiling reads as null here), and never the
+    /// V/F probe's exact pin: while a sweep runs, and after a pin the sweep
+    /// could not release, this is still the range lock the pin displaced.
     /// </summary>
     uint? AppliedLockMHz { get; }
 
@@ -54,14 +64,6 @@ public interface IGpuTuner
     string RecordKey => GpuUuid ?? throw new InvalidOperationException("this tuner has no record key");
 
     /// <summary>
-    /// The highest clock a lock can be pinned at: the domain maximum, or on a
-    /// driver that reads the range back, the released ceiling once observed —
-    /// a factory ceiling below the domain maximum cannot be exceeded, and a
-    /// sweep that tries is refused at its last target.
-    /// </summary>
-    uint MaxLockableClockMHz => Capabilities.MaxCoreClockMHz;
-
-    /// <summary>
     /// The currently applied values. PowerLimitW is null when the device has
     /// no readable power limit (the NVIDIA tuner always reads one back).
     /// LockedCoreClockMHz is an OBSERVATION — on a driver with a readback
@@ -77,8 +79,10 @@ public interface IGpuTuner
     /// Applies a profile. With <paramref name="releaseLock"/> the clock lock is
     /// released whether or not this session tracks one — an explicit
     /// <c>--lock-clock off</c> or MCP <c>unlock</c> is one operation with one
-    /// verdict, reported as the "clock lock" knob, instead of a front-end
-    /// releasing first and reconciling that against Apply's own release.
+    /// verdict, reported as the "clock lock" knob. A profile that carries a
+    /// lock AND asks for the release is refused as a "profile" failure before
+    /// anything is written: two answers to one question are not resolved
+    /// silently by any front-end.
     /// </summary>
     ApplyResult Apply(TuningProfile profile, bool reconcileVfPoints = true, bool releaseLock = false);
 
@@ -86,11 +90,28 @@ public interface IGpuTuner
 
     KnobResult ForceUnlock();
 
-    /// <summary>Range lock (idle downclock still allowed) — the probe-restore path.</summary>
+    /// <summary>Range lock (idle downclock still allowed) — the form profiles apply.</summary>
     NvmlReturn RestoreTuningLock(uint lockMHz);
 
-    /// <summary>Exact pin, required for V/F probing.</summary>
+    /// <summary>Exact pin, required for V/F probing; only meaningful between <see cref="BeginProbe"/> and <see cref="EndProbe"/>.</summary>
     NvmlReturn LockClockForProbe(uint clockMHz);
+
+    /// <summary>
+    /// Prepares a V/F sweep: remembers the range lock this process applied (so
+    /// <see cref="AppliedLockMHz"/> keeps answering with it while pins stand),
+    /// releases whatever clamp is on the card so the sweep runs against the
+    /// true ceiling, and reports the ceiling to sweep up to. The tuner owns
+    /// this because only it can capture the displaced lock BEFORE the release
+    /// empties its tracking — the probe capturing it from outside lost it.
+    /// </summary>
+    ProbeStart BeginProbe() => new(Capabilities.MaxCoreClockMHz, AppliedLockMHz, null);
+
+    /// <summary>
+    /// Ends a V/F sweep: puts back the lock <see cref="BeginProbe"/> remembered,
+    /// or releases the pin when there was none (and does nothing when no pin
+    /// ever landed). A failed verdict is the restore failure the probe reports.
+    /// </summary>
+    KnobResult EndProbe() => ForceUnlock();
 
     NvmlReturn SetAllFansRaw(uint dutyPct);
 

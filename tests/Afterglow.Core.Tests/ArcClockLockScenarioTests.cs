@@ -27,7 +27,7 @@ public sealed class ArcClockLockScenarioTests : IDisposable
 
         var result = tuner.Apply(Lock(1500));
 
-        Assert.True(result.AllSucceeded, Describe(result));
+        Assert.True(result.AllSucceeded, result.Summary);
         Assert.Equal((100d, 1500d), (dev.Min, dev.Max));
         Assert.Equal(1500u, tuner.ReadCurrent().LockedCoreClockMHz);
         Assert.Equal(1500u, tuner.AppliedLockMHz);
@@ -43,7 +43,7 @@ public sealed class ArcClockLockScenarioTests : IDisposable
 
         var release = tuner.Apply(NoLock());
 
-        Assert.True(release.AllSucceeded, Describe(release));
+        Assert.True(release.AllSucceeded, release.Summary);
         Assert.Equal((100d, 2300d), (dev.Min, dev.Max));
         Assert.Null(tuner.ReadCurrent().LockedCoreClockMHz);
         Assert.Null(tuner.AppliedLockMHz);
@@ -76,14 +76,14 @@ public sealed class ArcClockLockScenarioTests : IDisposable
 
         var first = tuner.Apply(NoLock());
 
-        Assert.True(first.AllSucceeded, Describe(first));
+        Assert.True(first.AllSucceeded, first.Summary);
         Assert.Null(AppliedStateStore.Load(Uuid)?.LockedCoreClockMHz);
 
         // The next process inherits nothing and applies cleanly too.
         var next = Tuner(dev);
         Assert.Null(next.AppliedLockMHz);
         var again = next.Apply(NoLock());
-        Assert.True(again.AllSucceeded, Describe(again));
+        Assert.True(again.AllSucceeded, again.Summary);
     }
 
     [Fact]
@@ -97,7 +97,7 @@ public sealed class ArcClockLockScenarioTests : IDisposable
 
         var release = tuner.Apply(NoLock());
 
-        Assert.True(release.AllSucceeded, Describe(release));
+        Assert.True(release.AllSucceeded, release.Summary);
         Assert.Equal((100d, 2300d), (dev.Min, dev.Max));
         Assert.Null(tuner.AppliedLockMHz);
     }
@@ -114,7 +114,7 @@ public sealed class ArcClockLockScenarioTests : IDisposable
 
         var apply = tuner.Apply(NoLock());
 
-        Assert.True(apply.AllSucceeded, Describe(apply));
+        Assert.True(apply.AllSucceeded, apply.Summary);
         Assert.Null(AppliedStateStore.Load(Uuid)?.LockedCoreClockMHz);
         Assert.DoesNotContain(dev.Writes, w => w.Max == 1800);
     }
@@ -143,31 +143,65 @@ public sealed class ArcClockLockScenarioTests : IDisposable
         var dev = new FakeArcDevice { FactoryMax = 2250 };
         var tuner = Tuner(dev);
         var applied = tuner.Apply(Lock(2250));
-        Assert.True(applied.AllSucceeded, Describe(applied));
+        Assert.True(applied.AllSucceeded, applied.Summary);
 
         var release = tuner.ForceUnlock();
 
         Assert.True(release.Applied, release.Detail);
-        Assert.Contains("(verified)", release.Detail, StringComparison.Ordinal);
+        Assert.Contains("factory ceiling", release.Detail, StringComparison.Ordinal); // adopted, honestly worded
         Assert.Equal((100d, 2250d), (dev.Min, dev.Max));
         Assert.Null(tuner.AppliedLockMHz);
         Assert.Null(tuner.ReadCurrent().LockedCoreClockMHz);
     }
 
     [Fact]
-    public void A_release_whose_readback_falls_short_of_the_highest_ceiling_seen_fails()
+    public void A_release_whose_readback_falls_short_of_a_ceiling_this_process_verified_fails()
     {
-        // The one shape the single rule refuses: this process has seen the
-        // ceiling higher than the restore left it, so a cap stayed.
+        // The one shape the rule refuses: this process has VERIFIED the ceiling
+        // higher than the restore left it, so a cap stayed.
         var dev = new FakeArcDevice();
         var tuner = Tuner(dev);
-        Assert.True(tuner.Apply(Lock(1500)).AllSucceeded); // the pre-write read saw 2300
+        Assert.True(tuner.ForceUnlock().Applied); // verifies the 2300 ceiling
+        Assert.True(tuner.Apply(Lock(1500)).AllSucceeded);
         dev.ReadbackOffset = -900; // every readback now lands well below that
 
         var release = tuner.ForceUnlock();
 
         Assert.False(release.Applied, release.Detail);
         Assert.Equal(1500u, tuner.AppliedLockMHz);
+    }
+
+    [Fact]
+    public void A_lock_written_a_megahertz_above_the_factory_ceiling_stays_releasable_across_processes()
+    {
+        // The request settles at the ceiling (measured) and verifies within the
+        // write tolerance; tracking the request instead of the settled value
+        // left a shadow no release could ever reach.
+        var dev = new FakeArcDevice { FactoryMax = 2200 };
+        var applied = Tuner(dev).Apply(Lock(2201));
+        Assert.True(applied.AllSucceeded, applied.Summary); // settled at 2200, within the write tolerance
+
+        var next = Tuner(dev); // a fresh process inherits the 2201 record over a card at 100..2200
+        Assert.Equal(2201u, next.AppliedLockMHz);
+
+        var release = next.ForceUnlock();
+        Assert.True(release.Applied, release.Detail);
+        Assert.Equal((100d, 2200d), (dev.Min, dev.Max));
+        Assert.Null(next.AppliedLockMHz);
+    }
+
+    [Fact]
+    public void An_apply_that_both_locks_and_releases_is_refused_before_anything_is_written()
+    {
+        var dev = new FakeArcDevice();
+        var tuner = Tuner(dev);
+
+        var result = tuner.Apply(Lock(1500), releaseLock: true);
+
+        Assert.False(result.AllSucceeded);
+        Assert.Single(result.Results, k => k.Knob == "profile" && !k.Applied);
+        Assert.Empty(dev.Writes);
+        Assert.Null(AppliedStateStore.Load(Uuid));
     }
 
     [Fact]
@@ -191,7 +225,6 @@ public sealed class ArcClockLockScenarioTests : IDisposable
     {
         var dev = new FakeArcDevice { FactoryMax = 2200 };
         var tuner = Tuner(dev);
-        _ = tuner.ReadCurrent();
         Assert.Equal(NvmlReturn.Success, tuner.LockClockForProbe(2200));
 
         var release = tuner.ForceUnlock();
@@ -206,7 +239,6 @@ public sealed class ArcClockLockScenarioTests : IDisposable
     {
         var dev = new FakeArcDevice();
         var tuner = Tuner(dev);
-        _ = tuner.ReadCurrent();
         Assert.Equal(NvmlReturn.Success, tuner.LockClockForProbe(1500));
         dev.RestoreResult = CtlResult.ErrorUnknown;
 
@@ -221,7 +253,6 @@ public sealed class ArcClockLockScenarioTests : IDisposable
     {
         var dev = new FakeArcDevice();
         var tuner = Tuner(dev);
-        _ = tuner.ReadCurrent();
         dev.ReadResult = CtlResult.ErrorUnknown;
 
         Assert.Equal(NvmlReturn.Unknown, tuner.LockClockForProbe(1500));
@@ -234,24 +265,46 @@ public sealed class ArcClockLockScenarioTests : IDisposable
     }
 
     [Fact]
-    public void The_users_lock_stays_the_applied_lock_while_a_pin_stands_and_after_its_release_fails()
+    public void The_users_lock_stays_the_applied_lock_through_a_sweep_and_after_its_restore_fails()
     {
         var dev = new FakeArcDevice();
         var tuner = Tuner(dev);
         Assert.True(tuner.Apply(Lock(1800)).AllSucceeded);
 
+        var start = tuner.BeginProbe();
+        Assert.Null(start.Refusal);
+        Assert.Equal(1800u, start.LockToRestoreMHz);
+        Assert.Equal(2300u, start.MaxClockMHz); // the sweep runs against the true ceiling, not under the lock
+        Assert.Equal(1800u, tuner.AppliedLockMHz); // captured before the release emptied the tracking
+
         Assert.Equal(NvmlReturn.Success, tuner.LockClockForProbe(1500));
         Assert.Equal(1800u, tuner.AppliedLockMHz);
 
-        dev.RestoreResult = CtlResult.ErrorUnknown;
-        Assert.False(tuner.ForceUnlock().Applied);
+        dev.WriteResult = CtlResult.ErrorUnknown; // the restore write is refused
+        Assert.False(tuner.EndProbe().Applied);
         Assert.Equal(1800u, tuner.AppliedLockMHz);
+        Assert.True(AppliedStateStore.Load(Uuid)?.ProbeLockPending);
 
-        dev.RestoreResult = CtlResult.Success;
-        Assert.Equal(NvmlReturn.Success, tuner.RestoreTuningLock(1800));
+        dev.WriteResult = CtlResult.Success;
+        var end = tuner.EndProbe();
+        Assert.True(end.Applied, end.Detail);
         Assert.Equal(1800u, tuner.AppliedLockMHz);
         Assert.Equal((100d, 1800d), (dev.Min, dev.Max));
         Assert.NotEqual(true, AppliedStateStore.Load(Uuid)?.ProbeLockPending);
+    }
+
+    [Fact]
+    public void A_sweep_that_pinned_nothing_ends_with_nothing_to_release()
+    {
+        var dev = new FakeArcDevice { WriteResult = CtlResult.ErrorInsufficientPermissions };
+        var tuner = Tuner(dev);
+
+        Assert.Null(tuner.BeginProbe().Refusal);
+        Assert.NotEqual(NvmlReturn.Success, tuner.LockClockForProbe(1500));
+
+        var end = tuner.EndProbe();
+        Assert.True(end.Applied, end.Detail);
+        Assert.DoesNotContain(dev.Writes, w => w.Min < 0); // no release was even attempted
     }
 
     [Fact]
@@ -290,7 +343,7 @@ public sealed class ArcClockLockScenarioTests : IDisposable
 
         var reset = tuner.ResetToDefaults();
 
-        Assert.True(reset.AllSucceeded, Describe(reset));
+        Assert.True(reset.AllSucceeded, reset.Summary);
         Assert.Equal((100d, 2300d), (dev.Min, dev.Max));
         Assert.Null(AppliedStateStore.Load(Uuid));
     }
@@ -302,7 +355,6 @@ public sealed class ArcClockLockScenarioTests : IDisposable
         var tuner = Tuner(dev);
         AppliedStateStore.RecordProbeLockPending(Uuid);
         Assert.True(AppliedStateStore.Load(Uuid)?.ProbeLockPending);
-        _ = tuner.ReadCurrent();
 
         Assert.True(tuner.ForceUnlock().Applied);
 
@@ -314,7 +366,6 @@ public sealed class ArcClockLockScenarioTests : IDisposable
     {
         var dev = new FakeArcDevice();
         var tuner = Tuner(dev);
-        _ = tuner.ReadCurrent();
 
         Assert.Equal(NvmlReturn.Success, tuner.LockClockForProbe(1500));
         Assert.True(AppliedStateStore.Load(Uuid)?.ProbeLockPending);
@@ -408,7 +459,7 @@ public sealed class ArcClockLockScenarioTests : IDisposable
 
         var apply = tuner.Apply(Lock(1500));
 
-        Assert.True(apply.AllSucceeded, Describe(apply));
+        Assert.True(apply.AllSucceeded, apply.Summary);
         Assert.NotNull(tuner.ReadCurrent().LockedCoreClockMHz);
         Assert.Equal(1500u, tuner.AppliedLockMHz);
 
@@ -424,7 +475,7 @@ public sealed class ArcClockLockScenarioTests : IDisposable
         Assert.Equal(1500d, dev.Max);
 
         var release = tuner.Apply(NoLock());
-        Assert.True(release.AllSucceeded, Describe(release));
+        Assert.True(release.AllSucceeded, release.Summary);
         Assert.Null(tuner.AppliedLockMHz);
     }
 
@@ -439,7 +490,7 @@ public sealed class ArcClockLockScenarioTests : IDisposable
 
         var result = tuner.Apply(NoLock(), releaseLock: true);
 
-        Assert.True(result.AllSucceeded, Describe(result));
+        Assert.True(result.AllSucceeded, result.Summary);
         Assert.Single(result.Results, k => k.Knob == "clock lock");
         Assert.Equal((100d, 2300d), (dev.Min, dev.Max));
         Assert.Null(tuner.ReadCurrent().LockedCoreClockMHz);
@@ -453,7 +504,7 @@ public sealed class ArcClockLockScenarioTests : IDisposable
 
         var result = tuner.Apply(NoLock(), releaseLock: true);
 
-        Assert.True(result.AllSucceeded, Describe(result));
+        Assert.True(result.AllSucceeded, result.Summary);
         var knob = Assert.Single(result.Results, k => k.Knob == "clock lock");
         Assert.Contains("(verified)", knob.Detail, StringComparison.Ordinal);
         Assert.DoesNotContain(result.Results, k => k.Knob == "profile");
@@ -477,7 +528,6 @@ public sealed class ArcClockLockScenarioTests : IDisposable
     {
         var dev = new FakeArcDevice();
         var tuner = Tuner(dev);
-        _ = tuner.ReadCurrent();
         Assert.Equal(NvmlReturn.Success, tuner.LockClockForProbe(1500));
         Assert.Equal(1500u, tuner.ReadCurrent().LockedCoreClockMHz);
         Assert.Equal(1500u, tuner.ReadCurrent().LockedCoreClockMHz);

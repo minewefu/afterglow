@@ -80,16 +80,15 @@ live on the Arc B390 the beta was verified on.
   `ok … (verified)` for a clamp that is the unrestricted range — `get` then said
   "none" a second later; it is now refused with the reason. A clamp left behind
   by a crashed session is no longer adopted as the "released" baseline, which had
-  made a real leftover clamp permanently invisible. A release is confirmed from
-  evidence, in this order: if a clamp was being tracked, the ceiling **must**
-  have risen above it or the release fails outright; otherwise, if this process
-  has already observed the GPU unclamped, the readback must reach that ceiling.
-  When neither exists — a `ForceUnlock` in a fresh process with nothing tracked,
-  where a pre-existing limit cannot be told apart from the factory one — the
-  result says "unverified", explains why, and does **not** adopt the reading as
-  the baseline; hiding a surviving clamp is worse than surfacing a limit that
-  turns out to be the factory one. No state is changed until a check passes, so
-  a failed release keeps the tracked clamp for the next apply to retry.
+  made a real leftover clamp permanently invisible. A release is judged from
+  the readback: the floor must be back at the minimum, and the ceiling must not
+  sit below one this process has already verified released — that, and only
+  that, fails. A ceiling that rose, or reached the domain maximum or a verified
+  ceiling, is reported "verified"; one that merely stayed where the clamp was is
+  adopted as the GPU's factory ceiling and said so (the driver's factory restore
+  is measured to return the factory range, see the research notes). No state is
+  changed until the readback passes, so a failed release keeps the tracked clamp
+  for the next apply to retry.
   `ReadCurrent` takes the apply lock, so a concurrent apply can no longer be
   overwritten with a pre-apply reading. And `--lock-clock off` performs one
   release, not two.
@@ -106,10 +105,10 @@ live on the Arc B390 the beta was verified on.
   this fix failed the release instead, which made the phantom permanent: every
   lock-less apply came back PARTIAL and persisted the ceiling as a lock that no
   reset could clear.) Only a ceiling that was merely *observed* is adopted this
-  way. A clamp Afterglow wrote — in this session, or in a crashed session whose
-  record was inherited — is never a factory value and stays under the strict
-  rule: the ceiling must rise, or the release fails and the record survives. A
-  lock-less apply releases such an inherited clamp again, from every front-end,
+  way, and so is a clamp Afterglow wrote at that ceiling — a request above it
+  settles at it, which is measured, so refusing to release such a lock made a
+  second phantom. A
+  lock-less apply releases an inherited clamp again, from every front-end,
   as it did in beta.1, and it reads the live range first when nothing is
   tracked, so a fresh CLI `certify` sees the same state the App's Tuning page
   would have.
@@ -195,10 +194,21 @@ live on the Arc B390 the beta was verified on.
   explicit unlock on an Arc without the clamp reported nothing and exited 0; MCP
   accepted `unlock` beside `lock_clock_mhz` and silently dropped the lock; and
   the pin flag lost the lock the pin displaced. The Arc release verdict is now
-  one rule — the ceiling is back at the highest ceiling this process has seen —
-  which releases a lock written at the factory ceiling (a measured shape the
-  old branches refused) and drops the cap-keeping hypothesis those branches
-  defended against.
+  one rule — the readback ceiling must not sit below one this process has
+  verified released — which releases a lock written at the factory ceiling (a
+  measured shape the old branches refused) and drops the cap-keeping hypothesis
+  those branches defended against.
+- **The tuner owns a sweep's start and end.** `IGpuTuner.BeginProbe` remembers
+  the lock this process applied, releases whatever clamp is on the card so the
+  sweep runs against the true ceiling, and says how high it may pin;
+  `EndProbe` puts the lock back or releases the pin. Only the tuner can capture
+  the displaced lock before its own release empties the tracking — the probe
+  capturing it from outside lost it on Arc, so a game rule or an MCP apply
+  during a sweep dropped the user's lock from the record. The probe's own
+  restore-versus-release choice, its pre-release, and its "did a pin land"
+  bookkeeping are gone with it. An apply that carries a lock and asks for the
+  release is refused by the tuner before anything is written, so no front-end
+  resolves that contradiction silently.
 - **The stepper refuses GPUs with no core-offset knob** instead of burning a full
   cycle at offset 0 and reporting "+0 MHz" as a confirmed stable offset — which
   `find_stable_offset` handed straight to an agent.

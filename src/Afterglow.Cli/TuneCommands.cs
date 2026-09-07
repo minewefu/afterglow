@@ -205,7 +205,9 @@ internal static class TuneCommands
             // not ReadCurrent's element, which on Arc is a driver observation:
             // carrying a factory ceiling forward wrote it as a clamp with
             // written provenance that no release could ever adopt again.
-            LockedCoreClockMHz = unlock ? null : (lockClock ?? gpu.Tuner.AppliedLockMHz),
+            // A lock given beside --lock-clock off reaches the tuner, which
+            // refuses the pair; resolving it here silently picked one answer.
+            LockedCoreClockMHz = lockClock ?? (unlock ? null : gpu.Tuner.AppliedLockMHz),
             VoltageBoostPct = voltageBoost,
         };
 

@@ -14,7 +14,7 @@ namespace Afterglow.Core.Tests;
 public sealed class ProbeRecordStoreTests : IDisposable
 {
     private const string Uuid = "GPU-aaaa1111-2222-3333-4444-555566667777";
-    private const string IndexKey = "index:0";
+    private static readonly string IndexKey = AppliedStateStore.IndexKeyFor(0);
 
     private readonly StoreScope _store = new();
 
@@ -112,7 +112,7 @@ public sealed class ProbeRecordStoreTests : IDisposable
     {
         AppliedStateStore.WriteLegacyRecord(new AppliedStateStore.AppliedState("old build", DateTimeOffset.Now, true, false, 2700));
 
-        Assert.Null(AppliedStateStore.LoadOrAdoptLegacy("INTEL-00:02.0-E20B-0000", "INTEL-00:02.0-E20B-0000"));
+        Assert.Null(AppliedStateStore.LoadOrAdoptLegacy(ArcScenario.Uuid, ArcScenario.Uuid));
         Assert.True(File.Exists(AppPaths.AppliedStateFile));
 
         var adopted = AppliedStateStore.LoadOrAdoptLegacy(IndexKey, null);
@@ -140,6 +140,22 @@ public sealed class ProbeRecordStoreTests : IDisposable
         Assert.False(adopted.CleanShutdown);
         Assert.False(File.Exists(AppPaths.AppliedStateFile));
         Assert.Equal(2700u, AppliedStateStore.Load(IndexKey)?.LockedCoreClockMHz);
+    }
+
+    [Fact]
+    public void A_legacy_record_never_overrides_a_real_record_of_the_cards_own()
+    {
+        // A delete that failed leaves the legacy file behind; it must not
+        // resurrect a lock the user has since released on every launch.
+        AppliedStateStore.WriteLegacyRecord(new AppliedStateStore.AppliedState("old build", DateTimeOffset.Now, true, false, 2700));
+        AppliedStateStore.Record(Profile("released"), true, null, IndexKey);
+
+        var own = AppliedStateStore.LoadOrAdoptLegacy(IndexKey, null);
+
+        Assert.NotNull(own);
+        Assert.Null(own!.LockedCoreClockMHz);
+        Assert.Equal("released", own.ProfileName);
+        Assert.False(File.Exists(AppPaths.AppliedStateFile));
     }
 
     [Fact]

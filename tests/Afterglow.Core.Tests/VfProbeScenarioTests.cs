@@ -30,7 +30,7 @@ public sealed class VfProbeScenarioTests : IDisposable
         })
         {
             SettleSeconds = 0,
-            SampleSeconds = 0.05,
+            SampleSeconds = 0.01,
             SampleIntervalMs = 5,
             StepMHz = 500,
             LoadFactory = () => load ?? new FakeProbeLoad(),
@@ -91,15 +91,26 @@ public sealed class VfProbeScenarioTests : IDisposable
         var dev = new FakeArcDevice();
         var tuner = Tuner(dev);
         var applied = tuner.Apply(Lock(1800));
-        Assert.True(applied.AllSucceeded, Describe(applied));
+        Assert.True(applied.AllSucceeded, applied.Summary);
+        var probe = Probe(tuner, dev);
+        uint? lockSeenMidSweep = null;
+        probe.ProgressChanged += p =>
+        {
+            if (p.Running && p.Phase == "measured")
+            {
+                lockSeenMidSweep ??= tuner.AppliedLockMHz; // while a pin stands
+            }
+        };
 
-        var final = RunToEnd(Probe(tuner, dev));
+        var final = RunToEnd(probe);
 
         Assert.Equal(VfProbeOutcome.Completed, final.Outcome);
         Assert.False(final.RestoreFailed, final.Phase);
+        Assert.Equal(1800u, lockSeenMidSweep);
         Assert.Equal((100d, 1800d), (dev.Min, dev.Max));
         Assert.Equal(1800u, tuner.AppliedLockMHz);
         Assert.NotEqual(true, AppliedStateStore.Load(Uuid)?.ProbeLockPending);
+        Assert.Equal(2300d, dev.PinnedTargets.Max()); // swept against the true ceiling, not under the lock
     }
 
     [Fact]
@@ -272,14 +283,13 @@ public sealed class VfProbeScenarioTests : IDisposable
     [Fact]
     public void A_written_lock_at_the_factory_ceiling_still_gets_a_sweep()
     {
-        // The lock sits exactly at the ceiling a fresh process has never seen
-        // released, so its release cannot be verified in this process. The
-        // sweep must not be refused for that: it runs under the lock and puts
-        // it back.
+        // The lock sits exactly at the factory ceiling. Its pre-sweep release
+        // is taken as the factory ceiling (nothing higher having been seen),
+        // the sweep runs up to it, and the lock is put back afterwards.
         var dev = new FakeArcDevice { FactoryMax = 2250 };
         var tuner = Tuner(dev);
         var applied = tuner.Apply(Lock(2250));
-        Assert.True(applied.AllSucceeded, Describe(applied));
+        Assert.True(applied.AllSucceeded, applied.Summary);
 
         var final = RunToEnd(Probe(tuner, dev));
 

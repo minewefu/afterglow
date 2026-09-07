@@ -164,13 +164,6 @@ public sealed class VfCurveProbe
         // clamp — but take the value from AppliedLockMHz, which is
         // provenance-aware: restoring an observed factory ceiling wrote it back
         // as "written by Afterglow" and blocked the adoption path forever.
-        uint? observedClamp = null;
-        if (_tuner.LockIsDriverReadable)
-        {
-            observedClamp = _tuner.ReadCurrent().LockedCoreClockMHz;
-        }
-
-        uint? previousLock = _tuner.AppliedLockMHz;
 
         // Release whatever clamp the driver shows BEFORE the sweep — the probe
         // restores or releases at the end anyway. Sweeping under a clamp had
@@ -180,41 +173,24 @@ public sealed class VfCurveProbe
         // Once released, the tuner knows the true ceiling and the targets are
         // capped at it. A clamp this process did not apply (another tool's, or
         // the factory ceiling) is released with the rest, and the outcome says so.
-        string? foreignClampNote = null;
-        uint? sweepCeiling = null;
-        if (observedClamp is uint observed && observed > 0)
+        // The tuner prepares the sweep: it remembers the lock this process
+        // applied (so AppliedLockMHz keeps answering with it while pins
+        // stand), releases whatever clamp is on the card so the sweep runs
+        // against the true ceiling, and says how high the sweep may pin.
+        var start = _tuner.BeginProbe();
+        if (start.Refusal is { } refusal)
         {
-            var pre = _tuner.ForceUnlock();
-            if (!pre.Applied && previousLock is uint held)
-            {
-                // The lock this process applied sits where its release cannot
-                // be verified — at a ceiling this process has never seen
-                // released — so it stays on, the sweep runs up to it, and the
-                // restore below puts it back exactly as before.
-                Log.Warn($"V/F probe: the {held} MHz clock lock could not be verifiably released before the sweep " +
-                    $"({pre.Detail}); sweeping up to it instead.");
-                sweepCeiling = held;
-            }
-            else if (!pre.Applied)
-            {
-                Report(new VfProbeProgress(
-                    false, 0, 0, 0, null, null,
-                    $"the clock lock present before the probe could not be released ({pre.Detail}); nothing was pinned",
-                    VfProbeOutcome.Aborted));
-                return;
-            }
-            else if (previousLock is null)
-            {
-                foreignClampNote = $"the driver reported a {observed} MHz clock ceiling this process had not applied " +
-                    "(another tool's clamp, or the factory ceiling); it was released before the sweep, " +
-                    "and the card is at its factory range";
-            }
+            Report(new VfProbeProgress(
+                false, 0, 0, 0, null, null,
+                $"the clock lock present before the probe could not be released ({refusal}); nothing was pinned",
+                VfProbeOutcome.Aborted));
+            return;
         }
 
-        uint lockable = sweepCeiling ?? _tuner.MaxLockableClockMHz;
-        if (lockable > 0 && lockable < maxClock)
+        string? foreignClampNote = start.ForeignClampNote;
+        if (start.MaxClockMHz > 0 && start.MaxClockMHz < maxClock)
         {
-            maxClock = lockable;
+            maxClock = start.MaxClockMHz;
         }
 
         var targets = new List<uint>();
@@ -240,13 +216,6 @@ public sealed class VfCurveProbe
         string? abortReason = null;
         var abortLock = new object();
         int stepsDone = 0;
-
-        // Nothing to restore unless a pin actually landed. On a non-elevated
-        // session step 0's lock is refused, nothing is ever pinned, and the
-        // unconditional release then fails for the SAME reason — which was being
-        // reported as "this GPU may still be pinned", latching an unclean-shutdown
-        // record and a next-launch banner over a session that changed nothing.
-        bool anyLockLanded = false;
 
         // Watch the load. Without a load the GPU never boosts to the locked
         // clock, so every sample is an idle-voltage reading — a curve that is
@@ -313,16 +282,8 @@ public sealed class VfCurveProbe
                 if (lockRc != NvmlReturn.Success)
                 {
                     // Unknown means the driver ACCEPTED the write and only the
-                    // readback failed to confirm it (see ArcGpuTuner's
-                    // WriteClampVerified), so a pin may well be on the card and
-                    // the release below must be held to account for it. Treating
-                    // it as "refused" dropped a failed release on the floor and
-                    // let shutdown stamp the session clean over a pinned GPU.
-                    if (lockRc == NvmlReturn.Unknown)
-                    {
-                        anyLockLanded = true;
-                    }
-
+                    // readback failed to confirm it; the tuner tracks that a
+                    // pin landed, so EndProbe still releases it.
                     // Report what the driver actually said. Only NoPermission
                     // means elevation; blaming administrator rights for every
                     // return code sent users chasing the wrong cause.
@@ -338,7 +299,6 @@ public sealed class VfCurveProbe
                     break;
                 }
 
-                anyLockLanded = true;
                 Sleep(SettleSeconds);
                 if (_cancel)
                 {
@@ -382,28 +342,13 @@ public sealed class VfCurveProbe
             // closing verification left the card exact-pinned until reboot
             // with the restore never reached.
             //
-            // Restore whatever lock state existed before the probe — as the
-            // RANGE lock profiles apply, never as an exact pin (which would
-            // hold full clocks at idle). The result is checked: this is the call
-            // that undoes an exact clock pin, and discarding its return left the
-            // GPU pinned while the UI announced the previous state was restored.
-            string? restoreFailure = null;
-            if (previousLock is uint restore)
-            {
-                var restoreRc = _tuner.RestoreTuningLock(restore);
-                if (restoreRc != NvmlReturn.Success)
-                {
-                    restoreFailure = $"the previous {restore} MHz clock lock could not be restored ({restoreRc})";
-                }
-            }
-            else
-            {
-                var unlocked = _tuner.ForceUnlock();
-                if (!unlocked.Applied && anyLockLanded)
-                {
-                    restoreFailure = $"the probe's clock lock could not be released ({unlocked.Detail})";
-                }
-            }
+            // The tuner puts back the lock BeginProbe remembered, or releases
+            // the pin when there was none. The result is checked: this is the
+            // call that undoes an exact clock pin, and discarding its return
+            // left the GPU pinned while the UI announced the previous state
+            // was restored.
+            var end = _tuner.EndProbe();
+            string? restoreFailure = end.Applied ? null : end.Detail;
 
             // The same 30 s budget every verdict site uses, and the result is
             // checked: the closing verification on a slow iGPU can outlast 5 s,
