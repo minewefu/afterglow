@@ -176,6 +176,29 @@ counters unsupported.
   against. This is the knob Afterglow maps its "locked core clock" onto for
   Arc — with a real "(verified)" suffix, which the NVML lock can never earn
   (no getter exists there).
+- **Frequency-range semantics measured on this device** (2026-09-04, driver
+  32.0.101.8991, elevated, GPU domain reported 100..2300 MHz), each step read
+  back immediately after the write:
+  - the factory restore `SetRange(-1, -1)` returns `100..2300` from a range
+    lock (`100..1500`), from an exact pin (`1500..1500`), from a narrow range
+    (`100..150`), and when already at factory — floor and ceiling alike, every
+    time; a restore that drops only the floor was **not** observed;
+  - on this card the factory range equals the domain range, so a factory
+    ceiling below the domain maximum was **not** observable here (the tuner
+    keeps handling it because the header allows it and discrete Arc reports are
+    still awaited);
+  - writes above the domain maximum return `Success` and are clamped to it:
+    `SetRange(100, 2400)` reads back `100..2300`, and the pin `2400..2400`
+    reads back `2300..2300` — a request the hardware cannot reach is accepted
+    and settles low, which is why the tuner verifies every write by readback;
+  - `SetRange(0, 0)` (the header's "hardware limit" sentinel) reads back
+    `100..2300`; a range write over a pin replaces it cleanly (`1500..1500`
+    then `100..1800` reads back `100..1800`);
+  - a fractional request is **truncated** on readback (`1499.6..1499.6` reads
+    back `1499.0..1499.0`), inside the write path's 1 MHz tolerance and the
+    reason the provenance-transfer tolerance is 2 MHz after rounding.
+  The in-memory device the test suite uses (`FakeArcDevice`) defaults to these
+  behaviours; its switches for the unobserved ones are labelled as hypotheses.
 - **GPU temperature is not exposed** by either stack on this device. The dashboard
   will say so rather than substitute a number from an undocumented source.
 - The shared-memory module (location SYSTEM) is the honest signal the VRAM test

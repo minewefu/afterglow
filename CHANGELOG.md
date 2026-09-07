@@ -156,6 +156,18 @@ live on the Arc B390 the beta was verified on.
   with; the exit-time re-record racing the worker's own resolve; a load engine
   that failed to stop reported as "the GPU proved unstable"; and Reset hiding
   the banner over a record it could not resolve.
+- **The Arc tuner's clamp state is one value.** Seven loose fields (the tracked
+  clamp plus three provenance booleans, the released baseline plus its
+  "observed" flag, and the ceiling high-water mark) became a `TrackedClamp`
+  record with a provenance enum (observed / inherited / written) and a shape
+  enum (range / exact pin), plus a nullable observed ceiling. Illegal
+  combinations — a clamp both written and inherited, a pin flag with no clamp —
+  can no longer be represented, so the release rules read as a decision on one
+  value rather than on four fields that had to be reset together by hand. The
+  frequency-range semantics were measured on the B390 the same day and are
+  recorded in `docs/research/intel-driver-apis.md`: a factory restore always
+  returns the full range, writes above the domain maximum are clamped rather
+  than refused, and fractional requests are truncated on readback.
 - **The stepper refuses GPUs with no core-offset knob** instead of burning a full
   cycle at offset 0 and reporting "+0 MHz" as a confirmed stable offset — which
   `find_stable_offset` handed straight to an agent.

@@ -54,13 +54,26 @@ internal sealed class FakeArcDevice : IArcDevice
     /// <summary>Result of every range read.</summary>
     public CtlResult ReadResult { get; set; } = CtlResult.Success;
 
-    /// <summary>A factory restore drops the floor but leaves the ceiling where it was.</summary>
+    /// <summary>
+    /// A factory restore drops the floor but leaves the ceiling where it was.
+    /// HYPOTHESIS: measured on the B390 (2026-09-04) a restore always returned
+    /// the full range; no driver has been seen doing this.
+    /// </summary>
     public bool KeepCapOnRestore { get; set; }
 
-    /// <summary>A write above the factory ceiling settles at the ceiling instead of being refused.</summary>
+    /// <summary>
+    /// A write above the factory ceiling settles at the ceiling instead of
+    /// being refused. MEASURED on the B390 (2026-09-04): writes above the
+    /// domain maximum return Success and read back clamped to it, ranges and
+    /// pins alike.
+    /// </summary>
     public bool ClampWritesToFactoryMax { get; set; } = true;
 
-    /// <summary>Added to every readback, to model a driver that settles a fraction off the request.</summary>
+    /// <summary>
+    /// Added to every readback, to model a driver that settles a fraction off
+    /// the request. MEASURED on the B390: a fractional request is truncated
+    /// (1499.6 reads back 1499.0), so a negative fraction is the realistic value.
+    /// </summary>
     public double ReadbackOffset { get; set; }
 
     /// <summary>Every range write, in order (restores appear as -1/-1).</summary>

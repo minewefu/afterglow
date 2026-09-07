@@ -303,6 +303,26 @@ public sealed class ArcClockLockScenarioTests : IDisposable
     }
 
     [Fact]
+    public void A_driver_that_truncates_the_readback_keeps_the_written_provenance()
+    {
+        // Measured on the B390: a request of 1499.6 reads back 1499.0. A
+        // readback a fraction below the request must pass the write's
+        // verification and must not demote the lock to "observed" on the next
+        // read — that demotion is what made a verified lock un-releasable.
+        var dev = new FakeArcDevice { ReadbackOffset = -0.6 };
+        var tuner = Tuner(dev);
+
+        var apply = tuner.Apply(Lock(1500));
+
+        Assert.True(apply.AllSucceeded, Describe(apply));
+        Assert.NotNull(tuner.ReadCurrent().LockedCoreClockMHz);
+        Assert.Equal(1500u, tuner.AppliedLockMHz);
+        var release = tuner.Apply(NoLock());
+        Assert.True(release.AllSucceeded, Describe(release));
+        Assert.Null(tuner.AppliedLockMHz);
+    }
+
+    [Fact]
     public void Dashboard_reads_during_a_pin_do_not_make_it_unreleasable()
     {
         var dev = new FakeArcDevice();
