@@ -218,15 +218,6 @@ internal static class TuneCommands
         bool allOk = result.AllSucceeded;
         foreach (var knob in result.Results)
         {
-            // A bare `--lock-clock off` carries no other knob, so the engine's
-            // "nothing in this profile applies" note is expected here and would
-            // read as though the release had not happened. It still counts
-            // toward the result; it just is not news worth printing.
-            if (unlock && knob.Applied && knob.Knob == "profile")
-            {
-                continue;
-            }
-
             Console.WriteLine($"  {(knob.Applied ? "ok  " : "FAIL")} {knob.Knob,-18} {knob.Detail}");
         }
 

@@ -1,8 +1,9 @@
 using Afterglow.Core.Interop.Igcl;
-using Afterglow.Core.Profiles;
+using Afterglow.Core.Stress;
 using Afterglow.Core.Telemetry;
 using Afterglow.Core.Tests.Fakes;
 using Afterglow.Core.Tuning;
+using static Afterglow.Core.Tests.Fakes.ArcScenario;
 
 namespace Afterglow.Core.Tests;
 
@@ -14,13 +15,9 @@ namespace Afterglow.Core.Tests;
 [Collection("AppPaths")]
 public sealed class VfProbeScenarioTests : IDisposable
 {
-    private const string Uuid = "INTEL-00:02.0-E20B-0000";
-
     private readonly StoreScope _store = new();
 
     public void Dispose() => _store.Dispose();
-
-    private static ArcGpuTuner Tuner(FakeArcDevice device) => new(device, Uuid);
 
     private static VfCurveProbe Probe(ArcGpuTuner tuner, FakeArcDevice device, FakeProbeLoad? load = null) =>
         new(tuner, () => new GpuSnapshot
@@ -33,7 +30,8 @@ public sealed class VfProbeScenarioTests : IDisposable
         })
         {
             SettleSeconds = 0,
-            SampleSeconds = 0.2,
+            SampleSeconds = 0.05,
+            SampleIntervalMs = 5,
             StepMHz = 500,
             LoadFactory = () => load ?? new FakeProbeLoad(),
         };
@@ -52,9 +50,6 @@ public sealed class VfProbeScenarioTests : IDisposable
         Assert.NotNull(terminal);
         return terminal!;
     }
-
-    private static string Describe(ApplyResult result) =>
-        string.Join("; ", result.Results.Select(r => $"{r.Knob}={(r.Applied ? "ok" : "FAIL")} {r.Detail}"));
 
     [Fact]
     public void A_full_sweep_pins_every_target_and_leaves_the_card_at_factory()
@@ -95,7 +90,7 @@ public sealed class VfProbeScenarioTests : IDisposable
     {
         var dev = new FakeArcDevice();
         var tuner = Tuner(dev);
-        var applied = tuner.Apply(new TuningProfile { Name = "lock", LockedCoreClockMHz = 1800 });
+        var applied = tuner.Apply(Lock(1800));
         Assert.True(applied.AllSucceeded, Describe(applied));
 
         var final = RunToEnd(Probe(tuner, dev));
@@ -104,6 +99,21 @@ public sealed class VfProbeScenarioTests : IDisposable
         Assert.False(final.RestoreFailed, final.Phase);
         Assert.Equal((100d, 1800d), (dev.Min, dev.Max));
         Assert.Equal(1800u, tuner.AppliedLockMHz);
+        Assert.NotEqual(true, AppliedStateStore.Load(Uuid)?.ProbeLockPending);
+    }
+
+    [Fact]
+    public void A_hardware_verdict_during_teardown_is_reported_as_a_load_failure()
+    {
+        var dev = new FakeArcDevice();
+        var tuner = Tuner(dev);
+
+        var final = RunToEnd(Probe(tuner, dev, new FakeProbeLoad { TeardownState = StressState.ArtifactDetected }));
+
+        Assert.Equal(VfProbeOutcome.Completed, final.Outcome);
+        Assert.NotNull(final.LoadFailure);
+        Assert.Contains("miscalculated", final.LoadFailure, StringComparison.Ordinal);
+        Assert.False(final.RestoreFailed, final.Phase);
     }
 
     [Fact]
@@ -268,7 +278,7 @@ public sealed class VfProbeScenarioTests : IDisposable
         // it back.
         var dev = new FakeArcDevice { FactoryMax = 2250 };
         var tuner = Tuner(dev);
-        var applied = tuner.Apply(new TuningProfile { Name = "lock", LockedCoreClockMHz = 2250 });
+        var applied = tuner.Apply(Lock(2250));
         Assert.True(applied.AllSucceeded, Describe(applied));
 
         var final = RunToEnd(Probe(tuner, dev));

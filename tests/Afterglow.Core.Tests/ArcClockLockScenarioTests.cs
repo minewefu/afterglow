@@ -1,8 +1,8 @@
 using Afterglow.Core.Interop.Igcl;
 using Afterglow.Core.Interop.Nvml;
-using Afterglow.Core.Profiles;
 using Afterglow.Core.Tests.Fakes;
 using Afterglow.Core.Tuning;
+using static Afterglow.Core.Tests.Fakes.ArcScenario;
 
 namespace Afterglow.Core.Tests;
 
@@ -15,20 +15,9 @@ namespace Afterglow.Core.Tests;
 [Collection("AppPaths")]
 public sealed class ArcClockLockScenarioTests : IDisposable
 {
-    private const string Uuid = "INTEL-00:02.0-E20B-0000";
-
     private readonly StoreScope _store = new();
 
     public void Dispose() => _store.Dispose();
-
-    private static ArcGpuTuner Tuner(FakeArcDevice device) => new(device, Uuid);
-
-    private static TuningProfile Lock(uint mhz) => new() { Name = "lock", LockedCoreClockMHz = mhz };
-
-    private static TuningProfile NoLock() => new() { Name = "plain" };
-
-    private static string Describe(ApplyResult result) =>
-        string.Join("; ", result.Results.Select(r => $"{r.Knob}={(r.Applied ? "ok" : "FAIL")} {r.Detail}"));
 
     [Fact]
     public void A_range_lock_is_written_verified_and_persisted()
@@ -131,18 +120,54 @@ public sealed class ArcClockLockScenarioTests : IDisposable
     }
 
     [Fact]
-    public void A_written_lock_whose_cap_the_driver_keeps_is_a_failed_release()
+    public void A_written_lock_whose_release_the_driver_refuses_stays_tracked()
     {
         var dev = new FakeArcDevice();
         var tuner = Tuner(dev);
         Assert.True(tuner.Apply(Lock(1500)).AllSucceeded);
-        dev.KeepCapOnRestore = true;
+        dev.RestoreResult = CtlResult.ErrorUnknown;
 
         var release = tuner.ForceUnlock();
 
         Assert.False(release.Applied, release.Detail);
         Assert.Equal(1500u, tuner.AppliedLockMHz);
         Assert.Equal(1500u, tuner.ReadCurrent().LockedCoreClockMHz);
+    }
+
+    [Fact]
+    public void A_range_lock_written_at_the_factory_ceiling_is_released_verified()
+    {
+        // Measured: a request above the ceiling settles at it. A lock written
+        // there can never show a rising ceiling on release; the ceiling being
+        // back at the highest one seen is the proof.
+        var dev = new FakeArcDevice { FactoryMax = 2250 };
+        var tuner = Tuner(dev);
+        var applied = tuner.Apply(Lock(2250));
+        Assert.True(applied.AllSucceeded, Describe(applied));
+
+        var release = tuner.ForceUnlock();
+
+        Assert.True(release.Applied, release.Detail);
+        Assert.Contains("(verified)", release.Detail, StringComparison.Ordinal);
+        Assert.Equal((100d, 2250d), (dev.Min, dev.Max));
+        Assert.Null(tuner.AppliedLockMHz);
+        Assert.Null(tuner.ReadCurrent().LockedCoreClockMHz);
+    }
+
+    [Fact]
+    public void A_release_whose_readback_falls_short_of_the_highest_ceiling_seen_fails()
+    {
+        // The one shape the single rule refuses: this process has seen the
+        // ceiling higher than the restore left it, so a cap stayed.
+        var dev = new FakeArcDevice();
+        var tuner = Tuner(dev);
+        Assert.True(tuner.Apply(Lock(1500)).AllSucceeded); // the pre-write read saw 2300
+        dev.ReadbackOffset = -900; // every readback now lands well below that
+
+        var release = tuner.ForceUnlock();
+
+        Assert.False(release.Applied, release.Detail);
+        Assert.Equal(1500u, tuner.AppliedLockMHz);
     }
 
     [Fact]
@@ -177,13 +202,13 @@ public sealed class ArcClockLockScenarioTests : IDisposable
     }
 
     [Fact]
-    public void A_pin_whose_cap_the_driver_keeps_is_a_failed_release()
+    public void A_pin_whose_release_the_driver_refuses_is_a_failed_release()
     {
         var dev = new FakeArcDevice();
         var tuner = Tuner(dev);
         _ = tuner.ReadCurrent();
         Assert.Equal(NvmlReturn.Success, tuner.LockClockForProbe(1500));
-        dev.KeepCapOnRestore = true;
+        dev.RestoreResult = CtlResult.ErrorUnknown;
 
         var release = tuner.ForceUnlock();
 
@@ -191,26 +216,42 @@ public sealed class ArcClockLockScenarioTests : IDisposable
         Assert.Equal(1500u, tuner.ReadCurrent().LockedCoreClockMHz);
     }
 
-    [Theory]
-    [InlineData(1)]
-    [InlineData(2)]
-    public void A_leftover_pin_whose_cap_sticks_is_never_adopted_as_the_factory_ceiling(int readsBeforeRelease)
+    [Fact]
+    public void A_readback_getter_failure_after_a_pin_write_leaves_the_pin_tracked_and_on_record()
     {
-        // A dead session left the card pinned; nothing on record. However many
-        // times the dashboard polled first, a restore that drops the floor but
-        // keeps the cap is a failure — not "this GPU's factory ceiling".
-        var dev = new FakeArcDevice { Min = 1500, Max = 1500, KeepCapOnRestore = true };
+        var dev = new FakeArcDevice();
         var tuner = Tuner(dev);
-        for (int i = 0; i < readsBeforeRelease; i++)
-        {
-            Assert.Equal(1500u, tuner.ReadCurrent().LockedCoreClockMHz);
-        }
+        _ = tuner.ReadCurrent();
+        dev.ReadResult = CtlResult.ErrorUnknown;
 
+        Assert.Equal(NvmlReturn.Unknown, tuner.LockClockForProbe(1500));
+        Assert.True(AppliedStateStore.Load(Uuid)?.ProbeLockPending);
+
+        dev.ReadResult = CtlResult.Success;
         var release = tuner.ForceUnlock();
+        Assert.True(release.Applied, release.Detail);
+        Assert.Null(AppliedStateStore.Load(Uuid));
+    }
 
-        Assert.False(release.Applied, release.Detail);
-        Assert.Equal(1500u, tuner.ReadCurrent().LockedCoreClockMHz);
-        Assert.Equal(2300u, tuner.MaxLockableClockMHz);
+    [Fact]
+    public void The_users_lock_stays_the_applied_lock_while_a_pin_stands_and_after_its_release_fails()
+    {
+        var dev = new FakeArcDevice();
+        var tuner = Tuner(dev);
+        Assert.True(tuner.Apply(Lock(1800)).AllSucceeded);
+
+        Assert.Equal(NvmlReturn.Success, tuner.LockClockForProbe(1500));
+        Assert.Equal(1800u, tuner.AppliedLockMHz);
+
+        dev.RestoreResult = CtlResult.ErrorUnknown;
+        Assert.False(tuner.ForceUnlock().Applied);
+        Assert.Equal(1800u, tuner.AppliedLockMHz);
+
+        dev.RestoreResult = CtlResult.Success;
+        Assert.Equal(NvmlReturn.Success, tuner.RestoreTuningLock(1800));
+        Assert.Equal(1800u, tuner.AppliedLockMHz);
+        Assert.Equal((100d, 1800d), (dev.Min, dev.Max));
+        Assert.NotEqual(true, AppliedStateStore.Load(Uuid)?.ProbeLockPending);
     }
 
     [Fact]
@@ -278,9 +319,34 @@ public sealed class ArcClockLockScenarioTests : IDisposable
         Assert.Equal(NvmlReturn.Success, tuner.LockClockForProbe(1500));
         Assert.True(AppliedStateStore.Load(Uuid)?.ProbeLockPending);
 
-        dev.KeepCapOnRestore = true;
+        dev.RestoreResult = CtlResult.ErrorUnknown;
         Assert.False(tuner.ForceUnlock().Applied);
         Assert.True(AppliedStateStore.Load(Uuid)?.ProbeLockPending);
+    }
+
+    [Fact]
+    public void A_refused_pin_does_not_erase_an_older_sessions_pin_record()
+    {
+        AppliedStateStore.RecordProbeLockPending(Uuid); // a session that never released its pin
+        var dev = new FakeArcDevice { WriteResult = CtlResult.ErrorInsufficientPermissions };
+        var tuner = Tuner(dev);
+
+        Assert.NotEqual(NvmlReturn.Success, tuner.LockClockForProbe(1500));
+
+        Assert.True(AppliedStateStore.Load(Uuid)?.ProbeLockPending);
+    }
+
+    [Fact]
+    public void An_explicit_release_on_a_card_without_the_clamp_is_one_failed_knob()
+    {
+        var dev = new FakeArcDevice { HwMax = 0 }; // the domain reports no controllable range
+        var tuner = Tuner(dev);
+        Assert.False(tuner.Capabilities.SupportsLockedCoreClock);
+
+        var result = tuner.Apply(NoLock(), releaseLock: true);
+
+        Assert.False(result.AllSucceeded);
+        Assert.Single(result.Results, k => k.Knob == "clock lock" && !k.Applied);
     }
 
     [Fact]

@@ -454,6 +454,16 @@ internal static class McpCommand
     {
         var current = gpu.Tuner.ReadCurrent();
         bool unlock = args?["unlock"]?.GetValue<bool>() ?? false;
+        if (unlock && args?["lock_clock_mhz"] is not null)
+        {
+            // Two answers to one question. Dropping the lock silently returned
+            // all_succeeded:true to a request that asked for a lock.
+            return new
+            {
+                all_succeeded = false,
+                error = "'unlock' and 'lock_clock_mhz' contradict each other: pass one or the other. Nothing was applied.",
+            };
+        }
 
         var profile = new TuningProfile
         {
@@ -519,19 +529,7 @@ internal static class McpCommand
         // or not this session tracks one — and reports it as the "clock lock"
         // knob, so all_succeeded reflects the release and nothing else.
         var result = gpu.Tuner.Apply(profile, releaseLock: unlock);
-        var knobs = new List<KnobResult>();
-        foreach (var knob in result.Results)
-        {
-            // With the release already done and reported, Apply's leftover
-            // "nothing else in this profile applies" note is noise that would
-            // read as though the unlock had not happened.
-            if (unlock && knob.Applied && knob.Knob == "profile")
-            {
-                continue;
-            }
-
-            knobs.Add(knob);
-        }
+        var knobs = new List<KnobResult>(result.Results);
 
         if (fanArg is { } fan)
         {

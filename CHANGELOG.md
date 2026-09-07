@@ -187,6 +187,18 @@ live on the Arc B390 the beta was verified on.
   used to release first and then reconcile that against Apply's own release by
   knob name, printing two lines for one request or a FAIL beside a verified
   release; both are now a single call.
+- **Review of the harness batch (medium effort, 8 findings, all applied).** The
+  NVIDIA restore path never resolved the pin record, so every successful probe
+  under a user lock raised the "may still be pinned" banner; a refused pin
+  write erased an older session's still-true pin record; the upgrade path
+  dropped a legacy record's lock when the card already had a probe record; an
+  explicit unlock on an Arc without the clamp reported nothing and exited 0; MCP
+  accepted `unlock` beside `lock_clock_mhz` and silently dropped the lock; and
+  the pin flag lost the lock the pin displaced. The Arc release verdict is now
+  one rule — the ceiling is back at the highest ceiling this process has seen —
+  which releases a lock written at the factory ceiling (a measured shape the
+  old branches refused) and drops the cap-keeping hypothesis those branches
+  defended against.
 - **The stepper refuses GPUs with no core-offset knob** instead of burning a full
   cycle at offset 0 and reporting "+0 MHz" as a confirmed stable offset — which
   `find_stable_offset` handed straight to an agent.

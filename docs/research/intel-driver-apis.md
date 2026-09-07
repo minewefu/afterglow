@@ -197,8 +197,11 @@ counters unsupported.
   - a fractional request is **truncated** on readback (`1499.6..1499.6` reads
     back `1499.0..1499.0`), inside the write path's 1 MHz tolerance and the
     reason the provenance-transfer tolerance is 2 MHz after rounding.
-  The in-memory device the test suite uses (`FakeArcDevice`) defaults to these
-  behaviours; its switches for the unobserved ones are labelled as hypotheses.
+  The in-memory device the test suite uses (`FakeArcDevice`) models exactly
+  these behaviours. A restore that keeps the cap is not modelled and the tuner
+  no longer carries branches for it: a release is verified by the ceiling being
+  back at the highest ceiling the process has seen, which fails a kept cap
+  without a special case should a driver ever show one.
 - **GPU temperature is not exposed** by either stack on this device. The dashboard
   will say so rather than substitute a number from an undocumented source.
 - The shared-memory module (location SYSTEM) is the honest signal the VRAM test

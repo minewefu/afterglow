@@ -152,7 +152,7 @@ public sealed class GpuTuner : IGpuTuner
         {
             lock (_applyLock)
             {
-                return _shadowIsProbePin ? null : _appliedLockMHz;
+                return _shadowIsProbePin ? _lockBeforePin : _appliedLockMHz;
             }
         }
     }
@@ -321,7 +321,19 @@ public sealed class GpuTuner : IGpuTuner
     // The shadow holds the probe's exact pin while a sweep runs. A pin is
     // never "the lock Afterglow applied": reporting it there made the next
     // sweep restore a failed-release pin as a range lock the user never set.
+    // The lock the pin displaced is kept beside it, so AppliedLockMHz still
+    // answers with the user's lock while the pin stands and after a failed
+    // pin release — matching the record on disk instead of contradicting it
+    // until the next restart.
     private bool _shadowIsProbePin;
+    private uint? _lockBeforePin;
+
+    private void ClearShadow()
+    {
+        _appliedLockMHz = null;
+        _shadowIsProbePin = false;
+        _lockBeforePin = null;
+    }
 
     /// <summary>
     /// A verified lock release or re-apply proves any V/F probe pin on this
@@ -361,7 +373,7 @@ public sealed class GpuTuner : IGpuTuner
             var unlockRc = _nvml.TryResetGpuLockedClocks();
             if (unlockRc == NvmlReturn.Success)
             {
-                _appliedLockMHz = null;
+                ClearShadow();
                 ResolveProbeRecord(); // the lock is gone whatever the other knobs do
             }
 
@@ -838,6 +850,7 @@ public sealed class GpuTuner : IGpuTuner
             {
                 _appliedLockMHz = lockMHz;
                 _shadowIsProbePin = false;
+                _lockBeforePin = null;
                 ResolveProbeRecord(); // a range lock this process wrote supersedes any probe pin
             }
 
@@ -857,16 +870,19 @@ public sealed class GpuTuner : IGpuTuner
         uint? previous = _appliedLockMHz;
         if (previous is not null || releaseLock)
         {
+            string detail = previous is uint was
+                ? _shadowIsProbePin
+                    ? $"released the V/F probe's {was} MHz pin"
+                    : $"removed (was {RangeLockFloorMHz}..{was} MHz)"
+                : "released (explicit)";
             var rc = _nvml.TryResetGpuLockedClocks();
             if (rc == NvmlReturn.Success)
             {
-                _appliedLockMHz = null;
+                ClearShadow();
                 ResolveProbeRecord();
             }
 
-            Report(results, "clock lock", rc, previous is uint was
-                ? $"removed (was {RangeLockFloorMHz}..{was} MHz)"
-                : "released (explicit)");
+            Report(results, "clock lock", rc, detail);
         }
     }
 
@@ -885,6 +901,8 @@ public sealed class GpuTuner : IGpuTuner
             {
                 _appliedLockMHz = lockMHz;
                 _shadowIsProbePin = false;
+                _lockBeforePin = null;
+                ResolveProbeRecord(); // the range lock is back in place of the pin
             }
 
             return rc;
@@ -901,15 +919,21 @@ public sealed class GpuTuner : IGpuTuner
         {
             // On record BEFORE the write: a pin outlives a killed process, and
             // the record is what the next launch reads. A refused write has
-            // pinned nothing, so the record is resolved again at once.
-            AppliedStateStore.RecordProbeLockPending(_recordKey);
+            // pinned nothing, so a record THIS call created is resolved again
+            // at once — one an earlier session left is still true and stays.
+            bool alreadyPending = AppliedStateStore.RecordProbeLockPending(_recordKey);
             var rc = _nvml.TrySetGpuLockedClocks(clockMHz, clockMHz);
             if (rc == NvmlReturn.Success)
             {
+                if (!_shadowIsProbePin)
+                {
+                    _lockBeforePin = _appliedLockMHz;
+                }
+
                 _appliedLockMHz = clockMHz;
                 _shadowIsProbePin = true;
             }
-            else
+            else if (!alreadyPending)
             {
                 ResolveProbeRecord();
             }
@@ -929,7 +953,7 @@ public sealed class GpuTuner : IGpuTuner
             var rc = _nvml.TryResetGpuLockedClocks();
             if (rc == NvmlReturn.Success)
             {
-                _appliedLockMHz = null;
+                ClearShadow();
                 ResolveProbeRecord();
             }
 
@@ -1070,7 +1094,6 @@ public static class AppliedStateStore
         uint? LockedCoreClockMHz = null,
         string? FanMode = null,
         uint? FanDuty = null,
-        bool Pending = false,
         string? GpuUuid = null,
         bool ProbeLockPending = false);
 
@@ -1085,7 +1108,6 @@ public static class AppliedStateStore
             AppliedAt = DateTimeOffset.Now,
             AllKnobsSucceeded = false,
             CleanShutdown = false,
-            Pending = true,
             GpuUuid = key,
         });
     }
@@ -1108,7 +1130,6 @@ public static class AppliedStateStore
             AllKnobsSucceeded = allSucceeded,
             CleanShutdown = false,
             LockedCoreClockMHz = lockWrittenByAfterglow,
-            Pending = false,
             GpuUuid = key,
         });
     }
@@ -1141,15 +1162,36 @@ public static class AppliedStateStore
     /// truthful record behind. The flag is its own fact, independent of
     /// <see cref="AppliedState.CleanShutdown"/>: a clean exit is still a clean
     /// exit, and the next launch reads the flag to raise the pin banner.
+    /// Returns true when the flag was already set — by an earlier step, or by
+    /// a session that never released its pin — so a refused write resolves only
+    /// a record it created itself, and a sweep writes the file once, not per step.
     /// </summary>
-    public static void RecordProbeLockPending(string key)
+    public static bool RecordProbeLockPending(string key)
     {
-        Mutate(key, state => (state ?? Empty(ProbeLockPendingName)) with
+        lock (Lock)
         {
-            AppliedAt = DateTimeOffset.Now,
-            ProbeLockPending = true,
-            GpuUuid = key,
-        });
+            try
+            {
+                string path = PathFor(key);
+                var state = ReadFile(path);
+                if (state is { ProbeLockPending: true })
+                {
+                    return true; // already on record: nothing to write, and not this call's to resolve
+                }
+
+                WriteFile(path, (state ?? Empty(ProbeLockPendingName)) with
+                {
+                    AppliedAt = DateTimeOffset.Now,
+                    ProbeLockPending = true,
+                    GpuUuid = key,
+                });
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+            }
+
+            return false;
+        }
     }
 
     /// <summary>
@@ -1228,6 +1270,15 @@ public static class AppliedStateStore
         }
     }
 
+    /// <summary>Test seam: writes the pre-multi-GPU single file the way an older build did.</summary>
+    internal static void WriteLegacyRecord(AppliedState state)
+    {
+        lock (Lock)
+        {
+            WriteFile(AppPaths.AppliedStateFile, state);
+        }
+    }
+
     /// <summary>The record filed under <paramref name="key"/>, or null.</summary>
     public static AppliedState? Load(string key)
     {
@@ -1266,12 +1317,23 @@ public static class AppliedStateStore
 
             try
             {
-                if (own is null)
-                {
-                    own = legacy with { GpuUuid = key };
-                    WriteFile(PathFor(key), own);
-                }
-
+                // Merge what only the legacy record still holds before retiring
+                // it: the previous layout kept a UUID-less card's lock in the
+                // legacy file while a probe record lived in its index-keyed file,
+                // and dropping the legacy file on the strength of that probe
+                // record lost the one lock the tuner still had to release.
+                own = own is null
+                    ? legacy with { GpuUuid = key }
+                    : own with
+                    {
+                        ProfileName = own.ProfileName == ProbeLockPendingName ? legacy.ProfileName : own.ProfileName,
+                        LockedCoreClockMHz = own.LockedCoreClockMHz ?? legacy.LockedCoreClockMHz,
+                        FanMode = own.FanMode ?? legacy.FanMode,
+                        FanDuty = own.FanDuty ?? legacy.FanDuty,
+                        CleanShutdown = own.CleanShutdown && legacy.CleanShutdown,
+                        AllKnobsSucceeded = own.AllKnobsSucceeded && legacy.AllKnobsSucceeded,
+                    };
+                WriteFile(PathFor(key), own);
                 File.Delete(AppPaths.AppliedStateFile);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

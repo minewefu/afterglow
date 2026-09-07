@@ -81,11 +81,23 @@ public sealed class ArcGpuTuner : IGpuTuner
     /// written and inherited — the four booleans this replaced had to be
     /// reset together by hand at every write site.
     /// </summary>
-    private readonly record struct TrackedClamp(uint Mhz, ClampProvenance Provenance, ClampShape Shape)
+    private readonly record struct TrackedClamp(
+        uint Mhz,
+        ClampProvenance Provenance,
+        ClampShape Shape,
+        uint? LockBeforePin = null)
     {
         public bool AfterglowWrote => Provenance != ClampProvenance.Observed;
 
         public bool IsPin => Shape == ClampShape.ExactPin;
+
+        /// <summary>
+        /// The lock Afterglow applied: a written or inherited range lock — or,
+        /// while the probe's pin stands, the range lock the pin displaced, so a
+        /// failed pin release does not make the user's lock vanish until the
+        /// next restart re-reads it from the record.
+        /// </summary>
+        public uint? AppliedLock => IsPin ? LockBeforePin : AfterglowWrote ? Mhz : null;
     }
 
     private TrackedClamp? _clamp;
@@ -124,16 +136,25 @@ public sealed class ArcGpuTuner : IGpuTuner
     /// resolved — the release just proved its pin is gone. One helper: the
     /// triplet was pasted at four sites and a fifth had to remember it.
     /// </summary>
-    private void AdoptReleasedBaseline(double max, bool verified = true)
+    private void AdoptReleasedBaseline(double max)
     {
         _clamp = null;
         _observedReleasedMaxMhz = max;
         _ceilingHighWaterMhz = Math.Max(_ceilingHighWaterMhz, max);
-        if (verified)
+        ResolveProbeRecord();
+    }
+
+    /// <summary>
+    /// Feeds the ceiling high-water mark from a readback before a write, so the
+    /// first release in a process knows the best ceiling it has seen — the
+    /// release proof compares against it, and the write paths were the one
+    /// place a fresh process could clamp a card it had never read.
+    /// </summary>
+    private void NoteCeiling()
+    {
+        if (_device.TryGetFrequencyRange(_gpuFreqDomain, out var range) == CtlResult.Success && range.Max > 0)
         {
-            // Only a VERIFIED release proves a probe's pin gone; the
-            // "rise not verifiable" adoption of a factory ceiling does not.
-            ResolveProbeRecord();
+            _ceilingHighWaterMhz = Math.Max(_ceilingHighWaterMhz, range.Max);
         }
     }
 
@@ -228,7 +249,7 @@ public sealed class ArcGpuTuner : IGpuTuner
                 // the probe's, never the lock Afterglow applied: reporting it
                 // here made the next sweep restore a failed-release pin as a
                 // range lock the user never set, on every stepper step too.
-                return _clamp is { AfterglowWrote: true, IsPin: false } applied ? applied.Mhz : null;
+                return _clamp?.AppliedLock;
             }
         }
     }
@@ -313,6 +334,7 @@ public sealed class ArcGpuTuner : IGpuTuner
             // verified write reclassified as merely observed on the next read.
             uint committed = seen;
             var provenance = ClampProvenance.Observed;
+            uint? lockBeforePin = null;
             if (_clamp is { } tracked && Math.Abs((long)tracked.Mhz - seen) <= 2)
             {
                 // Keep what was WRITTEN, not the truncated echo of it: the B390
@@ -321,6 +343,7 @@ public sealed class ArcGpuTuner : IGpuTuner
                 // rule) drift the lock down by a megahertz.
                 committed = tracked.Mhz;
                 provenance = tracked.Provenance;
+                lockBeforePin = tracked.LockBeforePin;
             }
 
             // The shape is the driver's, whatever the history: a pin is a
@@ -328,7 +351,8 @@ public sealed class ArcGpuTuner : IGpuTuner
             // pin with a range lock at the same ceiling, and a pin left by a
             // dead session is a pin from its very first read — the release
             // path refuses to adopt one as a factory ceiling.
-            _clamp = new TrackedClamp(committed, provenance, minRaised ? ClampShape.ExactPin : ClampShape.Range);
+            _clamp = new TrackedClamp(
+                committed, provenance, minRaised ? ClampShape.ExactPin : ClampShape.Range, lockBeforePin);
             return committed;
         }
     }
@@ -492,18 +516,21 @@ public sealed class ArcGpuTuner : IGpuTuner
             }
 
             bool isPin = Math.Abs(max - min) < 0.5;
+            bool alreadyPending = false;
             if (isPin)
             {
                 // On record BEFORE the write: a pin outlives a killed process,
                 // and the record is what the next launch reads. A refused
-                // write has pinned nothing, so the record is resolved at once.
-                AppliedStateStore.RecordProbeLockPending(RecordKey);
+                // write has pinned nothing, so a record THIS call created is
+                // resolved at once — one an earlier session left is still true.
+                alreadyPending = AppliedStateStore.RecordProbeLockPending(RecordKey);
             }
 
+            NoteCeiling();
             var rc = _device.TrySetFrequencyRange(_gpuFreqDomain, min, max);
             if (rc != CtlResult.Success)
             {
-                if (isPin)
+                if (isPin && !alreadyPending)
                 {
                     ResolveProbeRecord();
                 }
@@ -513,11 +540,14 @@ public sealed class ArcGpuTuner : IGpuTuner
 
             // The write landed with the driver; the shadow records that a clamp
             // may now be present whether or not the readback confirms the value,
-            // so a release is still attempted for it.
+            // so a release is still attempted for it. A pin remembers the lock
+            // it displaced (the first pin of a sweep takes it from the tracked
+            // clamp; later pins carry it forward).
             _clamp = new TrackedClamp(
                 shadow,
                 ClampProvenance.Written, // this process's write supersedes an inherited record
-                isPin ? ClampShape.ExactPin : ClampShape.Range);
+                isPin ? ClampShape.ExactPin : ClampShape.Range,
+                isPin ? _clamp?.AppliedLock : null);
 
             if (_device.TryGetFrequencyRange(_gpuFreqDomain, out var readback) != CtlResult.Success)
             {
@@ -589,6 +619,7 @@ public sealed class ArcGpuTuner : IGpuTuner
                 ? $" (requested {lockMHz}, clamped to hardware range {_hwMinMhz:F0}..{_hwMaxMhz:F0})"
                 : string.Empty;
 
+            NoteCeiling();
             var rc = _device.TrySetFrequencyRange(_gpuFreqDomain, _hwMinMhz, clamped);
             if (rc != CtlResult.Success)
             {
@@ -637,6 +668,14 @@ public sealed class ArcGpuTuner : IGpuTuner
         // than failing every apply.
         if (!Capabilities.SupportsLockedCoreClock)
         {
+            if (releaseLock)
+            {
+                // The explicit request still gets its one verdict — the
+                // answer ForceUnlock gives — rather than an empty result that
+                // the front-ends print as success.
+                results.Add(KnobResult.Fail("clock lock", "the frequency clamp isn't available on this GPU"));
+            }
+
             return;
         }
 
@@ -719,119 +758,42 @@ public sealed class ArcGpuTuner : IGpuTuner
         // hwMax-1, can be clamped, survive a release, and still satisfy the
         // shortcut. Ordering the tracked rule above it closes that window
         // without weakening either test.
-        if (previous is { } tracked)
+        // One rule for every clamp shape and provenance: the ceiling is back at
+        // the highest ceiling this process has seen — the domain maximum, a
+        // verified release, a read before the lock went on, or the clamp itself
+        // when nothing higher was ever seen. A written range lock, the probe's
+        // pin, an inherited record and an observed ceiling are all proven
+        // released by the same comparison; a ceiling BELOW that mark after an
+        // accepted restore is a cap that stayed, whoever put it there. The
+        // three verdict branches this replaced existed to defend against a
+        // restore that keeps the cap — which no driver has been measured doing
+        // — and they refused to release a lock written at the factory ceiling,
+        // a shape that IS measured: writes above the ceiling settle at it.
+        const double Epsilon = 0.5;
+        double highest = Math.Max(_ceilingHighWaterMhz, previous?.Mhz ?? 0);
+        bool atDomainMax = readback.Max >= _hwMaxMhz - Epsilon;
+
+        if (!atDomainMax && highest <= 0)
         {
-            uint prev = tracked.Mhz;
-            // A release must show a ceiling ABOVE the tracked clamp. The single
-            // exception is a clamp tracked AT the frequency domain's own maximum,
-            // which nothing can exceed — there the rise test is unsatisfiable, and
-            // a ceiling back at the domain max is the released state by
-            // definition (the floor gate above has already proven no exact pin
-            // survives).
-            //
-            // The tolerance matters. At 1.0 MHz the exception swallowed
-            // hwMax-1 as well, so a clamp at 2299 that the driver did NOT release
-            // read back 2299 and was reported "released to 100..2299 MHz
-            // (verified)" — a false verified release, which is worse than the
-            // false FAILURE this exception was added to fix. At 0.5 MHz a real
-            // release from 2299 reads 2300 and satisfies the rise test on its
-            // own, so the exception is needed only where it is actually true.
-            const double Epsilon = 0.5;
-            bool ceilingRose = readback.Max > prev + Epsilon;
-            bool clampWasAtDomainMax = prev + Epsilon >= _hwMaxMhz;
-            bool ceilingAtDomainMax = readback.Max >= _hwMaxMhz - Epsilon;
-            // An exact pin is proven released by the floor gate above — its
-            // floor sat AT the pinned frequency and is now back at the minimum
-            // — provided the ceiling did not drop below the pin. The ceiling
-            // need not rise: the probe's last pin on a card whose factory
-            // ceiling is below the domain maximum sits at that ceiling.
-            // ...and the ceiling is back at the highest one this process has
-            // seen: a ceiling stuck AT the pin is a cap the driver kept.
-            // Only a pin THIS process wrote: it knows the ceiling it pinned
-            // under. A pin merely observed (left by a dead session) has an
-            // unknown ceiling, so its release is proven only by a rise.
-            bool exactPinReleased = tracked is { IsPin: true, Provenance: ClampProvenance.Written }
-                && readback.Max + Epsilon >= Math.Max(prev, _ceilingHighWaterMhz);
-            if (!ceilingRose && !(clampWasAtDomainMax && ceilingAtDomainMax) && !exactPinReleased)
-            {
-                // A clamp Afterglow WROTE — in this process, or in a crashed
-                // session whose record was inherited — is never a factory
-                // value, so a release that leaves it in place has failed, full
-                // stop. Adopting an inherited clamp here would have hidden a
-                // real pinned card behind "factory ceiling" and cleared the
-                // only record of it.
-                if (tracked.AfterglowWrote)
-                {
-                    return KnobResult.Fail("clock lock", stillShows);
-                }
-
-                // An observed PIN is never a factory ceiling either: its floor
-                // was raised, and a ceiling that stays at the pin after the
-                // floor dropped is a cap the driver kept. Adopting it hid a
-                // still-capped card for the rest of the session.
-                if (tracked.IsPin)
-                {
-                    return KnobResult.Fail("clock lock", stillShows);
-                }
-
-                // The tracked value was only ever OBSERVED: ReadCurrent committed
-                // it because the ceiling sits below the domain maximum. The
-                // driver has just accepted a factory restore and the floor is
-                // back at minimum, yet the ceiling did not move — that is the
-                // factory ceiling, not a clamp. Failing here made the phantom
-                // permanent: every lock-less apply came back PARTIAL and
-                // persisted the ceiling as a lock, and no reset could ever clear
-                // it. Adopt it as the released baseline so ReadCurrent stops
-                // reporting it.
-                Log.Warn(
-                    $"Clock-lock release (Arc): the ceiling stayed at {readback.Max:F0} MHz after a factory restore " +
-                    $"and the tracked {prev} MHz was only observed, never written — treating it as the factory ceiling.");
-                AdoptReleasedBaseline(readback.Max, verified: false);
-                return KnobResult.Ok("clock lock",
-                    $"released; the factory restore left the ceiling at {readback.Min:F0}..{readback.Max:F0} MHz, " +
-                    "so that is this GPU's factory ceiling, not a clamp (rise not verifiable)");
-            }
-
-            AdoptReleasedBaseline(readback.Max);
-            return KnobResult.Ok("clock lock", $"released to {readback.Min:F0}..{readback.Max:F0} MHz (verified)");
+            // Nothing tracked and nothing ever read: a ceiling below the domain
+            // maximum is genuinely ambiguous — the factory ceiling or a clamp
+            // that outlived a crashed session — and no reading here can tell
+            // them apart. Report the release honestly WITHOUT the word
+            // "verified", and do NOT adopt the reading as the baseline:
+            // adopting it would hide a surviving clamp from every later read.
+            return KnobResult.Ok(
+                "clock lock",
+                $"released to {readback.Min:F0}..{readback.Max:F0} MHz (unverified — nothing was clamped by this " +
+                $"session, so a {readback.Max:F0} MHz ceiling cannot be told apart from this GPU's factory limit)");
         }
 
-        // Nothing tracked, and the ceiling is back at the frequency domain's own
-        // maximum: proof on its own, needing no baseline, and the ordinary case
-        // on hardware whose factory range spans the whole domain.
-        if (readback.Max >= _hwMaxMhz - 1.0)
+        if (!atDomainMax && readback.Max + Epsilon < highest)
         {
-            AdoptReleasedBaseline(readback.Max);
-            return KnobResult.Ok("clock lock", $"released to {readback.Min:F0}..{readback.Max:F0} MHz (verified)");
+            return KnobResult.Fail("clock lock", stillShows);
         }
 
-        // No tracked clamp, but we have seen this GPU's unclamped ceiling before:
-        // the readback has to reach it.
-        if (_observedReleasedMaxMhz is double knownCeiling)
-        {
-            if (readback.Max < knownCeiling - 1.0)
-            {
-                return KnobResult.Fail("clock lock", stillShows);
-            }
-
-            _clamp = null;
-            ResolveProbeRecord(); // verified against the known ceiling
-            return KnobResult.Ok("clock lock", $"released to {readback.Min:F0}..{readback.Max:F0} MHz (verified)");
-        }
-
-        // Neither: this is a ForceUnlock in a process that has never seen this
-        // GPU unclamped, so a ceiling below the domain maximum is genuinely
-        // ambiguous — it is either the factory ceiling or a clamp that outlived
-        // a crashed session, and no reading here can tell them apart. Report the
-        // release honestly WITHOUT the word "verified", and do NOT adopt the
-        // reading as the baseline: adopting it would hide a surviving clamp from
-        // every later read, and hiding a clamp is far worse than surfacing a
-        // limit that turns out to be the factory one.
-        _clamp = null;
-        return KnobResult.Ok(
-            "clock lock",
-            $"released to {readback.Min:F0}..{readback.Max:F0} MHz (unverified — nothing was clamped by this " +
-            $"session, so a {readback.Max:F0} MHz ceiling cannot be told apart from this GPU's factory limit)");
+        AdoptReleasedBaseline(readback.Max);
+        return KnobResult.Ok("clock lock", $"released to {readback.Min:F0}..{readback.Max:F0} MHz (verified)");
     }
 
     /// <summary>

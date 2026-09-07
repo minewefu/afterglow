@@ -3,12 +3,14 @@ using Afterglow.Core.Interop.Igcl;
 namespace Afterglow.Core.Tests.Fakes;
 
 /// <summary>
-/// An in-memory IGCL GPU frequency domain. It models the one thing every
-/// clock-lock scenario turns on — what a range write and a factory restore do
-/// to the range the driver reads back — with switches for the driver
-/// behaviours the tuner defends against. Every switch is a HYPOTHESIS about
-/// the real driver; the test that flips it names the scenario it encodes, and
-/// a switch no test needs should be deleted along with the branch it exercises.
+/// An in-memory IGCL GPU frequency domain, modelling what a range write and a
+/// factory restore do to the range the driver reads back. Its behaviours are
+/// the ones MEASURED on the B390 (2026-09-04, see
+/// docs/research/intel-driver-apis.md): a restore returns the full factory
+/// range, a write above the factory ceiling settles at the ceiling, and a
+/// readback may sit a fraction below the request. The one unmeasured shape it
+/// still models — a factory ceiling below the domain maximum — is what the
+/// IGCL header allows and discrete Arc reports may bring.
 /// </summary>
 internal sealed class FakeArcDevice : IArcDevice
 {
@@ -23,9 +25,10 @@ internal sealed class FakeArcDevice : IArcDevice
     public double FactoryMin { get; init; } = 100;
 
     /// <summary>
-    /// The ceiling a factory restore lands at. Below <see cref="HwMax"/> this
-    /// models a card whose factory ceiling sits under the domain maximum —
-    /// the shape that produced most of the phantom-clamp findings.
+    /// The ceiling a factory restore lands at, and the ceiling a write settles
+    /// at. Below <see cref="HwMax"/> this models a card whose factory ceiling
+    /// sits under the domain maximum — the shape behind most phantom-clamp
+    /// findings; on the B390 the two are equal.
     /// </summary>
     public double FactoryMax { get; init; } = 2300;
 
@@ -51,42 +54,25 @@ internal sealed class FakeArcDevice : IArcDevice
     /// <summary>Result of factory restores (-1/-1) only.</summary>
     public CtlResult RestoreResult { get; set; } = CtlResult.Success;
 
-    /// <summary>Result of every range read.</summary>
+    /// <summary>Result of every range read — the readback getter failing is a real tuner branch.</summary>
     public CtlResult ReadResult { get; set; } = CtlResult.Success;
 
     /// <summary>
-    /// A factory restore drops the floor but leaves the ceiling where it was.
-    /// HYPOTHESIS: measured on the B390 (2026-09-04) a restore always returned
-    /// the full range; no driver has been seen doing this.
-    /// </summary>
-    public bool KeepCapOnRestore { get; set; }
-
-    /// <summary>
-    /// A write above the factory ceiling settles at the ceiling instead of
-    /// being refused. MEASURED on the B390 (2026-09-04): writes above the
-    /// domain maximum return Success and read back clamped to it, ranges and
-    /// pins alike.
-    /// </summary>
-    public bool ClampWritesToFactoryMax { get; set; } = true;
-
-    /// <summary>
-    /// Added to every readback, to model a driver that settles a fraction off
-    /// the request. MEASURED on the B390: a fractional request is truncated
-    /// (1499.6 reads back 1499.0), so a negative fraction is the realistic value.
+    /// Added to every readback. MEASURED on the B390: a fractional request is
+    /// truncated (1499.6 reads back 1499.0), so a negative fraction is the
+    /// realistic value.
     /// </summary>
     public double ReadbackOffset { get; set; }
 
     /// <summary>Every range write, in order (restores appear as -1/-1).</summary>
     public List<(double Min, double Max)> Writes { get; } = [];
 
-    public int Reads { get; private set; }
-
     /// <summary>Set when the first exact pin (min == max) is written; lets a test wait for a probe to land one.</summary>
     public ManualResetEventSlim PinLanded { get; } = new();
 
     /// <summary>The exact pins written so far, in order.</summary>
     public IEnumerable<double> PinnedTargets =>
-        Writes.Where(w => w.Min > 0 && w.Min == w.Max).Select(w => w.Max).ToList();
+        Writes.Where(w => w.Min > 0 && w.Min == w.Max).Select(w => w.Max);
 
     public IReadOnlyList<(nint Handle, CtlFreqProperties Properties)> GetFrequencyDomains() =>
     [
@@ -101,7 +87,6 @@ internal sealed class FakeArcDevice : IArcDevice
 
     public CtlResult TryGetFrequencyRange(nint domain, out CtlFreqRange range)
     {
-        Reads++;
         if (domain != GpuDomain)
         {
             range = default;
@@ -136,27 +121,14 @@ internal sealed class FakeArcDevice : IArcDevice
         if (restore)
         {
             Min = FactoryMin;
-            if (!KeepCapOnRestore)
-            {
-                Max = FactoryMax;
-            }
-
+            Max = FactoryMax;
             return CtlResult.Success;
         }
 
-        double newMin = minMhz <= 0 ? HwMin : minMhz;
-        double newMax = maxMhz <= 0 ? HwMax : maxMhz;
-        if (ClampWritesToFactoryMax)
-        {
-            newMax = Math.Min(newMax, FactoryMax);
-            newMin = Math.Min(newMin, newMax);
-        }
-
-        if (newMin > newMax)
-        {
-            return CtlResult.ErrorInvalidArgument;
-        }
-
+        // 0 = hardware limit; anything above the factory ceiling settles at it
+        // (measured: 2400 reads back 2300, a 2400..2400 pin reads 2300..2300).
+        double newMax = Math.Min(maxMhz <= 0 ? HwMax : maxMhz, FactoryMax);
+        double newMin = Math.Min(minMhz <= 0 ? HwMin : minMhz, newMax);
         Min = newMin;
         Max = newMax;
         if (minMhz > 0 && minMhz == maxMhz)

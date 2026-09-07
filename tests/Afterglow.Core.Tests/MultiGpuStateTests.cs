@@ -15,26 +15,9 @@ public sealed class AppliedStateStoreTests : IDisposable
     private const string UuidA = "GPU-aaaa1111-2222-3333-4444-555566667777";
     private const string UuidB = "GPU-bbbb1111-2222-3333-4444-555566667777";
 
-    private readonly string _root;
+    private readonly Fakes.StoreScope _store = new();
 
-    public AppliedStateStoreTests()
-    {
-        _root = Path.Combine(Path.GetTempPath(), $"afterglow-test-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(_root);
-        AppPaths.OverrideRoot = _root;
-    }
-
-    public void Dispose()
-    {
-        AppPaths.OverrideRoot = null;
-        try
-        {
-            Directory.Delete(_root, recursive: true);
-        }
-        catch (IOException)
-        {
-        }
-    }
+    public void Dispose() => _store.Dispose();
 
     private static TuningProfile Profile(string name, int core = 100) =>
         new() { Name = name, CoreOffsetMHz = core, MemOffsetMHz = 500 };
@@ -58,9 +41,7 @@ public sealed class AppliedStateStoreTests : IDisposable
     public void Legacy_single_file_is_adopted_by_its_card_on_first_start_then_retired()
     {
         // A record written the pre-multi-GPU way (no key, the single file).
-        var legacy = new AppliedStateStore.AppliedState("legacy", DateTimeOffset.Now, true, false, 2700);
-        AppPaths.EnsureCreated();
-        File.WriteAllText(AppPaths.AppliedStateFile, System.Text.Json.JsonSerializer.Serialize(legacy));
+        AppliedStateStore.WriteLegacyRecord(new AppliedStateStore.AppliedState("legacy", DateTimeOffset.Now, true, false, 2700));
 
         // A tuner's first read adopts it into the card's own file and retires it.
         Assert.Equal("legacy", AppliedStateStore.LoadOrAdoptLegacy(UuidA, UuidA)!.ProfileName);

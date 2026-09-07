@@ -44,7 +44,10 @@ public sealed class GpuContext
     /// the probe-lock records and anything else that must name a card — two
     /// copies had already drifted on culture.
     /// </summary>
-    public string StableKey => Uuid ?? AppliedStateStore.IndexKeyFor(Index);
+    public string StableKey => StableKeyFor(Uuid, Index);
+
+    /// <summary>The one formula, usable before the context exists (the tuner is built first).</summary>
+    public static string StableKeyFor(string? uuid, uint index) => uuid ?? AppliedStateStore.IndexKeyFor(index);
 
     /// <summary>
     /// Why Afterglow cannot read this card's core voltage, or null when the
@@ -170,7 +173,7 @@ public sealed class GpuManager : IDisposable
                     Nvapi = pairedNvapi,
                     Architecture = arch,
                     Poller = poller,
-                    Tuner = new GpuTuner(device, pairedNvapi, uuid ?? AppliedStateStore.IndexKeyFor(device.Index)),
+                    Tuner = new GpuTuner(device, pairedNvapi, GpuContext.StableKeyFor(uuid, device.Index)),
                     Uuid = uuid,
                     PciBusId = pciBus,
                     PciVendorId = 0x10DE,

@@ -15,12 +15,8 @@ internal sealed class FakeProbeLoad : IProbeLoad
     /// <summary>StopAndWait reports the worker still running at the timeout.</summary>
     public bool HangOnStop { get; set; }
 
-    /// <summary>The state the engine settles into when stopped (a hardware verdict here models the closing verification failing).</summary>
+    /// <summary>The state the engine settles into when stopped; a hardware verdict here models the closing verification failing.</summary>
     public StressState TeardownState { get; set; } = StressState.Stopped;
-
-    public int Starts { get; private set; }
-
-    public bool Stopped { get; private set; }
 
     public event Action<StressProgress>? ProgressChanged;
 
@@ -29,7 +25,6 @@ internal sealed class FakeProbeLoad : IProbeLoad
 
     public void Start()
     {
-        Starts++;
         Progress = FailOnStart
             ? new StressProgress(StressState.Failed, TimeSpan.Zero, 0, 0, 0, "fake load refused to start")
             : new StressProgress(StressState.Running, TimeSpan.FromSeconds(1), 100, 10, 0, null, BurnDispatches: 10);
@@ -38,7 +33,6 @@ internal sealed class FakeProbeLoad : IProbeLoad
 
     public bool StopAndWait(TimeSpan timeout)
     {
-        Stopped = true;
         if (HangOnStop)
         {
             return false;
@@ -46,7 +40,13 @@ internal sealed class FakeProbeLoad : IProbeLoad
 
         if (Progress.State == StressState.Running)
         {
-            Progress = Progress with { State = TeardownState };
+            Progress = Progress with
+            {
+                State = TeardownState,
+                Detail = TeardownState is StressState.ArtifactDetected or StressState.DeviceLost
+                    ? "closing verification mismatch"
+                    : Progress.Detail,
+            };
         }
 
         return true;

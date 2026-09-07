@@ -110,9 +110,7 @@ public sealed class ProbeRecordStoreTests : IDisposable
     [Fact]
     public void An_unstamped_legacy_record_is_adopted_by_an_nvidia_key_once_and_never_by_an_intel_one()
     {
-        var legacy = new AppliedStateStore.AppliedState("old build", DateTimeOffset.Now, true, false, 2700);
-        AppPaths.EnsureCreated();
-        File.WriteAllText(AppPaths.AppliedStateFile, System.Text.Json.JsonSerializer.Serialize(legacy));
+        AppliedStateStore.WriteLegacyRecord(new AppliedStateStore.AppliedState("old build", DateTimeOffset.Now, true, false, 2700));
 
         Assert.Null(AppliedStateStore.LoadOrAdoptLegacy("INTEL-00:02.0-E20B-0000", "INTEL-00:02.0-E20B-0000"));
         Assert.True(File.Exists(AppPaths.AppliedStateFile));
@@ -126,11 +124,40 @@ public sealed class ProbeRecordStoreTests : IDisposable
     }
 
     [Fact]
+    public void A_legacy_lock_is_merged_into_an_existing_probe_record_on_adoption()
+    {
+        // The previous layout kept a UUID-less card's lock in the legacy file
+        // beside an index-keyed probe record; adoption must keep both facts.
+        AppliedStateStore.WriteLegacyRecord(new AppliedStateStore.AppliedState("old build", DateTimeOffset.Now, true, false, 2700));
+        AppliedStateStore.RecordProbeLockPending(IndexKey);
+
+        var adopted = AppliedStateStore.LoadOrAdoptLegacy(IndexKey, null);
+
+        Assert.NotNull(adopted);
+        Assert.Equal(2700u, adopted!.LockedCoreClockMHz);
+        Assert.True(adopted.ProbeLockPending);
+        Assert.Equal("old build", adopted.ProfileName);
+        Assert.False(adopted.CleanShutdown);
+        Assert.False(File.Exists(AppPaths.AppliedStateFile));
+        Assert.Equal(2700u, AppliedStateStore.Load(IndexKey)?.LockedCoreClockMHz);
+    }
+
+    [Fact]
+    public void Recording_a_pin_that_is_already_on_record_says_so_and_writes_nothing()
+    {
+        Assert.False(AppliedStateStore.RecordProbeLockPending(Uuid));
+        var first = File.GetLastWriteTimeUtc(AppliedStateStore.PathFor(Uuid));
+
+        Assert.True(AppliedStateStore.RecordProbeLockPending(Uuid));
+
+        Assert.Equal(first, File.GetLastWriteTimeUtc(AppliedStateStore.PathFor(Uuid)));
+    }
+
+    [Fact]
     public void A_legacy_record_stamped_for_another_card_is_listed_but_never_adopted()
     {
-        var legacy = new AppliedStateStore.AppliedState("other", DateTimeOffset.Now, true, false, 2700, GpuUuid: "GPU-other");
-        AppPaths.EnsureCreated();
-        File.WriteAllText(AppPaths.AppliedStateFile, System.Text.Json.JsonSerializer.Serialize(legacy));
+        AppliedStateStore.WriteLegacyRecord(
+            new AppliedStateStore.AppliedState("other", DateTimeOffset.Now, true, false, 2700, GpuUuid: "GPU-other"));
 
         Assert.Null(AppliedStateStore.LoadOrAdoptLegacy(Uuid, Uuid));
         Assert.True(File.Exists(AppPaths.AppliedStateFile));
