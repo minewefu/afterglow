@@ -317,6 +317,18 @@ public sealed class ArcClockLockScenarioTests : IDisposable
         Assert.True(apply.AllSucceeded, Describe(apply));
         Assert.NotNull(tuner.ReadCurrent().LockedCoreClockMHz);
         Assert.Equal(1500u, tuner.AppliedLockMHz);
+
+        // Refresh-then-restore cycles (a probe, a game rule) must not drift the
+        // lock down a megahertz at a time on the truncated echo.
+        for (int i = 0; i < 3; i++)
+        {
+            _ = tuner.ReadCurrent();
+            Assert.Equal(NvmlReturn.Success, tuner.RestoreTuningLock(tuner.AppliedLockMHz!.Value));
+        }
+
+        Assert.Equal(1500u, tuner.AppliedLockMHz);
+        Assert.Equal(1500d, dev.Max);
+
         var release = tuner.Apply(NoLock());
         Assert.True(release.AllSucceeded, Describe(release));
         Assert.Null(tuner.AppliedLockMHz);

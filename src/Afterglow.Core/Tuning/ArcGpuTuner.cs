@@ -316,17 +316,25 @@ public sealed class ArcGpuTuner : IGpuTuner
             // sides are rounded independently here, so a driver that settles
             // a fraction off could pass verification and then have its own
             // verified write reclassified as merely observed on the next read.
-            var provenance = _clamp is { } tracked && Math.Abs((long)tracked.Mhz - seen) <= 2
-                ? tracked.Provenance
-                : ClampProvenance.Observed;
+            uint committed = seen;
+            var provenance = ClampProvenance.Observed;
+            if (_clamp is { } tracked && Math.Abs((long)tracked.Mhz - seen) <= 2)
+            {
+                // Keep what was WRITTEN, not the truncated echo of it: the B390
+                // reads a 1500 request back as 1499.x, and re-committing the
+                // echo made every refresh-then-restore cycle (a probe, a game
+                // rule) drift the lock down by a megahertz.
+                committed = tracked.Mhz;
+                provenance = tracked.Provenance;
+            }
 
             // The shape is the driver's, whatever the history: a pin is a
             // raised floor. Another process may have replaced this session's
             // pin with a range lock at the same ceiling, and a pin left by a
             // dead session is a pin from its very first read — the release
             // path refuses to adopt one as a factory ceiling.
-            _clamp = new TrackedClamp(seen, provenance, minRaised ? ClampShape.ExactPin : ClampShape.Range);
-            return seen;
+            _clamp = new TrackedClamp(committed, provenance, minRaised ? ClampShape.ExactPin : ClampShape.Range);
+            return committed;
         }
     }
 
