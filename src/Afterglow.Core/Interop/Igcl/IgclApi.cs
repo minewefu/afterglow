@@ -111,7 +111,7 @@ public sealed class IgclApi : IDisposable
 /// Component handles (frequency domains, sensors, fans, power domains) are
 /// enumerated once and cached - IGCL handles stay valid for the API lifetime.
 /// </summary>
-public sealed class IgclDevice
+public sealed class IgclDevice : IArcDevice
 {
     private readonly nint _handle;
 
@@ -356,6 +356,14 @@ public sealed class IgclDevice
         };
         return Guard(() => IgclNative.ctlFrequencySetRange(domain, ref data));
     }
+
+    // The frequency-range calls take a domain handle rather than the device,
+    // so they are static here; the tuner's seam needs them on the instance.
+    CtlResult IArcDevice.TryGetFrequencyRange(nint domain, out CtlFreqRange range) =>
+        TryGetFrequencyRange(domain, out range);
+
+    CtlResult IArcDevice.TrySetFrequencyRange(nint domain, double minMhz, double maxMhz) =>
+        TrySetFrequencyRange(domain, minMhz, maxMhz);
 
     public IReadOnlyList<(nint Handle, CtlMemProperties Properties)> GetMemoryModules()
     {

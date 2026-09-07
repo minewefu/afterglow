@@ -130,7 +130,7 @@ public sealed record StressProgress(
 ///    first dispatch. Any difference means the GPU is miscalculating.
 /// A device-removed error (driver reset/TDR) is likewise caught and reported.
 /// </summary>
-public sealed class GpuStressTest : IDisposable
+public sealed class GpuStressTest : IProbeLoad
 {
     private const int ThreadCount = 1 << 20;          // 1M threads → 16 MiB output
     private const int CheckElements = 16384;          // 256 KiB verify slice

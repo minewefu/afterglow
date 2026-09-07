@@ -144,7 +144,7 @@ public sealed class GpuTuner : IGpuTuner
         {
             lock (_applyLock)
             {
-                return _appliedLockMHz;
+                return _shadowIsProbePin ? null : _appliedLockMHz;
             }
         }
     }
@@ -312,6 +312,11 @@ public sealed class GpuTuner : IGpuTuner
     /// <summary>Returns every knob this engine owns to driver defaults.</summary>
     /// <inheritdoc />
     public string? ProbeRecordKey { get; set; }
+
+    // The shadow holds the probe's exact pin while a sweep runs. A pin is
+    // never "the lock Afterglow applied": reporting it there made the next
+    // sweep restore a failed-release pin as a range lock the user never set.
+    private bool _shadowIsProbePin;
 
     /// <summary>
     /// A verified lock release or re-apply proves any V/F probe pin on this
@@ -833,6 +838,7 @@ public sealed class GpuTuner : IGpuTuner
             if (rc == NvmlReturn.Success)
             {
                 _appliedLockMHz = lockMHz;
+                _shadowIsProbePin = false;
                 ResolveProbeRecord(); // a range lock this process wrote supersedes any probe pin
             }
 
@@ -872,6 +878,7 @@ public sealed class GpuTuner : IGpuTuner
             if (rc == NvmlReturn.Success)
             {
                 _appliedLockMHz = lockMHz;
+                _shadowIsProbePin = false;
             }
 
             return rc;
@@ -890,6 +897,7 @@ public sealed class GpuTuner : IGpuTuner
             if (rc == NvmlReturn.Success)
             {
                 _appliedLockMHz = clockMHz;
+                _shadowIsProbePin = true;
             }
 
             return rc;
@@ -1115,10 +1123,31 @@ public static class AppliedStateStore
             {
                 try
                 {
-                    if (ReadFile(path) is { CleanShutdown: false } state &&
-                        (resolveProbeLocks || !state.ProbeLockPending))
+                    if (ReadFile(path) is not { } state)
                     {
-                        WriteFile(path, state with { CleanShutdown = true, ProbeLockPending = false });
+                        continue;
+                    }
+
+                    // The probe flag is its own fact, kept across the mark: a
+                    // clean exit is still a clean exit, and the next launch
+                    // reads the flag, not CleanShutdown, to raise the pin
+                    // banner. Dismissing the banner resolves it — and drops a
+                    // record that held nothing else, so no orphan lingers.
+                    if (resolveProbeLocks && state.ProbeLockPending
+                        && (IsIndexKey(state.GpuUuid) || IsProbeOnly(state)))
+                    {
+                        File.Delete(path);
+                        continue;
+                    }
+
+                    bool clearFlag = resolveProbeLocks && state.ProbeLockPending;
+                    if (!state.CleanShutdown || clearFlag)
+                    {
+                        WriteFile(path, state with
+                        {
+                            CleanShutdown = true,
+                            ProbeLockPending = state.ProbeLockPending && !clearFlag,
+                        });
                     }
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -1194,7 +1223,6 @@ public static class AppliedStateStore
             Mutate(key, state => (state ?? Empty(ProbeLockPendingName)) with
             {
                 AppliedAt = DateTimeOffset.Now,
-                CleanShutdown = false,
                 ProbeLockPending = true,
                 GpuUuid = key,
             });
@@ -1210,7 +1238,6 @@ public static class AppliedStateStore
                 WriteFile(path, state with
                 {
                     AppliedAt = DateTimeOffset.Now,
-                    CleanShutdown = false,
                     ProbeLockPending = true,
                     GpuUuid = key,
                 });
@@ -1241,10 +1268,10 @@ public static class AppliedStateStore
                 }
                 else if (ReadFile(path) is { ProbeLockPending: true } state)
                 {
-                    if (state.ProfileName == ProbeLockPendingName)
+                    if (IsProbeOnly(state))
                     {
-                        // Born from the probe, nothing else in it. Left behind
-                        // unclean under the name "v/f probe clock lock", it
+                        // Born from the probe and holding nothing else. Left
+                        // behind under the name "v/f probe clock lock", it
                         // raised the generic crash banner after a clean CLI
                         // re-probe — the CLI never marks the session clean.
                         File.Delete(path);
@@ -1260,6 +1287,15 @@ public static class AppliedStateStore
             }
         }
     }
+
+    /// <summary>
+    /// A record the probe created that nothing else has written into since:
+    /// no fan control, no tuning lock. Fans set after a failed probe share the
+    /// record and keep its probe name, so the name alone is not enough — the
+    /// fan record was being deleted with the flag.
+    /// </summary>
+    private static bool IsProbeOnly(AppliedState state) =>
+        state.ProfileName == ProbeLockPendingName && state.FanMode is null && state.LockedCoreClockMHz is null;
 
     private static bool IsIntelUuid(string? gpuUuid) =>
         gpuUuid is not null && gpuUuid.StartsWith("INTEL-", StringComparison.OrdinalIgnoreCase);

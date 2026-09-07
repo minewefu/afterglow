@@ -405,14 +405,11 @@ public partial class App : Application
         // nothing on file, so record THAT card — whatever an earlier probe on
         // another card left behind is already the store's.
         if (!probeClockRestored && !_ephemeralRun &&
-            _mainViewModel?.VfCurve is { } vfCurve &&
-            vfCurve.ActiveProbeKey is { } active &&
-            !vfCurve.ActiveProbeClockSettled) // a worker past its restore has already written the truth
+            _mainViewModel?.VfCurve.RecordUnsettledProbePin() == true)
         {
             Core.Diagnostics.Log.Warn(
-                "The V/F probe was still unwinding at shutdown; recording the card it was pinning as unclean " +
+                "The V/F probe was still unwinding at shutdown; recorded the card it was pinning as unclean " +
                 "so the next launch warns that the GPU may still be clock-locked.");
-            AppliedStateStore.RecordProbeLockPending(active);
         }
         _services?.Dispose();
         _activationSignal?.Dispose();

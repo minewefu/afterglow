@@ -658,7 +658,7 @@ public partial class MainViewModel : ObservableObject
         // graver of the two stories and is announced first — whichever record
         // enumerated first used to win, so a second card's pin was shown as an
         // ordinary unclean exit and dismissed with it.
-        var uncleanAll = AppliedStateStore.LoadAll().Where(s => !s.CleanShutdown).ToList();
+        var uncleanAll = AppliedStateStore.LoadAll().Where(s => !s.CleanShutdown || s.ProbeLockPending).ToList();
         var unclean = uncleanAll.FirstOrDefault(s => s.ProbeLockPending) ?? uncleanAll.FirstOrDefault();
         if (unclean is not null)
         {
@@ -694,7 +694,23 @@ public partial class MainViewModel : ObservableObject
             fans.SetAuto();
         }
 
-        ShowCrashBanner = false;
+        // Re-read the store rather than assume: a record for a card that is
+        // absent, or whose reset the driver refused, is still there, and
+        // hiding the banner over it left the startup profile suppressed on
+        // every launch with nothing on screen saying why.
+        var remaining = AppliedStateStore.LoadAll().Where(s => !s.CleanShutdown || s.ProbeLockPending).ToList();
+        if (remaining.Count == 0)
+        {
+            ShowCrashBanner = false;
+        }
+        else
+        {
+            CrashBannerText =
+                $"Reset done, but {remaining.Count} applied-state record(s) could not be resolved by it — a card " +
+                "that is not present right now, or a driver that refused its reset. If you know the card is free, " +
+                "Dismiss clears them.";
+        }
+
         Tuning.RefreshFromHardware();
     }
 

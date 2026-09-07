@@ -381,16 +381,12 @@ public partial class VfCurveViewModel : ObservableObject
     }
 
     /// <summary>
-    /// Stable key of the card a probe is running on, for a shutdown that has
-    /// to record a pin the probe had no time to report.
+    /// For a shutdown whose join timed out: records the probed card as pinned
+    /// if, and only if, a pin may still be on it (see
+    /// <see cref="VfCurveProbe.RecordPinIfUnsettled"/>). False when nothing
+    /// needed recording.
     /// </summary>
-    public string? ActiveProbeKey => _probeGpu?.StableKey;
-
-    /// <summary>
-    /// True unless the running probe may still have a pin on the card (see
-    /// <see cref="VfCurveProbe.ClockStateSettled"/>).
-    /// </summary>
-    public bool ActiveProbeClockSettled => _probe?.ClockStateSettled ?? true;
+    public bool RecordUnsettledProbePin() => _probe?.RecordPinIfUnsettled() ?? false;
 
     /// <summary>
     /// Maps the whole curve in about a minute: locks the clock at each step under
@@ -480,9 +476,10 @@ public partial class VfCurveViewModel : ObservableObject
                     ? $"  ⚠ {progress.Phase}"
                     : string.Empty;
 
-                // A hardware fault the load detected while winding down is about
-                // the top clock this sweep pinned, not about shutdown — it is a
-                // real finding, and it survives a fully measured sweep.
+                // A hardware fault the load detected — during the sweep, or while
+                // winding down after the clock restore — is about the GPU under
+                // load, not about shutdown: a real finding that survives a fully
+                // measured sweep.
                 if (!progress.Running && progress.LoadFailure is { } loadFault)
                 {
                     restoreWarning += $"  ⚠ {loadFault}";

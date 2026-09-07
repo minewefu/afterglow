@@ -142,6 +142,20 @@ live on the Arc B390 the beta was verified on.
   touched it; the probe restores the clock BEFORE the load's 30 s teardown,
   and releases any clamp it finds before sweeping so the targets are capped at
   the card's true ceiling rather than at a leftover pin.
+- **The clock-lock state machine is now under test.** `IArcDevice` and
+  `IProbeLoad` seams let the real Arc tuner and V/F probe run against an
+  in-memory frequency domain (`FakeArcDevice`) and a load that runs nothing,
+  and 39 scenario tests encode every clock-lock finding from the review passes
+  — a change to the tuner has to keep all of them true at once. The harness
+  caught, and the batch fixes: a leftover pin whose cap the driver kept being
+  adopted as the factory ceiling; a probe's own pin counting as "the lock
+  Afterglow applied" (so a failed release was restored as a range lock on the
+  next sweep and on every stepper step); a lock written at the factory
+  ceiling refusing the sweep; the probe flag rewriting a clean record's
+  shutdown state; a fan record deleted with the probe flag it shared a file
+  with; the exit-time re-record racing the worker's own resolve; a load engine
+  that failed to stop reported as "the GPU proved unstable"; and Reset hiding
+  the banner over a record it could not resolve.
 - **The stepper refuses GPUs with no core-offset knob** instead of burning a full
   cycle at offset 0 and reporting "+0 MHz" as a confirmed stable offset — which
   `find_stable_offset` handed straight to an agent.

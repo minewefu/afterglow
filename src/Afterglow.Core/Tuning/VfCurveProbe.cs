@@ -40,9 +40,11 @@ public sealed record VfProbeProgress(
 
     /// <summary>
     /// The load engine reported a hardware fault (miscalculation or driver
-    /// reset). Independent of <see cref="Outcome"/> for the same reason: a
-    /// fully measured sweep can still end with the GPU proving unstable at the
-    /// top clock it held. Null when nothing was detected.
+    /// reset), during the sweep or while winding down after the clock restore.
+    /// Independent of <see cref="Outcome"/> for the same reason: a fully
+    /// measured sweep can still end with the GPU proving unstable. Null when
+    /// nothing was detected — a load that merely failed to stop in time is
+    /// noted in <see cref="Phase"/>, never reported here.
     /// </summary>
     string? LoadFailure = null);
 
@@ -102,15 +104,61 @@ public sealed class VfCurveProbe
     /// </summary>
     public string? StableKey { get; set; }
 
-    private volatile bool _pinInFlight;
+    /// <summary>
+    /// The load engine to drive during the sweep. Null means the real burn
+    /// (<see cref="GpuStressTest"/>); tests supply a load that runs nothing.
+    /// </summary>
+    public Func<IProbeLoad>? LoadFactory { get; set; }
+
+    // Guards the pin-in-flight flag together with the store writes that settle
+    // it, so a shutdown's "record this card as pinned" and the worker's own
+    // restore-and-record cannot cross.
+    private readonly object _pinLock = new();
+    private bool _pinInFlight;
 
     /// <summary>
     /// False only while a pin this probe wrote may still be on the card — from
     /// the first lock until the restore has run and its record is written.
-    /// Shutdown reads it after a timed-out join: a worker that has already
-    /// restored and resolved its record must not be re-recorded as pinned.
     /// </summary>
-    public bool ClockStateSettled => !_pinInFlight;
+    public bool ClockStateSettled
+    {
+        get
+        {
+            lock (_pinLock)
+            {
+                return !_pinInFlight;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Records the card as pinned if a pin this probe wrote may still be on it
+    /// — for a shutdown whose join timed out. Takes the lock the worker's
+    /// restore path holds while it writes or resolves its own record and
+    /// clears the flag, so a worker past its restore has already written the
+    /// truth and this returns false instead of re-recording a released card.
+    /// </summary>
+    public bool RecordPinIfUnsettled()
+    {
+        lock (_pinLock)
+        {
+            if (!_pinInFlight)
+            {
+                return false;
+            }
+
+            if ((StableKey ?? _tuner.GpuUuid) is { } key)
+            {
+                AppliedStateStore.RecordProbeLockPending(key);
+            }
+            else
+            {
+                AppliedStateStore.RecordPending(AppliedStateStore.ProbeLockPendingName);
+            }
+
+            return true;
+        }
+    }
 
     public void Cancel() => _cancel = true;
 
@@ -189,10 +237,21 @@ public sealed class VfCurveProbe
         // capped at it. A clamp this process did not apply (another tool's, or
         // the factory ceiling) is released with the rest, and the outcome says so.
         string? foreignClampNote = null;
+        uint? sweepCeiling = null;
         if (observedClamp is uint observed && observed > 0)
         {
             var pre = _tuner.ForceUnlock();
-            if (!pre.Applied)
+            if (!pre.Applied && previousLock is uint held)
+            {
+                // The lock this process applied sits where its release cannot
+                // be verified — at a ceiling this process has never seen
+                // released — so it stays on, the sweep runs up to it, and the
+                // restore below puts it back exactly as before.
+                Log.Warn($"V/F probe: the {held} MHz clock lock could not be verifiably released before the sweep " +
+                    $"({pre.Detail}); sweeping up to it instead.");
+                sweepCeiling = held;
+            }
+            else if (!pre.Applied)
             {
                 Report(new VfProbeProgress(
                     false, 0, 0, 0, null, null,
@@ -200,8 +259,7 @@ public sealed class VfCurveProbe
                     VfProbeOutcome.Aborted));
                 return;
             }
-
-            if (previousLock is null)
+            else if (previousLock is null)
             {
                 foreignClampNote = $"the driver reported a {observed} MHz clock ceiling this process had not applied " +
                     "(another tool's clamp, or the factory ceiling); it was released before the sweep, " +
@@ -209,7 +267,7 @@ public sealed class VfCurveProbe
             }
         }
 
-        uint lockable = _tuner.MaxLockableClockMHz;
+        uint lockable = sweepCeiling ?? _tuner.MaxLockableClockMHz;
         if (lockable > 0 && lockable < maxClock)
         {
             maxClock = lockable;
@@ -225,7 +283,7 @@ public sealed class VfCurveProbe
         {
             targets.Add(maxClock);
         }
-        using var load = new GpuStressTest
+        using IProbeLoad load = LoadFactory?.Invoke() ?? new GpuStressTest
         {
             IterationsPerDispatch = 2048,
             TargetPciBusId = TargetPciBusId,
@@ -304,7 +362,10 @@ public sealed class VfCurveProbe
                 uint target = targets[i];
                 Report(new VfProbeProgress(true, i, targets.Count, target, null, null, "settling"));
 
-                _pinInFlight = true;
+                lock (_pinLock)
+                {
+                    _pinInFlight = true;
+                }
 
                 var lockRc = _tuner.LockClockForProbe(target);
                 if (lockRc != NvmlReturn.Success)
@@ -412,27 +473,30 @@ public sealed class VfCurveProbe
             // through the general Record/Clear path adopted and retired the
             // legacy file — the ONLY record a UUID-less NVIDIA tuner reads —
             // and deleted its tracked lock on a clean probe.
-            string? recordKey = StableKey ?? _tuner.GpuUuid;
-            if (restoreFailure is not null)
+            lock (_pinLock)
             {
-                if (recordKey is not null)
+                string? recordKey = StableKey ?? _tuner.GpuUuid;
+                if (restoreFailure is not null)
                 {
-                    AppliedStateStore.RecordProbeLockPending(recordKey);
+                    if (recordKey is not null)
+                    {
+                        AppliedStateStore.RecordProbeLockPending(recordKey);
+                    }
+                    else
+                    {
+                        AppliedStateStore.RecordPending(AppliedStateStore.ProbeLockPendingName);
+                    }
                 }
-                else
+                else if (anyLockLanded && recordKey is not null)
                 {
-                    AppliedStateStore.RecordPending(AppliedStateStore.ProbeLockPendingName);
+                    // A clean release resolves this card's probe record. The
+                    // store keeps such records through the shutdown mark, so
+                    // nothing else would ever retire it.
+                    AppliedStateStore.ResolveProbeLock(recordKey);
                 }
-            }
-            else if (anyLockLanded && recordKey is not null)
-            {
-                // A clean release resolves this card's probe record. The store
-                // keeps such records unclean through the shutdown mark, so
-                // nothing else would ever retire it.
-                AppliedStateStore.ResolveProbeLock(recordKey);
-            }
 
-            _pinInFlight = false;
+                _pinInFlight = false;
+            }
 
             // The same 30 s budget every verdict site uses, and the result is
             // checked: the closing verification on a slow iGPU can outlast 5 s,
@@ -444,14 +508,17 @@ public sealed class VfCurveProbe
             // so the curve stays valid.
             bool loadStopped = load.StopAndWait(TimeSpan.FromSeconds(30));
 
+            // Only a hardware verdict is a load FAILURE. A worker still running
+            // at the timeout is an unknown, noted in the phase text below,
+            // never an instability verdict — the CLI prints every LoadFailure
+            // as "the GPU proved unstable" and exits 1 on it.
             var teardown = load.Progress;
             string? loadFailure = teardown.IsHardwareVerdict
                 ? $"the GPU {(teardown.State == StressState.DeviceLost ? "driver reset" : "miscalculated")} " +
-                  "under load while the sweep was winding down, after the clock was restored " +
+                  "under load while the sweep was winding down, " +
+                  (restoreFailure is null ? "after the clock was restored " : "after the clock restore was attempted ") +
                   $"({teardown.Detail ?? teardown.State.ToString()})"
-                : !loadStopped
-                    ? "the load engine did not stop within 30 s, so its closing verification is unknown"
-                    : null;
+                : null;
 
             recorder.Save();
 
@@ -482,6 +549,14 @@ public sealed class VfCurveProbe
                 // old code restored it; say what happened rather than nothing.
                 Log.Warn($"V/F probe: {foreignClampNote}.");
                 phase = $"{phase} — note: {foreignClampNote}";
+            }
+
+            if (!loadStopped)
+            {
+                const string StopTimeout =
+                    "the load engine did not stop within 30 s, so its closing verification is unknown";
+                Log.Warn($"V/F probe: {StopTimeout}.");
+                phase = $"{phase} — note: {StopTimeout}";
             }
 
             Log.Info($"V/F probe finished ({outcome}, {stepsDone}/{targets.Count} steps).");

@@ -195,7 +195,7 @@ public sealed class StabilityStepper
         {
             Log("This GPU exposes no core-clock offset, so there is no offset to step. " +
                 "Nothing was applied and no stability verdict was produced.");
-            Publish(false, "failed", 0, null, TimeSpan.Zero, TimeSpan.Zero);
+            Publish(false, "failed", 0, null, TimeSpan.Zero, TimeSpan.Zero, restored: true); // nothing was written
             return;
         }
 

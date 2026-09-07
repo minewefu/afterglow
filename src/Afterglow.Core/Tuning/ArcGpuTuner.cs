@@ -26,7 +26,7 @@ namespace Afterglow.Core.Tuning;
 /// </summary>
 public sealed class ArcGpuTuner : IGpuTuner
 {
-    private readonly IgclDevice _device;
+    private readonly IArcDevice _device;
     private readonly nint _gpuFreqDomain;
     private readonly double _hwMinMhz;
     private readonly double _hwMaxMhz;
@@ -95,13 +95,18 @@ public sealed class ArcGpuTuner : IGpuTuner
     /// resolved — the release just proved its pin is gone. One helper: the
     /// triplet was pasted at four sites and a fifth had to remember it.
     /// </summary>
-    private void AdoptReleasedBaseline(double max)
+    private void AdoptReleasedBaseline(double max, bool verified = true)
     {
         ClearTrackedClamp();
         _releasedMaxMhz = max;
         _releasedMaxObserved = true;
         _ceilingHighWaterMhz = Math.Max(_ceilingHighWaterMhz, max);
-        ResolveProbeRecord();
+        if (verified)
+        {
+            // Only a VERIFIED release proves a probe's pin gone; the
+            // "rise not verifiable" adoption of a factory ceiling does not.
+            ResolveProbeRecord();
+        }
     }
 
     /// <summary>See <see cref="IGpuTuner.ProbeRecordKey"/>.</summary>
@@ -130,7 +135,7 @@ public sealed class ArcGpuTuner : IGpuTuner
     /// </summary>
     private double _releasedMaxMhz;
 
-    public ArcGpuTuner(IgclDevice device, string? gpuUuid)
+    public ArcGpuTuner(IArcDevice device, string? gpuUuid)
     {
         _device = device;
         GpuUuid = gpuUuid;
@@ -150,7 +155,7 @@ public sealed class ArcGpuTuner : IGpuTuner
             // Controllable only if the driver says so AND the readback getter
             // answers — the clamp ships with write-then-verify or not at all.
             supportsClamp = props.CanControl != 0 && props.Max > 0
-                && IgclDevice.TryGetFrequencyRange(handle, out _) == CtlResult.Success;
+                && _device.TryGetFrequencyRange(handle, out _) == CtlResult.Success;
         }
 
         bool supportsPowerLimit = false;
@@ -221,7 +226,13 @@ public sealed class ArcGpuTuner : IGpuTuner
         {
             lock (_applyLock)
             {
-                return _clampWrittenThisSession || _clampInheritedFromRecord ? _appliedLockMHz : null;
+                // A probe's exact pin is written by this process, but it is
+                // the probe's, never the lock Afterglow applied: reporting it
+                // here made the next sweep restore a failed-release pin as a
+                // range lock the user never set, on every stepper step too.
+                return (_clampWrittenThisSession || _clampInheritedFromRecord) && !_clampIsExactPin
+                    ? _appliedLockMHz
+                    : null;
             }
         }
     }
@@ -233,7 +244,7 @@ public sealed class ArcGpuTuner : IGpuTuner
     public bool LockIsDriverReadable => true;
 
     /// <summary>The IGCL device, for later milestones' write paths.</summary>
-    public IgclDevice Device => _device;
+    public IArcDevice Device => _device;
 
     public (int CoreOffsetMHz, int MemOffsetMHz, double? PowerLimitW, uint? VoltageBoostPct, uint? LockedCoreClockMHz) ReadCurrent()
     {
@@ -280,7 +291,7 @@ public sealed class ArcGpuTuner : IGpuTuner
         lock (_applyLock)
         {
             if (_gpuFreqDomain == 0
-                || IgclDevice.TryGetFrequencyRange(_gpuFreqDomain, out var range) != CtlResult.Success)
+                || _device.TryGetFrequencyRange(_gpuFreqDomain, out var range) != CtlResult.Success)
             {
                 return _appliedLockMHz;
             }
@@ -307,16 +318,14 @@ public sealed class ArcGpuTuner : IGpuTuner
             {
                 _clampWrittenThisSession = false;
                 _clampInheritedFromRecord = false;
-                _clampIsExactPin = false;
             }
-            else
-            {
-                // A pin is a raised floor, and the driver's shape wins over
-                // history: another process may have replaced this session's
-                // pin with a range lock at the same ceiling, and the pin rule
-                // must not then judge that range's release.
-                _clampIsExactPin = minRaised;
-            }
+
+            // The shape is the driver's, whatever the history: a pin is a
+            // raised floor. Another process may have replaced this session's
+            // pin with a range lock at the same ceiling, and a pin left by a
+            // dead session is a pin from its very first read — the release
+            // path refuses to adopt one as a factory ceiling.
+            _clampIsExactPin = minRaised;
 
             _appliedLockMHz = seen;
             return seen;
@@ -375,7 +384,7 @@ public sealed class ArcGpuTuner : IGpuTuner
             // or clamp write failed mid-apply — made the next launch inherit the
             // factory ceiling as "written by Afterglow", which the release path
             // then refused to adopt forever.
-            uint? persistedLock = _clampWrittenThisSession || _clampInheritedFromRecord ? _appliedLockMHz : null;
+            uint? persistedLock = AppliedLockMHz; // written or inherited, never observed, never a probe pin
             AppliedStateStore.Record(profile, all, persistedLock, GpuUuid);
             Log.Info($"Apply '{profile.Name}' (Arc): {(all ? "ok" : "PARTIAL")} — {string.Join("; ", results.Select(r => $"{r.Knob}={(r.Applied ? "ok" : "fail")}"))}");
             return new ApplyResult(all, results);
@@ -481,7 +490,7 @@ public sealed class ArcGpuTuner : IGpuTuner
                 return NvmlReturn.NotSupported;
             }
 
-            var rc = IgclDevice.TrySetFrequencyRange(_gpuFreqDomain, min, max);
+            var rc = _device.TrySetFrequencyRange(_gpuFreqDomain, min, max);
             if (rc != CtlResult.Success)
             {
                 return ToNvml(rc);
@@ -495,7 +504,7 @@ public sealed class ArcGpuTuner : IGpuTuner
             _clampIsExactPin = Math.Abs(max - min) < 0.5;
             _appliedLockMHz = shadow;
 
-            if (IgclDevice.TryGetFrequencyRange(_gpuFreqDomain, out var readback) != CtlResult.Success)
+            if (_device.TryGetFrequencyRange(_gpuFreqDomain, out var readback) != CtlResult.Success)
             {
                 // The capability was probed with this getter answering, so a
                 // failure here is a real loss of confirmation, not a formality.
@@ -562,7 +571,7 @@ public sealed class ArcGpuTuner : IGpuTuner
                 ? $" (requested {lockMHz}, clamped to hardware range {_hwMinMhz:F0}..{_hwMaxMhz:F0})"
                 : string.Empty;
 
-            var rc = IgclDevice.TrySetFrequencyRange(_gpuFreqDomain, _hwMinMhz, clamped);
+            var rc = _device.TrySetFrequencyRange(_gpuFreqDomain, _hwMinMhz, clamped);
             if (rc != CtlResult.Success)
             {
                 results.Add(KnobResult.Fail("locked core clock", $"driver refused the clamp: {rc}"));
@@ -580,7 +589,7 @@ public sealed class ArcGpuTuner : IGpuTuner
             _clampInheritedFromRecord = false; // this process's write supersedes an inherited record
             _clampIsExactPin = false; // a range lock, hwMin..clamped
             string detail = $"{_hwMinMhz:F0}..{clamped:F0} MHz{clampNote}";
-            var readRc = IgclDevice.TryGetFrequencyRange(_gpuFreqDomain, out var readback);
+            var readRc = _device.TryGetFrequencyRange(_gpuFreqDomain, out var readback);
             if (readRc != CtlResult.Success)
             {
                 // The capability was probed with this getter answering, so a
@@ -646,13 +655,13 @@ public sealed class ArcGpuTuner : IGpuTuner
     private KnobResult ReleaseClampCore()
     {
         uint? previous = _appliedLockMHz;
-        var rc = IgclDevice.TrySetFrequencyRange(_gpuFreqDomain, -1, -1);
+        var rc = _device.TrySetFrequencyRange(_gpuFreqDomain, -1, -1);
         if (rc != CtlResult.Success)
         {
             return KnobResult.Fail("clock lock", $"driver refused the release: {rc}");
         }
 
-        var readRc = IgclDevice.TryGetFrequencyRange(_gpuFreqDomain, out var readback);
+        var readRc = _device.TryGetFrequencyRange(_gpuFreqDomain, out var readback);
         if (readRc != CtlResult.Success)
         {
             return KnobResult.Fail("clock lock",
@@ -715,7 +724,11 @@ public sealed class ArcGpuTuner : IGpuTuner
             // ceiling is below the domain maximum sits at that ceiling.
             // ...and the ceiling is back at the highest one this process has
             // seen: a ceiling stuck AT the pin is a cap the driver kept.
-            bool exactPinReleased = _clampIsExactPin && readback.Max + Epsilon >= Math.Max(prev, _ceilingHighWaterMhz);
+            // Only a pin THIS process wrote: it knows the ceiling it pinned
+            // under. A pin merely observed (left by a dead session) has an
+            // unknown ceiling, so its release is proven only by a rise.
+            bool exactPinReleased = _clampIsExactPin && _clampWrittenThisSession
+                && readback.Max + Epsilon >= Math.Max(prev, _ceilingHighWaterMhz);
             if (!ceilingRose && !(clampWasAtDomainMax && ceilingAtDomainMax) && !exactPinReleased)
             {
                 // A clamp Afterglow WROTE — in this process, or in a crashed
@@ -725,6 +738,15 @@ public sealed class ArcGpuTuner : IGpuTuner
                 // real pinned card behind "factory ceiling" and cleared the
                 // only record of it.
                 if (_clampWrittenThisSession || _clampInheritedFromRecord)
+                {
+                    return KnobResult.Fail("clock lock", stillShows);
+                }
+
+                // An observed PIN is never a factory ceiling either: its floor
+                // was raised, and a ceiling that stays at the pin after the
+                // floor dropped is a cap the driver kept. Adopting it hid a
+                // still-capped card for the rest of the session.
+                if (_clampIsExactPin)
                 {
                     return KnobResult.Fail("clock lock", stillShows);
                 }
@@ -741,7 +763,7 @@ public sealed class ArcGpuTuner : IGpuTuner
                 Log.Warn(
                     $"Clock-lock release (Arc): the ceiling stayed at {readback.Max:F0} MHz after a factory restore " +
                     $"and the tracked {prev} MHz was only observed, never written — treating it as the factory ceiling.");
-                AdoptReleasedBaseline(readback.Max);
+                AdoptReleasedBaseline(readback.Max, verified: false);
                 return KnobResult.Ok("clock lock",
                     $"released; the factory restore left the ceiling at {readback.Min:F0}..{readback.Max:F0} MHz, " +
                     "so that is this GPU's factory ceiling, not a clamp (rise not verifiable)");
