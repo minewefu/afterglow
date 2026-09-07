@@ -21,7 +21,7 @@ public sealed class ArcClockLockScenarioTests : IDisposable
 
     public void Dispose() => _store.Dispose();
 
-    private static ArcGpuTuner Tuner(FakeArcDevice device) => new(device, Uuid) { ProbeRecordKey = Uuid };
+    private static ArcGpuTuner Tuner(FakeArcDevice device) => new(device, Uuid);
 
     private static TuningProfile Lock(uint mhz) => new() { Name = "lock", LockedCoreClockMHz = mhz };
 
@@ -269,18 +269,46 @@ public sealed class ArcClockLockScenarioTests : IDisposable
     }
 
     [Fact]
-    public void A_failed_release_keeps_the_probes_pending_record()
+    public void A_pin_is_on_record_before_it_lands_and_a_failed_release_keeps_it()
     {
         var dev = new FakeArcDevice();
         var tuner = Tuner(dev);
         _ = tuner.ReadCurrent();
+
         Assert.Equal(NvmlReturn.Success, tuner.LockClockForProbe(1500));
-        AppliedStateStore.RecordProbeLockPending(Uuid);
-        dev.KeepCapOnRestore = true;
-
-        Assert.False(tuner.ForceUnlock().Applied);
-
         Assert.True(AppliedStateStore.Load(Uuid)?.ProbeLockPending);
+
+        dev.KeepCapOnRestore = true;
+        Assert.False(tuner.ForceUnlock().Applied);
+        Assert.True(AppliedStateStore.Load(Uuid)?.ProbeLockPending);
+    }
+
+    [Fact]
+    public void A_refused_pin_leaves_no_record()
+    {
+        var dev = new FakeArcDevice { WriteResult = CtlResult.ErrorInsufficientPermissions };
+        var tuner = Tuner(dev);
+
+        Assert.NotEqual(NvmlReturn.Success, tuner.LockClockForProbe(1500));
+
+        Assert.Null(AppliedStateStore.Load(Uuid));
+    }
+
+    [Fact]
+    public void A_restored_range_lock_resolves_the_pin_record()
+    {
+        var dev = new FakeArcDevice();
+        var tuner = Tuner(dev);
+        Assert.True(tuner.Apply(Lock(1800)).AllSucceeded);
+        Assert.Equal(NvmlReturn.Success, tuner.LockClockForProbe(1500));
+        Assert.True(AppliedStateStore.Load(Uuid)?.ProbeLockPending);
+
+        Assert.Equal(NvmlReturn.Success, tuner.RestoreTuningLock(1800));
+
+        var state = AppliedStateStore.Load(Uuid);
+        Assert.NotNull(state);
+        Assert.False(state!.ProbeLockPending);
+        Assert.Equal(1800u, state.LockedCoreClockMHz);
     }
 
     [Fact]

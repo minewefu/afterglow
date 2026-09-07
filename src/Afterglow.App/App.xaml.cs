@@ -397,20 +397,15 @@ public partial class App : Application
             AppliedStateStore.MarkCleanShutdown();
         }
 
-        // A probe whose restore failed has already persisted its own record,
-        // and MarkCleanShutdown leaves probe-lock records unclean, so the App
-        // composes nothing here. The one case the probe cannot record for
-        // itself is a join that timed out with the worker still unwinding: the
-        // card it was pinning leaves this session at an exact frequency with
-        // nothing on file, so record THAT card — whatever an earlier probe on
-        // another card left behind is already the store's.
-        if (!probeClockRestored && !_ephemeralRun &&
-            _mainViewModel?.VfCurve.RecordUnsettledProbePin() == true)
+        // Nothing to compose for the probe here: the tuner put each pin on
+        // record before it landed and resolves it only on a verified release,
+        // so a join that timed out leaves the truthful record behind, and
+        // MarkCleanShutdown keeps that flag across the mark.
+        if (!probeClockRestored)
         {
-            Core.Diagnostics.Log.Warn(
-                "The V/F probe was still unwinding at shutdown; recorded the card it was pinning as unclean " +
-                "so the next launch warns that the GPU may still be clock-locked.");
+            Core.Diagnostics.Log.Warn("The V/F probe was still unwinding at shutdown; its pin record stands.");
         }
+
         _services?.Dispose();
         _activationSignal?.Dispose();
         _singleInstanceMutex?.Dispose();

@@ -45,15 +45,13 @@ public interface IGpuTuner
     bool LockIsDriverReadable => false;
 
     /// <summary>
-    /// The card's stable applied-state key (UUID, or the index fallback for a
-    /// card the driver gives no UUID) — the key a V/F probe records an
-    /// unreleased pin under. Set by the GPU manager. A verified lock release or
-    /// re-apply resolves that record, so the store reflects the hardware rather
-    /// than the last front-end that touched it: the CLI's own printed remedy
-    /// (`set --lock-clock off`) used to leave the App's "may still be pinned"
-    /// banner up on every launch.
+    /// The key this card's applied-state record is filed under: its UUID, or
+    /// the index fallback when the driver reports none. Every writer for the
+    /// card — the tuner, its fan service, a probe pinning it — uses this one
+    /// key, so the record has one home and a verified lock release from any
+    /// process resolves the pin a probe recorded.
     /// </summary>
-    string? ProbeRecordKey { get => null; set { } }
+    string RecordKey => GpuUuid ?? throw new InvalidOperationException("this tuner has no record key");
 
     /// <summary>
     /// The highest clock a lock can be pinned at: the domain maximum, or on a

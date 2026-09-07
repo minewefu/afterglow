@@ -370,23 +370,16 @@ public partial class VfCurveViewModel : ObservableObject
             return true;
         }
 
-        // The join is the only signal this ViewModel has to give: a worker
-        // that finished has already persisted its own restore failure (and the
-        // store keeps that record through the clean-shutdown mark), while a
-        // worker that has not finished is the one case shutdown must record
-        // for it (see ActiveProbeKey). An in-memory copy of "which cards are
-        // still pinned" fell out of step with the store the moment the user
-        // pressed Reset, and re-recorded a pin the tuner had just released.
+        // The join is the only signal this ViewModel has to give. The pin's
+        // record is the tuner's: written before the pin lands, resolved on a
+        // verified release, kept through the clean-shutdown mark — so a worker
+        // still unwinding at the timeout leaves the truthful record behind. An
+        // in-memory copy of "which cards are still pinned" fell out of step
+        // with the store the moment the user pressed Reset, and re-recorded a
+        // pin the tuner had just released.
         return probe.CancelAndWait(timeout);
     }
 
-    /// <summary>
-    /// For a shutdown whose join timed out: records the probed card as pinned
-    /// if, and only if, a pin may still be on it (see
-    /// <see cref="VfCurveProbe.RecordPinIfUnsettled"/>). False when nothing
-    /// needed recording.
-    /// </summary>
-    public bool RecordUnsettledProbePin() => _probe?.RecordPinIfUnsettled() ?? false;
 
     /// <summary>
     /// Maps the whole curve in about a minute: locks the clock at each step under
@@ -449,13 +442,11 @@ public partial class VfCurveViewModel : ObservableObject
         {
             TargetPciBusId = gpu.PciBusId,
             TargetVendorId = gpu.PciVendorId,
-            StableKey = gpu.StableKey,
         };
         _probe.ProgressChanged += progress =>
         {
-            // The pending record for a failed restore is written by the probe
-            // itself (Core) at the moment it fails; nothing here has to survive
-            // a closing dispatcher.
+            // The pin's record is written by the tuner the moment the pin lands
+            // (Core); nothing here has to survive a closing dispatcher.
             Application.Current?.Dispatcher.BeginInvoke(() =>
             {
                 // Name the probed card whenever it is no longer the one on

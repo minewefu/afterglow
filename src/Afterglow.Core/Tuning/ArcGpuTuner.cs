@@ -104,9 +104,6 @@ public sealed class ArcGpuTuner : IGpuTuner
 
     private double ReleasedMaxMhz => _observedReleasedMaxMhz ?? _hwMaxMhz;
 
-    /// <inheritdoc />
-    public string? ProbeRecordKey { get; set; }
-
     /// <summary>
     /// The highest ceiling any readback has shown this process: the released
     /// baseline once observed, or the ceiling ReadCurrent saw before a probe.
@@ -140,19 +137,14 @@ public sealed class ArcGpuTuner : IGpuTuner
         }
     }
 
-    /// <summary>See <see cref="IGpuTuner.ProbeRecordKey"/>.</summary>
-    private void ResolveProbeRecord()
-    {
-        if ((ProbeRecordKey ?? GpuUuid) is { } key)
-        {
-            AppliedStateStore.ResolveProbeLock(key);
-        }
-    }
+    /// <summary>See <see cref="IGpuTuner.RecordKey"/>.</summary>
+    private void ResolveProbeRecord() => AppliedStateStore.ResolveProbeLock(RecordKey);
 
-    public ArcGpuTuner(IArcDevice device, string? gpuUuid)
+    public ArcGpuTuner(IArcDevice device, string gpuUuid)
     {
         _device = device;
         GpuUuid = gpuUuid;
+        RecordKey = gpuUuid; // Intel identities are always derived, never missing
 
         bool supportsClamp = false;
         foreach (var (handle, props) in device.GetFrequencyDomains())
@@ -203,10 +195,10 @@ public sealed class ArcGpuTuner : IGpuTuner
             PowerLimitDefaultW = plDefaultW,
         };
 
-        // Adopt a tracked clamp only from a record stamped for this GPU —
-        // same identity guard as the NVIDIA tuner (legacy unstamped records
-        // never belong to an Intel identity; see AppliedStateStore.Load).
-        if (AppliedStateStore.Load(gpuUuid) is { LockedCoreClockMHz: uint tracked })
+        // Adopt a tracked clamp only from this card's own record (an unstamped
+        // legacy record never belongs to an Intel identity; see
+        // AppliedStateStore.LoadOrAdoptLegacy).
+        if (AppliedStateStore.LoadOrAdoptLegacy(RecordKey, gpuUuid) is { LockedCoreClockMHz: uint tracked })
         {
             _clamp = new TrackedClamp(tracked, ClampProvenance.Inherited, ClampShape.Range);
         }
@@ -215,6 +207,9 @@ public sealed class ArcGpuTuner : IGpuTuner
     public TuningCapabilities Capabilities { get; }
 
     public string? GpuUuid { get; }
+
+    /// <inheritdoc />
+    public string RecordKey { get; }
 
     // Locked like GpuTuner's: Nullable<uint> reads are not atomic, and probe
     // restore paths capture this value from other threads.
@@ -364,7 +359,7 @@ public sealed class ArcGpuTuner : IGpuTuner
                 return new ApplyResult(false, results);
             }
 
-            AppliedStateStore.RecordPending(profile.Name, GpuUuid);
+            AppliedStateStore.RecordPending(profile.Name, RecordKey);
 
             ApplyPowerLimit(profile, results);
             RefuseIfRequested(profile.TempLimitC is not null, "temp limit", results);
@@ -391,7 +386,7 @@ public sealed class ArcGpuTuner : IGpuTuner
             // factory ceiling as "written by Afterglow", which the release path
             // then refused to adopt forever.
             uint? persistedLock = AppliedLockMHz; // written or inherited, never observed, never a probe pin
-            AppliedStateStore.Record(profile, all, persistedLock, GpuUuid);
+            AppliedStateStore.Record(profile, all, persistedLock, RecordKey);
             Log.Info($"Apply '{profile.Name}' (Arc): {(all ? "ok" : "PARTIAL")} — {string.Join("; ", results.Select(r => $"{r.Knob}={(r.Applied ? "ok" : "fail")}"))}");
             return new ApplyResult(all, results);
         }
@@ -449,7 +444,7 @@ public sealed class ArcGpuTuner : IGpuTuner
             // exists precisely for the case where the driver refused to undo it.
             if (all)
             {
-                AppliedStateStore.Clear(GpuUuid);
+                AppliedStateStore.Clear(RecordKey);
             }
 
             Log.Info($"Reset to defaults (Arc): {(all ? "ok" : "PARTIAL")}");
@@ -496,9 +491,23 @@ public sealed class ArcGpuTuner : IGpuTuner
                 return NvmlReturn.NotSupported;
             }
 
+            bool isPin = Math.Abs(max - min) < 0.5;
+            if (isPin)
+            {
+                // On record BEFORE the write: a pin outlives a killed process,
+                // and the record is what the next launch reads. A refused
+                // write has pinned nothing, so the record is resolved at once.
+                AppliedStateStore.RecordProbeLockPending(RecordKey);
+            }
+
             var rc = _device.TrySetFrequencyRange(_gpuFreqDomain, min, max);
             if (rc != CtlResult.Success)
             {
+                if (isPin)
+                {
+                    ResolveProbeRecord();
+                }
+
                 return ToNvml(rc);
             }
 
@@ -508,7 +517,7 @@ public sealed class ArcGpuTuner : IGpuTuner
             _clamp = new TrackedClamp(
                 shadow,
                 ClampProvenance.Written, // this process's write supersedes an inherited record
-                Math.Abs(max - min) < 0.5 ? ClampShape.ExactPin : ClampShape.Range);
+                isPin ? ClampShape.ExactPin : ClampShape.Range);
 
             if (_device.TryGetFrequencyRange(_gpuFreqDomain, out var readback) != CtlResult.Success)
             {
@@ -517,12 +526,15 @@ public sealed class ArcGpuTuner : IGpuTuner
                 return NvmlReturn.Unknown;
             }
 
-            return Math.Abs(readback.Max - max) <= 1.0 && Math.Abs(readback.Min - min) <= 1.0
-                ? NvmlReturn.Success
-                : NvmlReturn.Unknown;
+            bool verified = Math.Abs(readback.Max - max) <= 1.0 && Math.Abs(readback.Min - min) <= 1.0;
+            if (verified && !isPin)
+            {
+                ResolveProbeRecord(); // a verified range lock this process wrote supersedes any pin
+            }
+
+            return verified ? NvmlReturn.Success : NvmlReturn.Unknown;
         }
     }
-
 
     public NvmlReturn SetAllFansRaw(uint dutyPct) => NvmlReturn.NotSupported;
 

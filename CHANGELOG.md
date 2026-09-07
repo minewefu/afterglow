@@ -129,8 +129,7 @@ live on the Arc B390 the beta was verified on.
   global core offset the zeroed table can take with it.
   A probe that cannot release its pin now records that itself, per card, in the
   applied-state store — the store keeps that record through the clean-shutdown
-  mark, the next-launch banner names the probe, and a card without a driver UUID
-  never touches the legacy file a UUID-less NVIDIA tuner relies on. On Arc the
+  mark and the next-launch banner names the probe. On Arc the
   sweep stops at the ceiling the driver reports, an exact pin's release is proven
   by the floor dropping back to minimum (the ceiling of a factory-limited card
   never "rises"), and every "keep the current lock" path — CLI `set`, MCP, the
@@ -168,6 +167,19 @@ live on the Arc B390 the beta was verified on.
   recorded in `docs/research/intel-driver-apis.md`: a factory restore always
   returns the full range, writes above the domain maximum are clamped rather
   than refused, and fractional requests are truncated on readback.
+- **One record per card, written by the tuner.** Every applied-state writer now
+  files under the card's stable key (`IGpuTuner.RecordKey`: the UUID, or
+  `index:N` when the driver reports none) — the tuner, the fan service, and the
+  V/F probe's pin, which the tuner itself puts on record before the pin lands
+  and resolves on every verified release or re-apply. A process killed
+  anywhere in a sweep, or a shutdown whose join timed out, leaves the truthful
+  record behind without any front-end composing it, so the probe's own record
+  writes, its in-flight flag, and the App's exit-time re-record are gone. The
+  pre-multi-GPU single file is adopted into the card's own file the first time
+  its tuner starts (an Intel identity never adopts an unstamped one) and is
+  otherwise only listed, so an orphan still raises the banner and Dismiss
+  clears it; the legacy-file ownership heuristics that every write and clear
+  used to run are deleted.
 - **The stepper refuses GPUs with no core-offset knob** instead of burning a full
   cycle at offset 0 and reporting "+0 MHz" as a confirmed stable offset — which
   `find_stable_offset` handed straight to an agent.

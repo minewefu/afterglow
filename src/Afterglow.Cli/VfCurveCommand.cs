@@ -143,7 +143,6 @@ internal static class VfCurveCommand
             {
                 TargetPciBusId = gpu.PciBusId,
                 TargetVendorId = gpu.PciVendorId,
-                StableKey = gpu.StableKey,
             };
             // Take the outcome the probe reports rather than sniffing the phase
             // text for "refused": that missed every other early exit, and a

@@ -90,19 +90,51 @@ public sealed class ProbeRecordStoreTests : IDisposable
     }
 
     [Fact]
-    public void Index_keyed_probe_records_never_touch_the_legacy_file()
+    public void An_index_keyed_card_keeps_its_lock_and_its_pin_in_one_record()
     {
-        // A UUID-less NVIDIA tuner reads and writes ONLY the legacy file.
-        AppliedStateStore.Record(Profile("nvidia"), true, 2500, null);
+        // A UUID-less NVIDIA card: its tuner, its fans and a probe pinning it
+        // all file under the index key, so a pin never displaces the lock.
+        AppliedStateStore.Record(Profile("nvidia"), true, 2500, IndexKey);
 
         AppliedStateStore.RecordProbeLockPending(IndexKey);
-        Assert.Equal(2500u, AppliedStateStore.Load(null)?.LockedCoreClockMHz);
-        Assert.True(File.Exists(AppPaths.AppliedStateFile));
-        Assert.Contains(AppliedStateStore.LoadAll(), s => s.GpuUuid == IndexKey && s.ProbeLockPending);
+        var pinned = AppliedStateStore.Load(IndexKey);
+        Assert.Equal(2500u, pinned?.LockedCoreClockMHz);
+        Assert.True(pinned?.ProbeLockPending);
 
         AppliedStateStore.ResolveProbeLock(IndexKey);
-        Assert.Equal(2500u, AppliedStateStore.Load(null)?.LockedCoreClockMHz);
-        Assert.DoesNotContain(AppliedStateStore.LoadAll(), s => s.GpuUuid == IndexKey);
+        var resolved = AppliedStateStore.Load(IndexKey);
+        Assert.Equal(2500u, resolved?.LockedCoreClockMHz);
+        Assert.False(resolved?.ProbeLockPending);
+    }
+
+    [Fact]
+    public void An_unstamped_legacy_record_is_adopted_by_an_nvidia_key_once_and_never_by_an_intel_one()
+    {
+        var legacy = new AppliedStateStore.AppliedState("old build", DateTimeOffset.Now, true, false, 2700);
+        AppPaths.EnsureCreated();
+        File.WriteAllText(AppPaths.AppliedStateFile, System.Text.Json.JsonSerializer.Serialize(legacy));
+
+        Assert.Null(AppliedStateStore.LoadOrAdoptLegacy("INTEL-00:02.0-E20B-0000", "INTEL-00:02.0-E20B-0000"));
+        Assert.True(File.Exists(AppPaths.AppliedStateFile));
+
+        var adopted = AppliedStateStore.LoadOrAdoptLegacy(IndexKey, null);
+        Assert.Equal(2700u, adopted?.LockedCoreClockMHz);
+        Assert.Equal(IndexKey, adopted?.GpuUuid);
+        Assert.False(File.Exists(AppPaths.AppliedStateFile));
+        Assert.Equal(2700u, AppliedStateStore.Load(IndexKey)?.LockedCoreClockMHz);
+        Assert.Single(AppliedStateStore.LoadAll());
+    }
+
+    [Fact]
+    public void A_legacy_record_stamped_for_another_card_is_listed_but_never_adopted()
+    {
+        var legacy = new AppliedStateStore.AppliedState("other", DateTimeOffset.Now, true, false, 2700, GpuUuid: "GPU-other");
+        AppPaths.EnsureCreated();
+        File.WriteAllText(AppPaths.AppliedStateFile, System.Text.Json.JsonSerializer.Serialize(legacy));
+
+        Assert.Null(AppliedStateStore.LoadOrAdoptLegacy(Uuid, Uuid));
+        Assert.True(File.Exists(AppPaths.AppliedStateFile));
+        Assert.Contains(AppliedStateStore.LoadAll(), s => s.GpuUuid == "GPU-other");
     }
 
     [Fact]

@@ -96,69 +96,10 @@ public sealed class VfCurveProbe
     public uint TargetVendorId { get; set; } = Stress.StressAdapter.NvidiaVendorId;
 
     /// <summary>
-    /// The probed card's stable key (its UUID, or the index fallback when the
-    /// driver reports none), for the pending record the probe writes itself
-    /// when its restore fails — the one behaviour that must survive a crash,
-    /// owned here so no front-end can forget it. Null falls back to the
-    /// tuner's UUID.
-    /// </summary>
-    public string? StableKey { get; set; }
-
-    /// <summary>
     /// The load engine to drive during the sweep. Null means the real burn
     /// (<see cref="GpuStressTest"/>); tests supply a load that runs nothing.
     /// </summary>
     public Func<IProbeLoad>? LoadFactory { get; set; }
-
-    // Guards the pin-in-flight flag together with the store writes that settle
-    // it, so a shutdown's "record this card as pinned" and the worker's own
-    // restore-and-record cannot cross.
-    private readonly object _pinLock = new();
-    private bool _pinInFlight;
-
-    /// <summary>
-    /// False only while a pin this probe wrote may still be on the card — from
-    /// the first lock until the restore has run and its record is written.
-    /// </summary>
-    public bool ClockStateSettled
-    {
-        get
-        {
-            lock (_pinLock)
-            {
-                return !_pinInFlight;
-            }
-        }
-    }
-
-    /// <summary>
-    /// Records the card as pinned if a pin this probe wrote may still be on it
-    /// — for a shutdown whose join timed out. Takes the lock the worker's
-    /// restore path holds while it writes or resolves its own record and
-    /// clears the flag, so a worker past its restore has already written the
-    /// truth and this returns false instead of re-recording a released card.
-    /// </summary>
-    public bool RecordPinIfUnsettled()
-    {
-        lock (_pinLock)
-        {
-            if (!_pinInFlight)
-            {
-                return false;
-            }
-
-            if ((StableKey ?? _tuner.GpuUuid) is { } key)
-            {
-                AppliedStateStore.RecordProbeLockPending(key);
-            }
-            else
-            {
-                AppliedStateStore.RecordPending(AppliedStateStore.ProbeLockPendingName);
-            }
-
-            return true;
-        }
-    }
 
     public void Cancel() => _cancel = true;
 
@@ -362,11 +303,9 @@ public sealed class VfCurveProbe
                 uint target = targets[i];
                 Report(new VfProbeProgress(true, i, targets.Count, target, null, null, "settling"));
 
-                lock (_pinLock)
-                {
-                    _pinInFlight = true;
-                }
-
+                // The tuner puts the pin on record before it lands and resolves
+                // it on every verified release, so a process killed anywhere
+                // in the sweep leaves the truthful record behind.
                 var lockRc = _tuner.LockClockForProbe(target);
                 if (lockRc != NvmlReturn.Success)
                 {
@@ -463,40 +402,10 @@ public sealed class VfCurveProbe
                 }
             }
 
-            // The probe owns the record of its own failure. Persisting at the
-            // moment of risk, not only at a graceful exit, is the one behaviour
-            // that survives a crash — and it lived in two front-ends' progress
-            // handlers, where a third consumer could forget it.
-            //
-            // Probe-lock records go through the store's own probe operations,
-            // which touch only the key's per-card file: routing an index key
-            // through the general Record/Clear path adopted and retired the
-            // legacy file — the ONLY record a UUID-less NVIDIA tuner reads —
-            // and deleted its tracked lock on a clean probe.
-            lock (_pinLock)
-            {
-                string? recordKey = StableKey ?? _tuner.GpuUuid;
-                if (restoreFailure is not null)
-                {
-                    if (recordKey is not null)
-                    {
-                        AppliedStateStore.RecordProbeLockPending(recordKey);
-                    }
-                    else
-                    {
-                        AppliedStateStore.RecordPending(AppliedStateStore.ProbeLockPendingName);
-                    }
-                }
-                else if (anyLockLanded && recordKey is not null)
-                {
-                    // A clean release resolves this card's probe record. The
-                    // store keeps such records through the shutdown mark, so
-                    // nothing else would ever retire it.
-                    AppliedStateStore.ResolveProbeLock(recordKey);
-                }
-
-                _pinInFlight = false;
-            }
+            // The store already tells the truth: the tuner recorded each pin
+            // before it landed and resolved the record when the release
+            // verified, so a failed restore leaves the record standing and a
+            // clean one leaves nothing — without the probe writing a word.
 
             // The same 30 s budget every verdict site uses, and the result is
             // checked: the closing verification on a slow iGPU can outlast 5 s,

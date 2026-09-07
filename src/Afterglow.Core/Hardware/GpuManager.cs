@@ -44,8 +44,7 @@ public sealed class GpuContext
     /// the probe-lock records and anything else that must name a card — two
     /// copies had already drifted on culture.
     /// </summary>
-    public string StableKey =>
-        Uuid ?? string.Create(System.Globalization.CultureInfo.InvariantCulture, $"index:{Index}");
+    public string StableKey => Uuid ?? AppliedStateStore.IndexKeyFor(Index);
 
     /// <summary>
     /// Why Afterglow cannot read this card's core voltage, or null when the
@@ -161,6 +160,7 @@ public sealed class GpuManager : IDisposable
                     poller.EnrichmentSource = enricher.Read;
                 }
 
+                string? uuid = device.GetUuid();
                 contexts.Add(new GpuContext
                 {
                     Index = device.Index,
@@ -170,8 +170,8 @@ public sealed class GpuManager : IDisposable
                     Nvapi = pairedNvapi,
                     Architecture = arch,
                     Poller = poller,
-                    Tuner = new GpuTuner(device, pairedNvapi),
-                    Uuid = device.GetUuid(),
+                    Tuner = new GpuTuner(device, pairedNvapi, uuid ?? AppliedStateStore.IndexKeyFor(device.Index)),
+                    Uuid = uuid,
                     PciBusId = pciBus,
                     PciVendorId = 0x10DE,
                     DriverVersion = DriverVersion,
@@ -218,14 +218,6 @@ public sealed class GpuManager : IDisposable
                 });
                 nextIndex++;
             }
-        }
-
-        // The tuner resolves a V/F probe's pin record on every verified lock
-        // release, and that record is keyed by the card's stable key — which a
-        // UUID-less NVIDIA tuner cannot derive on its own.
-        foreach (var context in contexts)
-        {
-            context.Tuner.ProbeRecordKey = context.StableKey;
         }
 
         Gpus = contexts;

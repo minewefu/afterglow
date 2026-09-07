@@ -27,7 +27,7 @@ public sealed class FanControlService : IDisposable
 {
     private readonly Func<uint, NvmlReturn> _setAllFans;
     private readonly Func<NvmlReturn> _restoreAutoFans;
-    private readonly string? _gpuUuid;
+    private readonly string _recordKey;
     private readonly uint _fanMinDutyPct;
     private readonly object _lock = new();
     private readonly object _commandLock = new();
@@ -48,7 +48,7 @@ public sealed class FanControlService : IDisposable
     private long _generation;
 
     public FanControlService(IGpuTuner tuner)
-        : this(tuner.SetAllFansRaw, tuner.RestoreAutoFansRaw, tuner.GpuUuid, tuner.Capabilities.FanMinDutyPct)
+        : this(tuner.SetAllFansRaw, tuner.RestoreAutoFansRaw, tuner.RecordKey, tuner.Capabilities.FanMinDutyPct)
     {
     }
 
@@ -60,12 +60,12 @@ public sealed class FanControlService : IDisposable
     internal FanControlService(
         Func<uint, NvmlReturn> setAllFans,
         Func<NvmlReturn> restoreAutoFans,
-        string? gpuUuid,
+        string recordKey,
         uint fanMinDutyPct)
     {
         _setAllFans = setAllFans;
         _restoreAutoFans = restoreAutoFans;
-        _gpuUuid = gpuUuid;
+        _recordKey = recordKey;
         _fanMinDutyPct = fanMinDutyPct;
     }
 
@@ -173,7 +173,7 @@ public sealed class FanControlService : IDisposable
             return false;
         }
 
-        AppliedStateStore.RecordFans(null, null, _gpuUuid);
+        AppliedStateStore.RecordFans(null, null, _recordKey);
         return true;
     }
 
@@ -204,7 +204,7 @@ public sealed class FanControlService : IDisposable
             return false;
         }
 
-        AppliedStateStore.RecordFans("fixed", duty, _gpuUuid);
+        AppliedStateStore.RecordFans("fixed", duty, _recordKey);
         return true;
     }
 
@@ -242,7 +242,7 @@ public sealed class FanControlService : IDisposable
             _lastManualDuty = dutyPct;
         }
 
-        AppliedStateStore.RecordFans("fixed", dutyPct, _gpuUuid);
+        AppliedStateStore.RecordFans("fixed", dutyPct, _recordKey);
     }
 
     public void SetCurve(FanCurveConfig config)
@@ -261,7 +261,7 @@ public sealed class FanControlService : IDisposable
             _generation++;
         }
 
-        AppliedStateStore.RecordFans("curve", null, _gpuUuid);
+        AppliedStateStore.RecordFans("curve", null, _recordKey);
     }
 
     /// <summary>Feed one telemetry snapshot (called on the polling thread).</summary>
@@ -402,7 +402,7 @@ public sealed class FanControlService : IDisposable
             // Re-recording clears the clean flag on purpose: this shutdown did
             // NOT leave the hardware as it found it, and the user needs to know.
             AppliedStateStore.RecordFans(
-                "fixed", lastDuty >= 0 ? (uint)Math.Round(lastDuty) : null, _gpuUuid);
+                "fixed", lastDuty >= 0 ? (uint)Math.Round(lastDuty) : null, _recordKey);
         }
     }
 }

@@ -112,19 +112,24 @@ public sealed class GpuTuner : IGpuTuner
     public TuningCapabilities Capabilities { get; }
 
     private readonly string? _gpuUuid;
+    private readonly string _recordKey;
 
-    public GpuTuner(NvmlDevice nvml, NvapiGpu? nvapi)
+    /// <param name="recordKey">
+    /// The card's stable key (see <see cref="IGpuTuner.RecordKey"/>): the UUID,
+    /// or the index fallback the GPU manager derives when NVML reports none.
+    /// </param>
+    public GpuTuner(NvmlDevice nvml, NvapiGpu? nvapi, string recordKey)
     {
         _nvml = nvml;
         _nvapi = nvapi;
         _gpuUuid = nvml.GetUuid();
+        _recordKey = recordKey;
         Capabilities = DiscoverCapabilities();
 
-        // Restore the tracked lock only when the persisted record belongs to
-        // THIS GPU (or predates UUID stamping) — on a multi-GPU system, a lock
-        // applied to another card must not be adopted here.
-        var state = AppliedStateStore.Load(_gpuUuid);
-        if (state is not null && (state.GpuUuid is null || state.GpuUuid == _gpuUuid))
+        // The record is this card's own file — adopted from the pre-multi-GPU
+        // single file on the first start after an upgrade — so a lock applied
+        // to another card can never be adopted here.
+        if (AppliedStateStore.LoadOrAdoptLegacy(_recordKey, _gpuUuid) is { } state)
         {
             _appliedLockMHz = state.LockedCoreClockMHz;
         }
@@ -132,6 +137,9 @@ public sealed class GpuTuner : IGpuTuner
 
     /// <summary>NVML UUID of the GPU this tuner drives (null if the driver won't report one).</summary>
     public string? GpuUuid => _gpuUuid;
+
+    /// <inheritdoc />
+    public string RecordKey => _recordKey;
 
     /// <summary>
     /// The clock lock Afterglow last applied (null = none). NVML has no getter
@@ -285,7 +293,7 @@ public sealed class GpuTuner : IGpuTuner
                 return new ApplyResult(false, results);
             }
 
-            AppliedStateStore.RecordPending(profile.Name, _gpuUuid);
+            AppliedStateStore.RecordPending(profile.Name, _recordKey);
 
             ApplyPowerLimit(profile, results);
             ApplyTempLimit(profile, results);
@@ -303,16 +311,13 @@ public sealed class GpuTuner : IGpuTuner
             ApplyVfPointOffsets(profile, results, reconcileVfPoints);
 
             bool all = results.All(r => r.Applied);
-            AppliedStateStore.Record(profile, all, _appliedLockMHz, _gpuUuid);
+            AppliedStateStore.Record(profile, all, AppliedLockMHz, _recordKey); // never the probe's pin
             Log.Info($"Apply '{profile.Name}': {(all ? "ok" : "PARTIAL")} — {string.Join("; ", results.Select(r => $"{r.Knob}={(r.Applied ? "ok" : "fail")}"))}");
             return new ApplyResult(all, results);
         }
     }
 
     /// <summary>Returns every knob this engine owns to driver defaults.</summary>
-    /// <inheritdoc />
-    public string? ProbeRecordKey { get; set; }
-
     // The shadow holds the probe's exact pin while a sweep runs. A pin is
     // never "the lock Afterglow applied": reporting it there made the next
     // sweep restore a failed-release pin as a range lock the user never set.
@@ -325,13 +330,7 @@ public sealed class GpuTuner : IGpuTuner
     /// off` or `reset` freed the card (neither front-end can clear a record
     /// keyed by the index fallback, which only the tuner knows belongs to it).
     /// </summary>
-    private void ResolveProbeRecord()
-    {
-        if ((ProbeRecordKey ?? _gpuUuid) is { } key)
-        {
-            AppliedStateStore.ResolveProbeLock(key);
-        }
-    }
+    private void ResolveProbeRecord() => AppliedStateStore.ResolveProbeLock(_recordKey);
 
     public ApplyResult ResetToDefaults()
     {
@@ -399,7 +398,7 @@ public sealed class GpuTuner : IGpuTuner
             // exists precisely for the case where the driver refused to undo it.
             if (all)
             {
-                AppliedStateStore.Clear(_gpuUuid);
+                AppliedStateStore.Clear(_recordKey);
             }
 
             Log.Info($"Reset to defaults: {(all ? "ok" : "PARTIAL")}");
@@ -893,11 +892,19 @@ public sealed class GpuTuner : IGpuTuner
     {
         lock (_applyLock)
         {
+            // On record BEFORE the write: a pin outlives a killed process, and
+            // the record is what the next launch reads. A refused write has
+            // pinned nothing, so the record is resolved again at once.
+            AppliedStateStore.RecordProbeLockPending(_recordKey);
             var rc = _nvml.TrySetGpuLockedClocks(clockMHz, clockMHz);
             if (rc == NvmlReturn.Success)
             {
                 _appliedLockMHz = clockMHz;
                 _shadowIsProbePin = true;
+            }
+            else
+            {
+                ResolveProbeRecord();
             }
 
             return rc;
@@ -1018,22 +1025,36 @@ public sealed class GpuTuner : IGpuTuner
 
 /// <summary>
 /// Persists what was applied so an unclean shutdown (crash, TDR, power cut) can be
-/// detected on the next start, and so Afterglow-tracked state (the clock lock, manual
-/// fan control) survives restarts. A pending marker is written before an apply begins,
-/// so even a crash mid-apply is caught. One file per GPU (keyed by NVML UUID) so two
-/// cards never overwrite each other's record; the pre-multi-GPU single file remains
-/// readable as the legacy fallback and is retired the first time that GPU's state is
-/// written or cleared.
+/// detected on the next start, and so Afterglow-tracked state (the clock lock, a
+/// V/F probe's pin, manual fan control) survives restarts. A pending marker is
+/// written before an apply or a pin begins, so even a crash mid-write is caught.
+/// One file per card, keyed by the card's stable key — its UUID, or
+/// <c>index:N</c> when the driver reports none — and every writer for a card
+/// (its tuner, its fan service, a probe pinning it) uses that one key, so two
+/// cards never overwrite each other and no record has two homes. The
+/// pre-multi-GPU single file is migrated to a card's own file the first time
+/// that card's tuner starts (<see cref="LoadOrAdoptLegacy"/>); until then it is
+/// only ever listed, so an orphan still raises the banner and can be dismissed.
 /// </summary>
 public static class AppliedStateStore
 {
     /// <summary>
-    /// The pending-record name for a V/F probe that could not put the clock
-    /// state back — the text the next-launch banner displays. One constant, so
-    /// the probe, the App and the shutdown sweep cannot drift apart on it.
+    /// The pending-record name for a V/F probe's pin — the text the next-launch
+    /// banner displays for a record the probe created and nothing else wrote.
     /// </summary>
     public const string ProbeLockPendingName = "v/f probe clock lock";
 
+    /// <summary>The prefix of the index-fallback key a card without a driver UUID is recorded under.</summary>
+    public const string IndexKeyPrefix = "index:";
+
+    /// <summary>The record key of a card the driver gives no UUID: one formula, used by the GPU manager and the tests.</summary>
+    public static string IndexKeyFor(uint index) =>
+        IndexKeyPrefix + index.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// One card's record. <paramref name="GpuUuid"/> is the key the record is
+    /// filed under (a UUID or an index key; the JSON name predates index keys).
+    /// </summary>
     public sealed record AppliedState(
         string ProfileName,
         DateTimeOffset AppliedAt,
@@ -1049,33 +1070,31 @@ public static class AppliedStateStore
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly object Lock = new();
 
-    public static void RecordPending(string profileName, string? gpuUuid = null)
+    public static void RecordPending(string profileName, string key)
     {
-        Mutate(gpuUuid, state => (state ?? Empty(profileName)) with
+        Mutate(key, state => (state ?? Empty(profileName)) with
         {
             ProfileName = profileName,
             AppliedAt = DateTimeOffset.Now,
             AllKnobsSucceeded = false,
             CleanShutdown = false,
             Pending = true,
-            // A run where NVML won't report a UUID is not evidence the record
-            // changed owner — keep a stamp we are in no position to replace.
-            GpuUuid = gpuUuid ?? state?.GpuUuid,
+            GpuUuid = key,
         });
     }
 
     /// <summary>
     /// Records an apply. <paramref name="lockWrittenByAfterglow"/> must be a
     /// clock lock this process wrote, or inherited from a crashed session's
-    /// record — never one merely observed from the driver. An observed factory
-    /// ceiling persisted here is loaded by the next launch as "written by
-    /// Afterglow", and the release path then refuses to adopt it forever. The
-    /// NVML tuner's shadow is only ever written by its own calls; a tuner with a
-    /// readback getter (Intel) must filter by provenance before calling this.
+    /// record — never one merely observed from the driver, and never a probe's
+    /// exact pin. An observed factory ceiling persisted here is loaded by the
+    /// next launch as "written by Afterglow", and the release path then refuses
+    /// to adopt it forever; a pin persisted here is restored as a range lock
+    /// the user never set.
     /// </summary>
-    public static void Record(TuningProfile profile, bool allSucceeded, uint? lockWrittenByAfterglow, string? gpuUuid = null)
+    public static void Record(TuningProfile profile, bool allSucceeded, uint? lockWrittenByAfterglow, string key)
     {
-        Mutate(gpuUuid, state => (state ?? Empty(profile.Name)) with
+        Mutate(key, state => (state ?? Empty(profile.Name)) with
         {
             ProfileName = profile.Name,
             AppliedAt = DateTimeOffset.Now,
@@ -1083,14 +1102,14 @@ public static class AppliedStateStore
             CleanShutdown = false,
             LockedCoreClockMHz = lockWrittenByAfterglow,
             Pending = false,
-            GpuUuid = gpuUuid ?? state?.GpuUuid, // keep the stamp when this run has no UUID (see RecordPending)
+            GpuUuid = key,
         });
     }
 
     /// <summary>Records that Afterglow took manual control of the fans (or released it with null).</summary>
-    public static void RecordFans(string? mode, uint? duty, string? gpuUuid = null)
+    public static void RecordFans(string? mode, uint? duty, string key)
     {
-        Mutate(gpuUuid, state =>
+        Mutate(key, state =>
         {
             if (state is null && mode is null)
             {
@@ -1102,18 +1121,69 @@ public static class AppliedStateStore
                 FanMode = mode,
                 FanDuty = duty,
                 CleanShutdown = false,
-                GpuUuid = gpuUuid ?? state?.GpuUuid,
+                GpuUuid = key,
             };
         });
     }
 
     /// <summary>
-    /// App-level: marks every GPU's record (and the legacy file) as cleanly shut
-    /// down. A record whose V/F probe left a clock pin unresolved (see
-    /// <see cref="RecordProbeLockPending"/>) stays unclean — the pin outlives
-    /// the process, and the App used to re-record it after this call purely to
-    /// undo the mark — unless <paramref name="resolveProbeLocks"/> is true (the
-    /// user dismissing the banner).
+    /// Records that a V/F probe's exact pin is (or may be) on the card. The
+    /// tuner writes it BEFORE the pin lands and resolves it on every verified
+    /// release or re-apply, so the store reflects the hardware whatever process
+    /// or front-end touched it last, and a process killed mid-sweep leaves the
+    /// truthful record behind. The flag is its own fact, independent of
+    /// <see cref="AppliedState.CleanShutdown"/>: a clean exit is still a clean
+    /// exit, and the next launch reads the flag to raise the pin banner.
+    /// </summary>
+    public static void RecordProbeLockPending(string key)
+    {
+        Mutate(key, state => (state ?? Empty(ProbeLockPendingName)) with
+        {
+            AppliedAt = DateTimeOffset.Now,
+            ProbeLockPending = true,
+            GpuUuid = key,
+        });
+    }
+
+    /// <summary>
+    /// The probe's pin on <paramref name="key"/> is verifiably gone. A record
+    /// the probe created that nothing else wrote into is dropped outright; any
+    /// other record only loses the flag — the rest of it (a tuning lock, fan
+    /// control, its shutdown state) is still its owner's to track.
+    /// </summary>
+    public static void ResolveProbeLock(string key)
+    {
+        lock (Lock)
+        {
+            try
+            {
+                string path = PathFor(key);
+                if (ReadFile(path) is not { ProbeLockPending: true } state)
+                {
+                    return;
+                }
+
+                if (IsProbeOnly(state))
+                {
+                    File.Delete(path);
+                }
+                else
+                {
+                    WriteFile(path, state with { ProbeLockPending = false });
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+            }
+        }
+    }
+
+    /// <summary>
+    /// App-level: marks every record (an un-migrated legacy file included) as
+    /// cleanly shut down. The probe flag is kept across the mark unless
+    /// <paramref name="resolveProbeLocks"/> is true (the user dismissing the
+    /// banner) — then it is cleared, and a record that held nothing else is
+    /// dropped so no orphan lingers.
     /// </summary>
     public static void MarkCleanShutdown(bool resolveProbeLocks = false)
     {
@@ -1128,13 +1198,7 @@ public static class AppliedStateStore
                         continue;
                     }
 
-                    // The probe flag is its own fact, kept across the mark: a
-                    // clean exit is still a clean exit, and the next launch
-                    // reads the flag, not CleanShutdown, to raise the pin
-                    // banner. Dismissing the banner resolves it — and drops a
-                    // record that held nothing else, so no orphan lingers.
-                    if (resolveProbeLocks && state.ProbeLockPending
-                        && (IsIndexKey(state.GpuUuid) || IsProbeOnly(state)))
+                    if (resolveProbeLocks && state.ProbeLockPending && IsProbeOnly(state))
                     {
                         File.Delete(path);
                         continue;
@@ -1157,134 +1221,57 @@ public static class AppliedStateStore
         }
     }
 
-    /// <summary>
-    /// State for one GPU: its own file first, else the legacy single file —
-    /// but only when that legacy record is this GPU's. An unstamped record
-    /// predates per-GPU files and still migrates (the single-GPU upgrade);
-    /// a record stamped for a DIFFERENT card is not ours to read. Handing it
-    /// back would let Mutate copy the fields a write doesn't touch — the
-    /// tracked clock lock above all — into our file under our stamp, which
-    /// defeats GpuTuner's identity guard on the next launch.
-    ///
-    /// Called with a null uuid (a run where NVML would not identify the card)
-    /// there is no identity to compare, so the legacy record is returned as-is
-    /// and a write keeps whatever stamp it already carried: best effort, and
-    /// the only case where this can still hand back another card's record.
-    /// </summary>
-    public static AppliedState? Load(string? gpuUuid = null)
+    /// <summary>The record filed under <paramref name="key"/>, or null.</summary>
+    public static AppliedState? Load(string key)
     {
         lock (Lock)
         {
-            if (gpuUuid is not null && ReadFile(PathFor(gpuUuid)) is { } perGpu)
-            {
-                return perGpu;
-            }
-
-            var legacy = ReadFile(AppPaths.AppliedStateFile);
-            if (gpuUuid is not null && legacy?.GpuUuid is { } owner && owner != gpuUuid)
-            {
-                return null; // another card's record: never adopted, never seeded from
-            }
-
-            // An UNSTAMPED legacy record predates Arc write support, so it can
-            // only have been written for an NVIDIA card — an Intel identity
-            // must never adopt it (a hybrid machine upgrading from an old
-            // build would otherwise hand the NVIDIA lock to the Arc tuner).
-            if (legacy is { GpuUuid: null } && IsIntelUuid(gpuUuid))
-            {
-                return null;
-            }
-
-            return legacy;
+            return ReadFile(PathFor(key));
         }
     }
 
     /// <summary>
-    /// True for the index fallback a card without a driver UUID is recorded
-    /// under (<c>index:N</c>) — a key no tuner ever loads or clears.
+    /// A tuner's first read: its own file, after adopting the pre-multi-GPU
+    /// single file when that file is this card's. An UNSTAMPED legacy record
+    /// predates Arc write support, so it can only have been written for an
+    /// NVIDIA card — an Intel identity never adopts it (a hybrid machine
+    /// upgrading from an old build would otherwise hand the NVIDIA lock to the
+    /// Arc tuner). A record stamped for a different card is not ours to read
+    /// and stays where it is. Once adopted, the legacy file is retired.
     /// </summary>
-    public static bool IsIndexKey(string? key) =>
-        key is not null && key.StartsWith("index:", StringComparison.Ordinal);
-
-    /// <summary>
-    /// Records that a V/F probe left a clock pin it could not release on the
-    /// card <paramref name="key"/> (UUID or index fallback). An index key
-    /// touches only its own file: routing it through <see cref="RecordPending"/>
-    /// seeded the new file from the unstamped legacy record and retired that
-    /// record — the ONLY file a UUID-less NVIDIA tuner reads and writes — so the
-    /// tuner's tracked lock migrated to a file it never loads.
-    /// </summary>
-    public static void RecordProbeLockPending(string key)
+    public static AppliedState? LoadOrAdoptLegacy(string key, string? uuid)
     {
-        if (!IsIndexKey(key))
-        {
-            // A real UUID owns its per-GPU file (and a legacy record stamped
-            // with it); the ordinary write path is the right one for it.
-            Mutate(key, state => (state ?? Empty(ProbeLockPendingName)) with
-            {
-                AppliedAt = DateTimeOffset.Now,
-                ProbeLockPending = true,
-                GpuUuid = key,
-            });
-            return;
-        }
-
         lock (Lock)
         {
+            var own = ReadFile(PathFor(key));
+            if (ReadFile(AppPaths.AppliedStateFile) is not { } legacy)
+            {
+                return own;
+            }
+
+            bool ours = legacy.GpuUuid is null
+                ? !IsIntelKey(key)
+                : legacy.GpuUuid == uuid || legacy.GpuUuid == key;
+            if (!ours)
+            {
+                return own;
+            }
+
             try
             {
-                string path = PathFor(key);
-                var state = ReadFile(path) ?? Empty(ProbeLockPendingName);
-                WriteFile(path, state with
+                if (own is null)
                 {
-                    AppliedAt = DateTimeOffset.Now,
-                    ProbeLockPending = true,
-                    GpuUuid = key,
-                });
+                    own = legacy with { GpuUuid = key };
+                    WriteFile(PathFor(key), own);
+                }
+
+                File.Delete(AppPaths.AppliedStateFile);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
             }
-        }
-    }
 
-    /// <summary>
-    /// The probe's clock pin on <paramref name="key"/> is released: an
-    /// index-fallback record is dropped outright (nothing else lives in it);
-    /// a real UUID's file only loses the probe flag — the rest of the record
-    /// (a tuning lock, fan control) is still the tuner's to track. The legacy
-    /// file is never touched (see <see cref="RecordProbeLockPending"/>).
-    /// </summary>
-    public static void ResolveProbeLock(string key)
-    {
-        lock (Lock)
-        {
-            try
-            {
-                string path = PathFor(key);
-                if (IsIndexKey(key))
-                {
-                    File.Delete(path);
-                }
-                else if (ReadFile(path) is { ProbeLockPending: true } state)
-                {
-                    if (IsProbeOnly(state))
-                    {
-                        // Born from the probe and holding nothing else. Left
-                        // behind under the name "v/f probe clock lock", it
-                        // raised the generic crash banner after a clean CLI
-                        // re-probe — the CLI never marks the session clean.
-                        File.Delete(path);
-                    }
-                    else
-                    {
-                        WriteFile(path, state with { ProbeLockPending = false });
-                    }
-                }
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-            }
+            return own;
         }
     }
 
@@ -1297,12 +1284,13 @@ public static class AppliedStateStore
     private static bool IsProbeOnly(AppliedState state) =>
         state.ProfileName == ProbeLockPendingName && state.FanMode is null && state.LockedCoreClockMHz is null;
 
-    private static bool IsIntelUuid(string? gpuUuid) =>
-        gpuUuid is not null && gpuUuid.StartsWith("INTEL-", StringComparison.OrdinalIgnoreCase);
+    private static bool IsIntelKey(string key) =>
+        key.StartsWith("INTEL-", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
-    /// Every persisted record, for startup crash scanning — per-GPU files plus
-    /// the legacy file when no per-GPU file has superseded it (same UUID).
+    /// Every persisted record, for startup crash scanning — per-card files plus
+    /// a legacy file no tuner has adopted yet (a card that is absent, or an
+    /// upgrade whose card has not started a tuner since).
     /// </summary>
     public static IReadOnlyList<AppliedState> LoadAll()
     {
@@ -1327,25 +1315,14 @@ public static class AppliedStateStore
         }
     }
 
-    /// <summary>Removes the GPU's record — its own file and, if it owns it, the legacy file.</summary>
-    public static void Clear(string? gpuUuid = null)
+    /// <summary>Removes the record filed under <paramref name="key"/>.</summary>
+    public static void Clear(string key)
     {
         lock (Lock)
         {
             try
             {
-                if (gpuUuid is not null)
-                {
-                    File.Delete(PathFor(gpuUuid));
-                }
-
-                var legacy = ReadFile(AppPaths.AppliedStateFile);
-                bool ownsLegacy = legacy is null || legacy.GpuUuid == gpuUuid || gpuUuid is null
-                    || (legacy.GpuUuid is null && !IsIntelUuid(gpuUuid));
-                if (ownsLegacy)
-                {
-                    File.Delete(AppPaths.AppliedStateFile);
-                }
+                File.Delete(PathFor(key));
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
@@ -1354,13 +1331,13 @@ public static class AppliedStateStore
     }
 
     /// <summary>
-    /// Per-GPU file name derived from the GPU UUID ("GPU-2b6ae74e-…" or
-    /// "INTEL-0000:00:02.0-…" → stable suffix). Vendor prefixes are stripped so
-    /// the 12-character budget is spent on the identifying digits.
+    /// Per-card file name derived from the key ("GPU-2b6ae74e-…",
+    /// "INTEL-0000:00:02.0-…" or "index:0" → stable suffix). Vendor prefixes are
+    /// stripped so the 12-character budget is spent on the identifying digits.
     /// </summary>
-    public static string PathFor(string gpuUuid)
+    public static string PathFor(string key)
     {
-        var keep = new string(gpuUuid.Where(char.IsLetterOrDigit).ToArray());
+        var keep = new string(key.Where(char.IsLetterOrDigit).ToArray());
         if (keep.StartsWith("INTEL", StringComparison.OrdinalIgnoreCase))
         {
             keep = "i" + keep[5..]; // keep vendor namespaces disjoint post-strip
@@ -1426,32 +1403,17 @@ public static class AppliedStateStore
     private static AppliedState Empty(string name) =>
         new(name, DateTimeOffset.Now, false, false);
 
-    private static void Mutate(string? gpuUuid, Func<AppliedState?, AppliedState?> mutate)
+    private static void Mutate(string key, Func<AppliedState?, AppliedState?> mutate)
     {
         lock (Lock)
         {
             try
             {
-                // Seed the mutation from this GPU's current view (its file, or
-                // the legacy file it hasn't superseded yet), but always write
-                // to the per-GPU file once a UUID is known.
-                var next = mutate(Load(gpuUuid));
-                if (next is null)
+                string path = PathFor(key);
+                var next = mutate(ReadFile(path));
+                if (next is not null)
                 {
-                    return;
-                }
-
-                WriteFile(gpuUuid is not null ? PathFor(gpuUuid) : AppPaths.AppliedStateFile, next);
-
-                // The legacy file is superseded for this GPU from now on;
-                // leaving a stale copy would double-report crashes. An
-                // unstamped legacy record is never an Intel identity's to
-                // supersede (it predates Arc write support).
-                if (gpuUuid is not null &&
-                    ReadFile(AppPaths.AppliedStateFile) is { } legacy &&
-                    ((legacy.GpuUuid is null && !IsIntelUuid(gpuUuid)) || legacy.GpuUuid == gpuUuid))
-                {
-                    File.Delete(AppPaths.AppliedStateFile);
+                    WriteFile(path, next);
                 }
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

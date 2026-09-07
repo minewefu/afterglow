@@ -20,7 +20,7 @@ public sealed class VfProbeScenarioTests : IDisposable
 
     public void Dispose() => _store.Dispose();
 
-    private static ArcGpuTuner Tuner(FakeArcDevice device) => new(device, Uuid) { ProbeRecordKey = Uuid };
+    private static ArcGpuTuner Tuner(FakeArcDevice device) => new(device, Uuid);
 
     private static VfCurveProbe Probe(ArcGpuTuner tuner, FakeArcDevice device, FakeProbeLoad? load = null) =>
         new(tuner, () => new GpuSnapshot
@@ -35,7 +35,6 @@ public sealed class VfProbeScenarioTests : IDisposable
             SettleSeconds = 0,
             SampleSeconds = 0.2,
             StepMHz = 500,
-            StableKey = Uuid,
             LoadFactory = () => load ?? new FakeProbeLoad(),
         };
 
@@ -155,7 +154,6 @@ public sealed class VfProbeScenarioTests : IDisposable
         Assert.True(final.RestoreFailed, final.Phase);
         Assert.Contains("WARNING", final.Phase, StringComparison.Ordinal);
         Assert.True(AppliedStateStore.Load(Uuid)?.ProbeLockPending);
-        Assert.True(probe.ClockStateSettled);
 
         dev.RestoreResult = CtlResult.Success;
         Assert.True(tuner.ForceUnlock().Applied);
@@ -201,7 +199,7 @@ public sealed class VfProbeScenarioTests : IDisposable
         Assert.Equal(VfProbeOutcome.Cancelled, terminal!.Outcome);
         Assert.False(terminal.RestoreFailed, terminal.Phase);
         Assert.Equal((100d, 2300d), (dev.Min, dev.Max));
-        Assert.True(probe.ClockStateSettled);
+        Assert.Null(AppliedStateStore.Load(Uuid));
     }
 
     [Fact]
@@ -282,23 +280,22 @@ public sealed class VfProbeScenarioTests : IDisposable
     }
 
     [Fact]
-    public void Shutdown_can_record_a_pin_only_while_it_is_unsettled()
+    public void A_pin_is_on_record_from_the_moment_it_lands_until_the_release_verifies()
     {
+        // A process killed anywhere in the sweep — or a shutdown whose join
+        // timed out — leaves the truthful record behind without any front-end
+        // composing it.
         var dev = new FakeArcDevice();
         var tuner = Tuner(dev);
         var probe = Probe(tuner, dev);
         probe.SampleSeconds = 5;
-
-        Assert.False(probe.RecordPinIfUnsettled()); // nothing pinned yet
+        Assert.Null(AppliedStateStore.Load(Uuid));
 
         probe.Start(new VfCurveRecorder());
         Assert.True(dev.PinLanded.Wait(TimeSpan.FromSeconds(10)), "the probe never pinned");
-
-        Assert.True(probe.RecordPinIfUnsettled());
         Assert.True(AppliedStateStore.Load(Uuid)?.ProbeLockPending);
 
         Assert.True(probe.CancelAndWait(TimeSpan.FromSeconds(10)));
-        Assert.False(probe.RecordPinIfUnsettled()); // restored and resolved: nothing to record
         Assert.NotEqual(true, AppliedStateStore.Load(Uuid)?.ProbeLockPending);
     }
 }
