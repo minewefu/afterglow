@@ -18,18 +18,29 @@ internal static class VfPointsCommand
 {
     public static int Run(string[] args)
     {
+        if (CliArgs.Validate(args, "vfpoints") is string argError)
+        {
+            Console.Error.WriteLine(argError);
+            return 2;
+        }
+
         using var manager = new GpuManager();
         if (manager.Gpus.Count == 0)
         {
-            Console.Error.WriteLine($"No NVIDIA GPU available (NVML: {manager.NvmlStatus}).");
+            Console.Error.WriteLine($"No supported GPU available (NVML: {manager.NvmlStatus}, IGCL: {manager.IgclStatus}).");
             return 1;
         }
 
-        uint gpuIndex = CliGpu.ParseIndex(args) ?? manager.Gpus[0].Index;
+        if (!CliGpu.TryIndexOrFirst(args, manager.Gpus[0].Index, out uint gpuIndex, out string? gpuArgError))
+        {
+            Console.Error.WriteLine(gpuArgError);
+            return 2;
+        }
+
         var gpu = manager.Gpus.FirstOrDefault(g => g.Index == gpuIndex);
         if (gpu is null)
         {
-            Console.Error.WriteLine($"GPU {gpuIndex} not found — {manager.Gpus.Count} NVIDIA GPU(s) detected.");
+            Console.Error.WriteLine($"GPU {gpuIndex} not found — {manager.Gpus.Count} GPU(s) detected.");
             return 2;
         }
 

@@ -226,6 +226,17 @@ public sealed unsafe class DrsApi
     public NvapiStatus ApplySettings(string exeName, GameDriverSettings settings, out string note)
     {
         note = string.Empty;
+
+        // A value outside the three legal ones used to mean "not enabled", which
+        // DELETES the stored setting — and the verification below re-derived its
+        // expected value from the same test, so it compared against "default",
+        // exactly what the delete produced, and could never fail. `--vsync yes`
+        // therefore removed the user's vsync override and reported "(verified)".
+        if (settings.Vsync is not ("default" or "on" or "off"))
+        {
+            note = $"'{settings.Vsync}' is not a vsync mode (expected default, on or off) — nothing was written";
+            return NvapiStatus.InvalidArgument;
+        }
         var status = WithSession((session) =>
         {
             var rc = FindOrCreateProfile(session, exeName, out nint profile, out bool created);
@@ -275,8 +286,11 @@ public sealed unsafe class DrsApi
             return readBack;
         }
 
+        // Compare against the REQUESTED value. Re-deriving the expected value
+        // from the same predicate that decided whether to write made the check
+        // self-confirming for every input the predicate rejected.
         bool ok = actual.FrameCapFps == (settings.FrameCapFps > 0 ? settings.FrameCapFps : 0) &&
-                  actual.Vsync == (settings.Vsync is "on" or "off" ? settings.Vsync : "default") &&
+                  actual.Vsync == settings.Vsync &&
                   actual.LowLatency == settings.LowLatency;
         note = ok ? "verified" : $"readback mismatch (got cap={actual.FrameCapFps}, vsync={actual.Vsync}, lowlat={actual.LowLatency})";
         return ok ? NvapiStatus.Ok : NvapiStatus.Error;

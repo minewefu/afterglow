@@ -46,11 +46,20 @@ public partial class VfCurveViewModel : ObservableObject
     [ObservableProperty] private bool _probeRunning;
     [ObservableProperty] private string _probeStatusText = string.Empty;
 
-    public bool CanApply => _services.DemoMode || (_services.IsElevated && _gpu is not null);
+    // Capability term for non-NVIDIA GPUs only — the NVIDIA gate is unchanged.
+    public bool CanApply => _services.DemoMode
+        || (_services.IsElevated && _gpu is not null
+            && (_gpu.Vendor == Core.Hardware.GpuVendor.Nvidia
+                || _gpu.Tuner.Capabilities.SupportsCoreOffset
+                || _gpu.Tuner.Capabilities.SupportsLockedCoreClock));
 
     public string GateText => CanApply
         ? string.Empty
-        : "Applying an undervolt needs administrator rights.";
+        : _gpu is not null && _gpu.Vendor != Core.Hardware.GpuVendor.Nvidia
+            && !_gpu.Tuner.Capabilities.SupportsCoreOffset
+            && !_gpu.Tuner.Capabilities.SupportsLockedCoreClock
+            ? "Undervolting isn't implemented for this GPU yet — the offset and clock-lock knobs it needs are unavailable in this beta."
+            : "Applying an undervolt needs administrator rights.";
 
     public string MethodNote { get; } =
         "Two curves, two truths: the gold dashed line is the driver's stored V/F table (editable per point " +
@@ -209,13 +218,20 @@ public partial class VfCurveViewModel : ObservableObject
     /// </summary>
     public void RebindGpu()
     {
+        var previousGpu = _gpu;
         _gpu = _services.SelectedGpu;
         _plan = null;
         HasPlan = false;
         PlanText = string.Empty;
         TargetVoltage = 0;
         TargetClock = 0;
-        VfpStatusText = string.Empty;
+
+        // The V/F-point apply result is this card's, like every other verdict on
+        // every other page. It was the one string here that survived a switch.
+        if (previousGpu is not null && previousGpu.Index != _gpu?.Index)
+        {
+            VfpStatusText = string.Empty;
+        }
         OnPropertyChanged(nameof(CanApply));
         OnPropertyChanged(nameof(GateText));
         OnPropertyChanged(nameof(SupportsVfPoints));
@@ -262,9 +278,22 @@ public partial class VfCurveViewModel : ObservableObject
         var recorder = Recorder;
         Curve = recorder.GetCurve();
         PeakSamples = recorder.PeakBinSamples();
-        SampleText = Curve.Count == 0
-            ? "Collecting… run a game or the burn test to draw the curve."
-            : $"{Curve.Count} voltage points from {recorder.TotalSamples:N0} samples under load";
+        SampleText = Curve.Count switch
+        {
+            // "Collecting…" is advice to wait, and on a GPU whose driver reports
+            // no core voltage the wait is endless: a V/F curve is voltage against
+            // clock, so there is nothing to collect. The verified Arc B390 sat on
+            // that message indefinitely. The recorder counts the reads that
+            // arrived without a voltage, so this is measured, not assumed.
+            0 when recorder.VoltageSensorLooksAbsent =>
+                (_gpu?.CoreVoltageUnavailableReason is { } noSource
+                    ? $"Afterglow cannot read this GPU's core voltage ({noSource})"
+                    : "This GPU's driver has reported no core voltage in any sample so far")
+                + ", so a V/F curve cannot be measured here. Clock, power and utilisation are still live on the Dashboard.",
+            0 => "Collecting… run a game or the burn test to draw the curve.",
+            _ => $"{Curve.Count} voltage points from {recorder.TotalSamples:N0} samples under load",
+        };
+
     }
 
     /// <summary>Called by the chart when the user picks a target point.</summary>
@@ -320,6 +349,38 @@ public partial class VfCurveViewModel : ObservableObject
         LastApplyFailed = !result.AllSucceeded;
     }
 
+    /// <summary>Asks a running probe to stop, without waiting.</summary>
+    public void RequestProbeStop() => _probe?.Cancel();
+
+    /// <summary>
+    /// Cancels a running probe and waits for its worker to put the clock state
+    /// back. Called from application shutdown: the probe pins the core clock at
+    /// an exact frequency and only its own finally block undoes that, so the
+    /// process must not exit out from under it.
+    /// </summary>
+    /// <returns>
+    /// True when the probe's worker finished — its restore outcome is then on
+    /// file in the applied-state store. False when it was still unwinding at
+    /// the timeout: the card may be leaving pinned with nothing recorded.
+    /// </returns>
+    public bool CancelProbeAndWait(TimeSpan timeout)
+    {
+        if (_probe is not { } probe)
+        {
+            return true;
+        }
+
+        // The join is the only signal this ViewModel has to give. The pin's
+        // record is the tuner's: written before the pin lands, resolved on a
+        // verified release, kept through the clean-shutdown mark — so a worker
+        // still unwinding at the timeout leaves the truthful record behind. An
+        // in-memory copy of "which cards are still pinned" fell out of step
+        // with the store the moment the user pressed Reset, and re-recorded a
+        // pin the tuner had just released.
+        return probe.CancelAndWait(timeout);
+    }
+
+
     /// <summary>
     /// Maps the whole curve in about a minute: locks the clock at each step under
     /// load and records the voltage the driver selects. Restores the previous
@@ -349,9 +410,43 @@ public partial class VfCurveViewModel : ObservableObject
         }
 
         var recorder = _services.VfCurveFor(gpu.Index);
+
+        // Don't lock this GPU's clock through a full sweep to measure something
+        // the driver cannot report. The probe pins the core clock at each step —
+        // a real intervention on the user's hardware — and on a card with no
+        // core-voltage sensor every step would record nothing. Refusing is not an
+        // assumption: the recorder has been fed live samples since launch and
+        // counts the ones that arrived without a voltage.
+        // Name the real cause: on NVIDIA without an NVAPI pairing the driver
+        // does report voltage — Afterglow has no way to read it — and blaming
+        // the driver steered users away from the actual fix.
+        if (gpu.CoreVoltageUnavailableReason is { } noSource)
+        {
+            ProbeStatusText =
+                $"Afterglow cannot read this GPU's core voltage: {noSource}. A V/F probe would lock the "
+                + "clock through a full sweep and measure nothing. Not started.";
+            return;
+        }
+
+        if (recorder.VoltageSensorLooksAbsent)
+        {
+            ProbeStatusText =
+                "This GPU's driver has reported no core voltage in any sample so far, so a V/F probe would "
+                + "lock the clock through a full sweep and measure nothing. Not started.";
+            return;
+        }
+
         _probeGpu = gpu;
-        _probe = new VfCurveProbe(gpu.Tuner, () => gpu.Poller.Poll()) { TargetPciBusId = gpu.PciBusId };
+
+        _probe = new VfCurveProbe(gpu.Tuner, () => gpu.Poller.Poll())
+        {
+            TargetPciBusId = gpu.PciBusId,
+            TargetVendorId = gpu.PciVendorId,
+        };
         _probe.ProgressChanged += progress =>
+        {
+            // The pin's record is written by the tuner the moment the pin lands
+            // (Core); nothing here has to survive a closing dispatcher.
             Application.Current?.Dispatcher.BeginInvoke(() =>
             {
                 // Name the probed card whenever it is no longer the one on
@@ -361,17 +456,49 @@ public partial class VfCurveViewModel : ObservableObject
                     : $" [GPU {gpu.Index} — {gpu.Name}]";
 
                 ProbeRunning = progress.Running;
+
+                // A failed clock-lock restore means the GPU may still be pinned
+                // at an exact frequency — full clock and voltage at idle, until
+                // an explicit unlock or a reboot. It is deliberately independent
+                // of the coverage outcome, so a fully measured sweep can carry
+                // it; appending it to every terminal message stops "previous
+                // clock state restored" being printed over a GPU that is not.
+                string restoreWarning = !progress.Running && progress.RestoreFailed
+                    ? $"  ⚠ {progress.Phase}"
+                    : string.Empty;
+
+                // A hardware fault the load detected — during the sweep, or while
+                // winding down after the clock restore — is about the GPU under
+                // load, not about shutdown: a real finding that survives a fully
+                // measured sweep.
+                if (!progress.Running && progress.LoadFailure is { } loadFault)
+                {
+                    restoreWarning += $"  ⚠ {loadFault}";
+                }
+
                 ProbeStatusText = progress.Running
                     ? progress.MeasuredVoltageMv is double mv
                         ? $"Step {progress.StepIndex}/{progress.StepCount}: {progress.TargetClockMHz} MHz measured at {mv:F0} mV{card}"
                         : $"Step {progress.StepIndex + 1}/{progress.StepCount}: locking {progress.TargetClockMHz} MHz…{card}"
-                    : progress.Phase switch
+                    // Gate on the outcome, not on the phase string. Matching
+                    // "complete" meant every early exit — a refused clock lock
+                    // above all — fell through to the completed wording and was
+                    // presented as a full measured V/F map.
+                    : progress.Outcome switch
                     {
-                        "complete" => card.Length == 0
+                        VfProbeOutcome.Completed => (card.Length == 0
                             ? "Probe complete — the curve below is your GPU's measured V/F map."
-                            : $"Probe complete on GPU {gpu.Index} — {gpu.Name}; the readings went to that card's curve. The curve below is the selected card's.",
-                        "cancelled" => $"Probe cancelled; previous clock state restored.{card}",
-                        _ => $"Probe stopped: {progress.Phase}{card}",
+                            : $"Probe complete on GPU {gpu.Index} — {gpu.Name}; the readings went to that card's curve. The curve below is the selected card's.")
+                            + restoreWarning,
+                        VfProbeOutcome.Cancelled =>
+                            $"Probe cancelled after {progress.StepIndex} of {progress.StepCount} steps; " +
+                            (progress.RestoreFailed
+                                ? "the previous clock state could NOT be restored."
+                                : "previous clock state restored.") +
+                            $" The curve holds only the steps measured so far.{card}{restoreWarning}",
+                        _ =>
+                            $"Probe stopped after {progress.StepIndex} of {progress.StepCount} steps — {progress.Phase}. " +
+                            $"The curve is incomplete and is not a full V/F map.{card}{restoreWarning}",
                     };
                 if (!progress.Running)
                 {
@@ -379,6 +506,21 @@ public partial class VfCurveViewModel : ObservableObject
                     RefreshCurve();
                 }
             });
+        };
+
+        // An unresolved pin on another card stays on record in the store; only
+        // a clean probe of THAT card, or a Reset, resolves it.
+        var unresolved = AppliedStateStore.LoadAll()
+            .Where(s => s.ProbeLockPending && s.GpuUuid is not null && s.GpuUuid != gpu.StableKey)
+            .Select(s => s.GpuUuid!)
+            .ToList();
+        if (unresolved.Count > 0)
+        {
+            Core.Diagnostics.Log.Warn(
+                $"Starting a probe on GPU {gpu.Index} while an earlier probe's clock lock is still unresolved " +
+                $"({string.Join(", ", unresolved)}); " +
+                "the unresolved locks stay on record until a probe on that card releases cleanly.");
+        }
 
         ProbeRunning = true;
         ProbeStatusText = "Starting probe…";
@@ -389,7 +531,12 @@ public partial class VfCurveViewModel : ObservableObject
     private void ResetCurve()
     {
         Recorder.Clear();
-        Recorder.Save();
+        if (!Recorder.Save())
+        {
+            SampleText = "Curve cleared in memory, but the curve file on disk belongs to another GPU (or could " +
+                         "not be written), so it was left as it was.";
+        }
+
         _plan = null;
         HasPlan = false;
         PlanText = string.Empty;

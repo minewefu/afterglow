@@ -30,6 +30,7 @@ public partial class OverlayWindow : Window
 
     private readonly AppServices _services;
     private readonly DispatcherTimer _timer;
+    private readonly Action<Core.Hardware.GpuContext> _onSelectedGpuChanged;
     private OverlaySettings _settings;
     private uint _deviceIndex;
 
@@ -39,7 +40,12 @@ public partial class OverlayWindow : Window
         _services = services;
         _settings = settings;
         _deviceIndex = services.SelectedGpu?.Index ?? 0;
-        services.SelectedGpuChanged += gpu => _deviceIndex = gpu.Index;
+        // Held in a field so OnClosed can unhook it: AppServices outlives every
+        // overlay window, so an anonymous handler left subscribed roots this
+        // window and its whole visual tree for the process lifetime — once per
+        // overlay toggle.
+        _onSelectedGpuChanged = gpu => _deviceIndex = gpu.Index;
+        services.SelectedGpuChanged += _onSelectedGpuChanged;
 
         Opacity = settings.Opacity;
         SourceInitialized += (_, _) => MakeClickThrough();
@@ -99,9 +105,11 @@ public partial class OverlayWindow : Window
             ? Visibility.Visible
             : Visibility.Collapsed;
 
-        if (showFps)
+        // Pattern-matched rather than null-forgiven: the compiler proves the
+        // value is there instead of us asserting it across two statements.
+        if (showFps && stats is { } current)
         {
-            var (app, s) = stats!.Value;
+            var (app, s) = current;
             FpsRow.Text = $"{s.AverageFps:F0} FPS  {app.Application}";
             LowsRow.Text = $"1% {s.Low1Fps:F0}   0.1% {s.Low01Fps:F0}   {s.AverageFrametimeMs:F1} ms";
             if (_settings.ShowFrametimeGraph)
@@ -171,6 +179,10 @@ public partial class OverlayWindow : Window
     protected override void OnClosed(EventArgs e)
     {
         _timer.Stop();
+
+        // AppServices lives for the whole process, so a handler left subscribed
+        // roots this window and its entire visual tree — once per overlay toggle.
+        _services.SelectedGpuChanged -= _onSelectedGpuChanged;
         base.OnClosed(e);
     }
 }

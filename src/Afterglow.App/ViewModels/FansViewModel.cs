@@ -61,11 +61,17 @@ public partial class FansViewModel : ObservableObject
 
     partial void OnZeroRpmBelowChanged(double value) => PersistFanSettings();
 
-    public bool CanControl => _services.DemoMode || (_services.IsElevated && _gpu is not null);
+    // Capability term for non-NVIDIA GPUs only — the NVIDIA gate is unchanged.
+    public bool CanControl => _services.DemoMode
+        || (_services.IsElevated && _gpu is not null
+            && (_gpu.Vendor == Core.Hardware.GpuVendor.Nvidia || _gpu.Tuner.Capabilities.SupportsFanControl));
 
     public string GateText => CanControl
         ? string.Empty
-        : "Fan control needs administrator rights.";
+        : _gpu is not null && _gpu.Vendor != Core.Hardware.GpuVendor.Nvidia
+            && !_gpu.Tuner.Capabilities.SupportsFanControl
+            ? "This GPU's fans are firmware-controlled on this device — the driver exposes no fan interface."
+            : "Fan control needs administrator rights.";
 
     public bool HasMemJunction { get; private set; }
 
@@ -111,7 +117,14 @@ public partial class FansViewModel : ObservableObject
     /// </summary>
     public void RebindGpu()
     {
+        // "Curve active — Afterglow is driving the fans" is a statement about the
+        // card it was applied to; the settings below are reloaded for the new one.
+        var previousGpu = _gpu;
         BindGpu(_services.SelectedGpu);
+        if (previousGpu is not null && previousGpu.Index != _gpu?.Index)
+        {
+            StatusText = string.Empty;
+        }
         OnPropertyChanged(nameof(HasMemJunction));
         OnPropertyChanged(nameof(FanIds));
         OnPropertyChanged(nameof(CanControl));
@@ -342,8 +355,20 @@ public partial class FansViewModel : ObservableObject
         uint duty = Core.Tuning.TuningMath.NormalizeFixedFanDuty(
             (uint)FixedDuty, _gpu.Tuner.Capabilities.FanMinDutyPct);
         var rc = _gpu.Tuner.SetFanRaw(coolerId, duty);
-        StatusText = rc == Core.Interop.Nvml.NvmlReturn.Success
-            ? $"Fan {coolerId} set to {duty}% (others untouched)."
-            : $"Per-fan command failed: {rc}";
+        if (rc != Core.Interop.Nvml.NvmlReturn.Success)
+        {
+            StatusText = $"Per-fan command failed: {rc}";
+            return;
+        }
+
+        // This is a real, driver-persistent manual takeover (NVAPI control mode
+        // 1) that used to bypass FanControlService entirely: nothing recorded
+        // applied state, so shutdown stamped the session clean and — if the
+        // service had never been engaged this session — its Dispose released
+        // nothing, leaving this cooler pinned (possibly stopped) at the driver
+        // level after the process exited. Arming the service makes the release
+        // path, the unclean-shutdown banner, and "Firmware (auto)" all cover it.
+        _fanControl?.NoteExternalManualControl(duty);
+        StatusText = $"Fan {coolerId} set to {duty}% (others untouched).";
     }
 }

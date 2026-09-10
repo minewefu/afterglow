@@ -31,6 +31,24 @@ public sealed record CrashEvidence
     public int CoreOffsetMHz { get; init; }
 
     public int MemOffsetMHz { get; init; }
+
+    /// <summary>
+    /// How long after the session ended the hard-reset evidence was logged, when
+    /// any was found. Those records are written by the NEXT boot, so a machine
+    /// left off overnight legitimately shows hours here — but the further out it
+    /// sits, the weaker the tie to this session. Null when no reset evidence was
+    /// found at all.
+    /// </summary>
+    public TimeSpan? ResetLoggedAfter { get; init; }
+
+    /// <summary>
+    /// True when the reset evidence is close enough to the session end to
+    /// support a verdict about WHAT the GPU was doing at the time. Beyond this
+    /// the records may belong to something unrelated that happened later, so the
+    /// verdict must not assert an instant reset "while under sustained load".
+    /// </summary>
+    public bool ResetIsPromptlyCorrelated =>
+        ResetLoggedAfter is not { } gap || gap <= TimeSpan.FromMinutes(30);
 }
 
 public sealed record CrashVerdict(string Headline, string Interpretation, string Recommendation);
@@ -55,6 +73,33 @@ public static class CrashClassifier
 
         string offsets = DescribeOffsets(e);
 
+        // Staleness is judged BEFORE any verdict that reads the boot-stamped
+        // evidence as a statement about this session. Both the bugcheck branch
+        // and the hard-reset branches below draw conclusions — and name the
+        // applied offsets — from records written at the next boot, which the
+        // widened event-log search can now find up to a day later. Placing the
+        // hedge lower down covered the hard-reset path and left the bluescreen
+        // path asserting that last session's overclock is suspect for a
+        // bluescreen from the following evening. The fault-stamped signatures
+        // (TDR, WHEA) are timestamped at the fault and stay above this.
+        if (!e.ResetIsPromptlyCorrelated && !e.TdrLogged && !e.WheaErrorsLogged)
+        {
+            string gap = e.ResetLoggedAfter is { } after ? FormatMinutes(after.TotalSeconds) : "some time";
+            string what = e.BugcheckCode is int stale and > 0
+                ? $"Windows bluescreened (bugcheck 0x{stale.ToString("X", CultureInfo.InvariantCulture)})"
+                : "an unexpected shutdown was recorded";
+
+            return new CrashVerdict(
+                $"{char.ToUpperInvariant(what[0])}{what[1..]} {gap} after this session ended.",
+                "Afterglow's recording stopped without a clean shutdown, and Windows logged this at the next " +
+                $"boot — but {gap} later, so it cannot be tied to what the GPU was doing when this session " +
+                "ended. It may be this crash, or something unrelated since.",
+                e.CoreOffsetMHz != 0 || e.MemOffsetMHz != 0
+                    ? "Re-run the stability tests at these settings to establish whether they are actually " +
+                      "implicated; do not treat this as proof either way."
+                    : "No tuning was applied in that session, so Afterglow's settings are not implicated.");
+        }
+
         if (e.TdrLogged)
         {
             return new CrashVerdict(
@@ -63,6 +108,25 @@ public static class CrashClassifier
                 "usually means the core clock or voltage margin ran out.",
                 "Back off the core offset (or lock a lower clock) and re-validate with the burn test. " +
                 "If it happened at stock, suspect the driver version or the card.");
+        }
+
+        // WHEA sits ABOVE the bugcheck branch, alongside TDR. Both are
+        // fault-stamped, which is why the staleness gate exempts them — but an
+        // exemption is only sound if the exempted branch is actually reached
+        // first. With WHEA below the bugcheck, any WHEA record near the session
+        // end (the query filters by provider only, so a routine corrected-PCIe
+        // event qualifies) let control fall through to the unhedged bugcheck
+        // verdict, naming the session's offsets for a bluescreen logged up to a
+        // day later — the exact attribution the hedge exists to prevent.
+        if (e.WheaErrorsLogged)
+        {
+            return new CrashVerdict(
+                "A hardware error was logged (WHEA) around the crash.",
+                $"Windows recorded a machine-level hardware error. {offsets}WHEA sources are named in the " +
+                "event details — PCIe/bus errors can be GPU-related; CPU cache or memory-controller errors " +
+                "point at the platform (CPU/RAM/board) instead.",
+                "Open Event Viewer → System → WHEA-Logger and note the error source. If it names PCI Express, " +
+                "reduce the GPU offsets and reseat the power connector; otherwise look at platform stability.");
         }
 
         if (e.BugcheckCode is int code and > 0)
@@ -76,17 +140,6 @@ public static class CrashClassifier
                 "cause is confirmed.");
         }
 
-        if (e.WheaErrorsLogged)
-        {
-            return new CrashVerdict(
-                "A hardware error was logged (WHEA) around the crash.",
-                $"Windows recorded a machine-level hardware error. {offsets}WHEA sources are named in the " +
-                "event details — PCIe/bus errors can be GPU-related; CPU cache or memory-controller errors " +
-                "point at the platform (CPU/RAM/board) instead.",
-                "Open Event Viewer → System → WHEA-Logger and note the error source. If it names PCI Express, " +
-                "reduce the GPU offsets and reseat the power connector; otherwise look at platform stability.");
-        }
-
         // From here on: the instant power-cut signature — reset/power-loss with
         // no bluescreen, no WHEA, no driver recovery. The timing relative to
         // load is what separates the failure modes.
@@ -95,6 +148,9 @@ public static class CrashClassifier
               "errors in the final seconds — a GPU-side failure cascade preceded the reset."
             : string.Empty;
 
+        // Staleness was already handled above, before the bugcheck branch, so
+        // everything from here on is evidence promptly correlated to this
+        // session and may be spoken about in those terms.
         if (e.HeavyLoadAtDeath)
         {
             string cause = e.CoreOffsetMHz > 0
@@ -167,6 +223,15 @@ public static class CrashClassifier
 
     private static string FormatMinutes(double seconds)
     {
+        // The staleness branch reports gaps of up to 24 h through this helper,
+        // which was written for the ≤600 s post-load case — so an overnight
+        // reset rendered as "1200 min 0 s" in the startup banner while the
+        // report body printed the same quantity in hours.
+        if (seconds >= 3600)
+        {
+            return string.Create(CultureInfo.InvariantCulture, $"{seconds / 3600.0:F1} h");
+        }
+
         int m = (int)(seconds / 60);
         int s = (int)(seconds % 60);
         return m > 0

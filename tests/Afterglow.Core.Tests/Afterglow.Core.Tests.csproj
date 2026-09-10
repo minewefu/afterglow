@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Afterglow.Core\Afterglow.Core.csproj" />
+    <ProjectReference Include="..\..\src\Afterglow.Cli\Afterglow.Cli.csproj" />
   </ItemGroup>
 
 </Project>

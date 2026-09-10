@@ -16,6 +16,12 @@ internal static class TuneCommands
 
     public static int Caps(string[] args)
     {
+        if (CliArgs.Validate(args, "caps") is string argError)
+        {
+            Console.Error.WriteLine(argError);
+            return 2;
+        }
+
         using var manager = new GpuManager();
         if (SelectGpu(manager, args) is not { } gpu)
         {
@@ -30,14 +36,19 @@ internal static class TuneCommands
             {
                 gpu = gpu.Name,
                 index = gpu.Index,
-                driver = manager.DriverVersion,
+                driver = gpu.DriverVersion,
                 architecture = gpu.Architecture,
                 capabilities = c,
             }, JsonOut));
             return 0;
         }
 
-        Console.WriteLine($"{gpu.Name} (GPU {gpu.Index}) — driver-reported tuning capabilities:");
+        // On Intel a flag means "Afterglow drives this knob on this device,
+        // verified by readback" — a mix of driver answers and not-implemented-
+        // yet policy, so don't label it as purely the driver speaking.
+        Console.WriteLine(gpu.Vendor == GpuVendor.Intel
+            ? $"{gpu.Name} (GPU {gpu.Index}) — knobs Afterglow can drive on this device (others read \"not supported\"):"
+            : $"{gpu.Name} (GPU {gpu.Index}) — driver-reported tuning capabilities:");
         Console.WriteLine($"  Core offset     {(c.SupportsCoreOffset ? $"{c.CoreOffsetMinMHz}..{c.CoreOffsetMaxMHz} MHz" : "not supported")}");
         Console.WriteLine($"  Memory offset   {(c.SupportsMemOffset ? $"{c.MemOffsetMinMHz}..{c.MemOffsetMaxMHz} MHz" : "not supported")}");
         Console.WriteLine($"  Power limit     {(c.SupportsPowerLimit ? $"{c.PowerLimitMinW:F0}..{c.PowerLimitMaxW:F0} W (default {c.PowerLimitDefaultW:F0})" : "not supported")}");
@@ -50,6 +61,12 @@ internal static class TuneCommands
 
     public static int Get(string[] args)
     {
+        if (CliArgs.Validate(args, "get") is string argError)
+        {
+            Console.Error.WriteLine(argError);
+            return 2;
+        }
+
         using var manager = new GpuManager();
         if (SelectGpu(manager, args) is not { } gpu)
         {
@@ -57,14 +74,22 @@ internal static class TuneCommands
         }
 
         var (core, mem, power, boost, lockMHz) = gpu.Tuner.ReadCurrent();
+        var caps = gpu.Tuner.Capabilities;
+
+        // A knob this device does not expose has no "current value": printing 0
+        // there is the same fabrication the power-limit slot was made nullable
+        // to avoid, and it directly contradicts what `caps` says one line over.
+        // NVIDIA supports both offsets, so its output is unchanged.
+        int? coreOffset = caps.SupportsCoreOffset ? core : null;
+        int? memOffset = caps.SupportsMemOffset ? mem : null;
 
         if (args.Contains("--json"))
         {
             Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(new
             {
                 gpu = gpu.Name,
-                core_offset_mhz = core,
-                mem_offset_mhz = mem,
+                core_offset_mhz = coreOffset,
+                mem_offset_mhz = memOffset,
                 power_limit_w = power,
                 voltage_boost_pct = boost,
                 lock_clock_mhz = lockMHz,
@@ -73,16 +98,20 @@ internal static class TuneCommands
         }
 
         Console.WriteLine($"{gpu.Name} (GPU {gpu.Index}) — current applied state:");
-        Console.WriteLine($"  Core offset     {core} MHz");
-        Console.WriteLine($"  Memory offset   {mem} MHz");
-        Console.WriteLine($"  Power limit     {power:F0} W");
+        Console.WriteLine($"  Core offset     {(coreOffset is int co ? $"{co} MHz" : "not supported")}");
+        Console.WriteLine($"  Memory offset   {(memOffset is int mo ? $"{mo} MHz" : "not supported")}");
+        Console.WriteLine($"  Power limit     {(power is double p ? $"{p:F0} W" : "not supported")}");
         if (boost is uint b)
         {
             Console.WriteLine($"  Voltage boost   {b}%");
         }
 
+        // NVIDIA's lock has no driver getter (the value is Afterglow-tracked);
+        // Intel's frequency clamp reads straight back from the driver.
         Console.WriteLine(lockMHz is uint lc
-            ? $"  Clock lock      210..{lc} MHz (Afterglow-tracked; the driver has no getter)"
+            ? gpu.Vendor == GpuVendor.Intel
+                ? $"  Clock lock      clamped to {lc} MHz (read back from the driver)"
+                : $"  Clock lock      210..{lc} MHz (Afterglow-tracked; the driver has no getter)"
             : "  Clock lock      none");
 
         return 0;
@@ -95,6 +124,15 @@ internal static class TuneCommands
         uint? lockClock = null, voltageBoost = null, tempLimit = null;
         bool unlock = false;
         string? fan = null;
+
+        // Declared in CliArgs.Options like every other command, so the option
+        // surface is covered by the contract test and a missing value is
+        // reported by the shared checker rather than a hand-typed copy of it.
+        if (CliArgs.Validate(args, "set") is string argError)
+        {
+            Console.Error.WriteLine(argError);
+            return 2;
+        }
 
         for (int i = 1; i < args.Length; i++)
         {
@@ -135,7 +173,7 @@ internal static class TuneCommands
                     i++;
                     break;
                 case "--gpu":
-                    i++;
+                    i++; // value checked by CliArgs.Validate / CliGpu.TryParseIndex
                     break;
                 default:
                     Console.Error.WriteLine($"Unknown or malformed option '{arg}'.");
@@ -163,25 +201,26 @@ internal static class TuneCommands
             MemOffsetMHz = memOffset ?? current.MemOffsetMHz,
             PowerLimitW = powerLimit,
             TempLimitC = tempLimit,
-            // An unspecified --lock-clock preserves the currently tracked lock.
-            LockedCoreClockMHz = unlock ? null : (lockClock ?? current.LockedCoreClockMHz),
+            // An unspecified --lock-clock preserves the lock Afterglow APPLIED —
+            // not ReadCurrent's element, which on Arc is a driver observation:
+            // carrying a factory ceiling forward wrote it as a clamp with
+            // written provenance that no release could ever adopt again.
+            // A lock given beside --lock-clock off reaches the tuner, which
+            // refuses the pair; resolving it here silently picked one answer.
+            LockedCoreClockMHz = lockClock ?? (unlock ? null : gpu.Tuner.AppliedLockMHz),
             VoltageBoostPct = voltageBoost,
         };
 
-        var result = gpu.Tuner.Apply(profile);
+        // An explicit `--lock-clock off` is one operation with one verdict:
+        // Apply releases the lock itself — whether or not this session tracks
+        // one — and reports it as the "clock lock" knob. Releasing from here
+        // first and letting Apply retry printed two lines for one request, or
+        // a FAIL followed by a verified release and exit 1.
+        var result = gpu.Tuner.Apply(profile, releaseLock: unlock);
         bool allOk = result.AllSucceeded;
         foreach (var knob in result.Results)
         {
             Console.WriteLine($"  {(knob.Applied ? "ok  " : "FAIL")} {knob.Knob,-18} {knob.Detail}");
-        }
-
-        // Explicit `--lock-clock off` always issues the driver release, even when no
-        // lock is tracked (one can outlive a crashed session until reboot).
-        if (unlock)
-        {
-            var knob = gpu.Tuner.ForceUnlock();
-            Console.WriteLine($"  {(knob.Applied ? "ok  " : "FAIL")} {knob.Knob,-18} {knob.Detail}");
-            allOk &= knob.Applied;
         }
 
         // Fans are commanded directly (not part of profile apply).
@@ -208,7 +247,9 @@ internal static class TuneCommands
 
         if (!allOk)
         {
-            Console.Error.WriteLine("Some knobs failed. Run elevated (administrator) for write access.");
+            Console.Error.WriteLine(gpu.Vendor == GpuVendor.Intel
+                ? "Some knobs failed. On Intel, Afterglow drives only the knobs 'caps' lists as available; if the driver refused one of those, run elevated (administrator) for write access."
+                : "Some knobs failed. Run elevated (administrator) for write access.");
             return 1;
         }
 
@@ -236,18 +277,19 @@ internal static class TuneCommands
     {
         if (manager.Gpus.Count == 0)
         {
-            Console.Error.WriteLine($"No NVIDIA GPU found (NVML: {manager.NvmlStatus}).");
+            Console.Error.WriteLine($"No supported GPU found (NVML: {manager.NvmlStatus}, IGCL: {manager.IgclStatus}).");
             return null;
         }
 
-        uint index = 0;
-        for (int i = 1; i < args.Length - 1; i++)
+        // Same rule as everywhere else: an unusable --gpu is an error, not a
+        // silent write to GPU 0. This is the tuning-write path.
+        if (!CliGpu.TryParseIndex(args, out uint? parsedIndex, out string? gpuArgError))
         {
-            if (args[i] == "--gpu" && uint.TryParse(args[i + 1], out uint g))
-            {
-                index = g;
-            }
+            Console.Error.WriteLine(gpuArgError);
+            return null;
         }
+
+        uint index = parsedIndex ?? 0;
 
         var gpu = manager.Gpus.FirstOrDefault(g => g.Index == index);
         if (gpu is null)

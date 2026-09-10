@@ -16,26 +16,9 @@ public sealed class FanControlServiceTests : IDisposable
 {
     private const string Uuid = "GPU-ffff1111-2222-3333-4444-555566667777";
 
-    private readonly string _root;
+    private readonly Fakes.StoreScope _store = new();
 
-    public FanControlServiceTests()
-    {
-        _root = Path.Combine(Path.GetTempPath(), $"afterglow-test-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(_root);
-        AppPaths.OverrideRoot = _root;
-    }
-
-    public void Dispose()
-    {
-        AppPaths.OverrideRoot = null;
-        try
-        {
-            Directory.Delete(_root, recursive: true);
-        }
-        catch (IOException)
-        {
-        }
-    }
+    public void Dispose() => _store.Dispose();
 
     /// <summary>Records what the service asked the driver to do, and answers as told.</summary>
     private sealed class FakeDriver

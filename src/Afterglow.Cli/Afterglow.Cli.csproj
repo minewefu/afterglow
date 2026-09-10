@@ -13,6 +13,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The argument contract is covered by tests: an option allow-list that
+         drifts from the options a command actually reads silently disables a
+         documented flag, which has happened. -->
+    <InternalsVisibleTo Include="Afterglow.Core.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <None Include="..\..\ThirdParty\PresentMon\**"
           Link="ThirdParty\PresentMon\%(Filename)%(Extension)"
           CopyToOutputDirectory="PreserveNewest"

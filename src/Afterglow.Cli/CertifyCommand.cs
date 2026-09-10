@@ -1,4 +1,3 @@
-using System.Globalization;
 using Afterglow.Core.Hardware;
 using Afterglow.Core.Profiles;
 
@@ -16,17 +15,27 @@ internal static class CertifyCommand
     {
         string? name = null;
         int seconds = 90;
+
+        // Certification stamps a profile as stable. A run that quietly differed
+        // from the one asked for — a mistyped duration falling back to the
+        // 90-second default — would put that stamp on work the user never chose.
+        if (CliArgs.Validate(args, "certify") is string argError)
+        {
+            Console.Error.WriteLine(argError);
+            return 2;
+        }
+
+        if (CliArgs.TryInt(args, "--seconds", 30, 1800, ref seconds) is string secondsError)
+        {
+            Console.Error.WriteLine(secondsError);
+            return 2;
+        }
+
         for (int i = 1; i < args.Length - 1; i++)
         {
             if (args[i] == "--profile")
             {
                 name = args[i + 1];
-            }
-
-            if (args[i] == "--seconds" &&
-                int.TryParse(args[i + 1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int s))
-            {
-                seconds = Math.Clamp(s, 30, 1800);
             }
         }
 
@@ -49,19 +58,24 @@ internal static class CertifyCommand
         using var manager = new GpuManager();
         if (manager.Gpus.Count == 0)
         {
-            Console.Error.WriteLine($"No NVIDIA GPU available (NVML: {manager.NvmlStatus}).");
+            Console.Error.WriteLine($"No supported GPU available (NVML: {manager.NvmlStatus}, IGCL: {manager.IgclStatus}).");
             return 1;
         }
 
-        uint gpuIndex = CliGpu.ParseIndex(args) ?? manager.Gpus[0].Index;
-        var gpu = manager.Gpus.FirstOrDefault(g => g.Index == gpuIndex);
-        if (gpu is null)
+        if (!CliGpu.TryIndexOrFirst(args, manager.Gpus[0].Index, out uint gpuIndex, out string? gpuArgError))
         {
-            Console.Error.WriteLine($"GPU {gpuIndex} not found — {manager.Gpus.Count} NVIDIA GPU(s) detected.");
+            Console.Error.WriteLine(gpuArgError);
             return 2;
         }
 
-        var certifier = new ProfileCertifier(gpu.Tuner, store, gpu.PciBusId);
+        var gpu = manager.Gpus.FirstOrDefault(g => g.Index == gpuIndex);
+        if (gpu is null)
+        {
+            Console.Error.WriteLine($"GPU {gpuIndex} not found — {manager.Gpus.Count} GPU(s) detected.");
+            return 2;
+        }
+
+        var certifier = new ProfileCertifier(gpu.Tuner, store, gpu.PciBusId, gpu.PciVendorId);
         var done = new ManualResetEventSlim(false);
         int lastLogCount = 0;
         CertifierStatus? final = null;

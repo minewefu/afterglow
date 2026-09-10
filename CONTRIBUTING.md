@@ -8,9 +8,10 @@ project trustworthy:
 1. **No kernel drivers.** Ever. Features that require ring-0 access (RTX 50 hot spot,
    per-module VRAM temps) stay out until a userland path exists — we show an honest
    "unavailable" instead.
-2. **No guessed interop.** Every NVAPI interface ID or struct layout must cite a source
-   (an open-source project that ships it, or the public SDK) in
-   `docs/research/driver-apis.md`, and be probed at runtime before the UI exposes it.
+2. **No guessed interop.** Every driver interface ID or struct layout must cite a source
+   (an open-source project that ships it, or the public SDK/header) in
+   `docs/research/driver-apis.md` (NVIDIA) or `docs/research/intel-driver-apis.md`
+   (Intel), and be probed at runtime before the UI exposes it.
 3. **Every write is validated.** New tuning knobs must clamp to driver-reported ranges,
    verify by readback where possible, and report per-knob results.
 4. **Honest labels.** A metric's method belongs next to the metric (see the FPS page's

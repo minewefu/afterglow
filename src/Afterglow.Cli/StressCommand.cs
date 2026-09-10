@@ -1,4 +1,3 @@
-using System.Globalization;
 using Afterglow.Core.Stress;
 
 namespace Afterglow.Cli;
@@ -11,29 +10,62 @@ internal static class StressCommand
         int seconds = 30;
         uint intensity = 4096;
         var pattern = StressPattern.Sustained;
+
+        // Nothing here may be silently ignored. A mistyped --pattern used to
+        // fall through to the sustained burn and still report a pass, so the
+        // regime the user picked for catching marginal memory was quietly
+        // replaced by one that cannot catch it — a stability verdict for work
+        // they never asked for.
+        if (CliArgs.Validate(args, "stress") is string argError)
+        {
+            Console.Error.WriteLine(argError);
+            return 2;
+        }
+
+        if (CliArgs.TryInt(args, "--seconds", 5, 86_400, ref seconds) is string secondsError)
+        {
+            Console.Error.WriteLine(secondsError);
+            return 2;
+        }
+
+        if (CliArgs.TryUInt(args, "--intensity", 128, 16_384, ref intensity) is string intensityError)
+        {
+            Console.Error.WriteLine(intensityError);
+            return 2;
+        }
+
         for (int i = 1; i < args.Length - 1; i++)
         {
-            if (args[i] == "--seconds" &&
-                int.TryParse(args[i + 1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int s))
+            if (args[i] != "--pattern")
             {
-                seconds = Math.Clamp(s, 5, 86_400);
+                continue;
             }
 
-            if (args[i] == "--intensity" &&
-                uint.TryParse(args[i + 1], NumberStyles.Integer, CultureInfo.InvariantCulture, out uint n))
+            switch (args[i + 1].ToUpperInvariant())
             {
-                intensity = Math.Clamp(n, 128, 16_384);
+                case "SUSTAINED":
+                    pattern = StressPattern.Sustained;
+                    break;
+                case "TRANSITIONS" or "TRANSITION":
+                    pattern = StressPattern.Transitions;
+                    break;
+                case "EXCURSIONS" or "EXCURSION" or "BURSTS" or "DWELL":
+                    pattern = StressPattern.BoostExcursions;
+                    break;
+                default:
+                    Console.Error.WriteLine(
+                        $"Unknown --pattern '{args[i + 1]}' (expected sustained, transitions or excursions).");
+                    return 2;
             }
+        }
 
-            if (args[i] == "--pattern")
-            {
-                pattern = args[i + 1].ToUpperInvariant() switch
-                {
-                    "TRANSITIONS" or "TRANSITION" => StressPattern.Transitions,
-                    "EXCURSIONS" or "EXCURSION" or "BURSTS" or "DWELL" => StressPattern.BoostExcursions,
-                    _ => StressPattern.Sustained,
-                };
-            }
+        // A transitions run shorter than its first load/idle cycle counts no
+        // excursion and so can never earn a verdict; refuse it up front rather
+        // than burn and then print "inconclusive — give it more seconds".
+        if (GpuStressTest.SecondsShortfall(pattern, seconds) is string tooShort)
+        {
+            Console.Error.WriteLine($"'--seconds {seconds}': {tooShort}.");
+            return 2;
         }
 
         // Hidden diagnostic: show how each NVML GPU resolves to a D3D adapter
@@ -43,7 +75,7 @@ internal static class StressCommand
             return ProbeAdapter();
         }
 
-        var (bus, busError) = CliGpu.ResolveBus(args);
+        var (bus, vendorId, busError) = CliGpu.ResolveTarget(args);
         if (busError is not null)
         {
             Console.Error.WriteLine(busError);
@@ -55,6 +87,13 @@ internal static class StressCommand
             IterationsPerDispatch = intensity,
             Pattern = pattern,
             TargetPciBusId = bus,
+            TargetVendorId = vendorId,
+
+            // `stress` with no --gpu is explicitly an exploratory run, and the
+            // historical largest-VRAM fallback for that case is documented
+            // behaviour the release preserves. Everything that attributes a
+            // result to a named card leaves this false and gets the refusal.
+            AllowUnboundGuess = bus is null,
         };
         var done = new ManualResetEventSlim(false);
         StressProgress? final = null;
@@ -79,16 +118,19 @@ internal static class StressCommand
         Console.WriteLine(
             $"Burn test: {seconds} s at intensity {intensity}, pattern {pattern} " +
             "(bit-exact verification every ~2 s). Ctrl+C aborts.");
+        bool aborted = false;
         Console.CancelKeyPress += (_, e) =>
         {
             e.Cancel = true;
+            aborted = true;
             stress.Stop();
         };
 
         stress.Start();
+        bool stoppedCleanly = true;
         if (!done.Wait(TimeSpan.FromSeconds(seconds)))
         {
-            stress.StopAndWait(TimeSpan.FromSeconds(10));
+            stoppedCleanly = stress.StopAndWait(TimeSpan.FromSeconds(30));
             final ??= stress.Progress;
         }
 
@@ -103,7 +145,55 @@ internal static class StressCommand
             Console.WriteLine($"  {detail}");
         }
 
-        return final.State is StressState.Stopped or StressState.Running ? 0 : 1;
+        // An abandoned burn is not a pass. The figures above came from the last
+        // progress report before the worker stopped answering, and nothing was
+        // verified after it — say so and fail, rather than exiting 0 on a run
+        // that never finished.
+        if (!stoppedCleanly)
+        {
+            Console.Error.WriteLine(
+                "  The burn did not stop within 30 s — the figures above are a stale mid-run snapshot, " +
+                "not a completed run, and no stability conclusion can be drawn from them.");
+            return 1;
+        }
+
+        // A detected artifact, TDR or engine failure is a RESULT, already
+        // printed above with its real cause. Falling through to the zero-work
+        // branch appended "setup outlasted the requested window — give it more
+        // seconds" underneath a driver reset, contradicting the true diagnosis
+        // one line up and advising exactly the wrong thing.
+        if (final.State is StressState.ArtifactDetected or StressState.DeviceLost or StressState.Failed)
+        {
+            return 1;
+        }
+
+        // Neither is a run that never entered its load loop, or a cycling
+        // pattern that completed no cycle. The dispatch count above includes a
+        // one-off reference pass, so it reads 1 even then — and the closing
+        // verification would have compared the reference buffer against itself
+        // and matched by construction. This exit code is documented to
+        // automation as "0 = stable" (docs/agent-integration.md), so it must not
+        // be 0 for a run that proved nothing; the rule is the engine's own.
+        if (final.VerdictGap is { } gap)
+        {
+            Console.Error.WriteLine(
+                $"  {char.ToUpperInvariant(gap[0])}{gap[1..]} — this is not a pass. " +
+                "Give it more seconds, or a lower --intensity.");
+            return 1;
+        }
+
+        if (aborted)
+        {
+            // The burn stopped because the user stopped it, not because it
+            // survived the window. Exiting 0 told every scripted consumer
+            // "stable" for a test that never finished.
+            Console.Error.WriteLine(
+                "  Aborted before the requested window elapsed — this is not a pass. " +
+                "The counters above cover only the part that ran.");
+            return 1;
+        }
+
+        return final.IsCleanPass ? 0 : 1;
     }
 
     private static int ProbeAdapter()
@@ -111,19 +201,24 @@ internal static class StressCommand
         using var manager = new Afterglow.Core.Hardware.GpuManager();
         if (manager.Gpus.Count == 0)
         {
-            Console.WriteLine($"No NVIDIA GPU via NVML ({manager.NvmlStatus}).");
+            Console.WriteLine($"No supported GPU found (NVML: {manager.NvmlStatus}, IGCL: {manager.IgclStatus}).");
         }
 
         foreach (var gpu in manager.Gpus)
         {
+            string source = gpu.PciVendorId == StressAdapter.NvidiaVendorId ? "NVML" : "IGCL";
             Console.WriteLine(FormattableString.Invariant(
-                $"GPU {gpu.Index}: {gpu.Name}  (NVML PCI bus {(gpu.PciBusId is { } b ? b : (object)"?")}, UUID {gpu.Uuid ?? "?"})"));
-            using var bound = StressAdapter.Select(gpu.PciBusId, out string boundDesc);
+                $"GPU {gpu.Index}: {gpu.Name}  ({source} PCI bus {(gpu.PciBusId is { } b ? b : (object)"?")}, UUID {gpu.Uuid ?? "?"})"));
+            using var bound = StressAdapter.Select(gpu.PciVendorId, gpu.PciBusId, out string boundDesc);
             Console.WriteLine($"  bus-bound D3D adapter: {(bound is null ? "FAILED" : "ok")} — {boundDesc}");
         }
 
-        using var fallback = StressAdapter.Select(null, out string fallbackDesc);
-        Console.WriteLine($"no-bus fallback (largest NVIDIA): {(fallback is null ? "none" : fallbackDesc)}");
+        // Probe the same vendor an actual unbound run would resolve, so the
+        // diagnostic describes what the engine will really do.
+        uint fallbackVendor = StressAdapter.DetectDefaultVendor();
+        string fallbackLabel = fallbackVendor == StressAdapter.NvidiaVendorId ? "largest NVIDIA" : "largest Intel";
+        using var fallback = StressAdapter.Select(fallbackVendor, null, out string fallbackDesc);
+        Console.WriteLine($"no-bus fallback ({fallbackLabel}): {(fallback is null ? "none" : fallbackDesc)}");
         return 0;
     }
 }

@@ -27,7 +27,25 @@ public sealed record StepperStatus(
     TimeSpan StepElapsed,
     TimeSpan StepDuration,
     IReadOnlyList<string> Log,
-    int? ResultOffsetMHz);
+    int? ResultOffsetMHz,
+
+    /// <summary>
+    /// Null while running. When the run ended EARLY (cancelled, failed): whether
+    /// the starting offset was actually put back — false means the restore
+    /// write FAILED and the card is still at the offset under test. At a normal
+    /// finish (phase "done") the card is deliberately left at the result offset,
+    /// and this instead reports whether the closing re-write of that result was
+    /// confirmed by the driver — false means the result stands but could not
+    /// be re-confirmed as applied; MCP exposes it as result_offset_confirmed.
+    /// <para>
+    /// Callers used to infer this from "a terminal status arrived", which only
+    /// says the thread unwound. ApplyOffset gives up after three tries in about
+    /// 4.5 s, so a client waiting 90 s for a cancel would be told "the starting
+    /// offset was restored" over a card left at an untested overclock.
+    /// </para>
+    /// </summary>
+    bool? StartOffsetRestored = null);
+
 
 /// <summary>
 /// Guided core-offset stability search: step the offset up, burn each step with
@@ -37,7 +55,7 @@ public sealed record StepperStatus(
 /// </summary>
 public sealed class StabilityStepper
 {
-    private readonly GpuTuner _tuner;
+    private readonly IGpuTuner _tuner;
     private readonly object _lock = new();
     private readonly List<string> _log = [];
     private Thread? _thread;
@@ -46,13 +64,16 @@ public sealed class StabilityStepper
 
     public event Action<StepperStatus>? StatusChanged;
 
-    public StabilityStepper(GpuTuner tuner)
+    public StabilityStepper(IGpuTuner tuner)
     {
         _tuner = tuner;
     }
 
     /// <summary>Binds the burn to the tuned card on multi-GPU systems (null = largest NVIDIA).</summary>
     public uint? TargetPciBusId { get; set; }
+
+    /// <summary>PCI vendor of the card being tuned (defaults to NVIDIA).</summary>
+    public uint TargetVendorId { get; set; } = StressAdapter.NvidiaVendorId;
 
     public StepperStatus Status
     {
@@ -152,12 +173,12 @@ public sealed class StabilityStepper
         }
     }
 
-    private void Publish(bool running, string phase, int offset, int? lastGood, TimeSpan stepElapsed, TimeSpan stepDuration, int? result = null)
+    private void Publish(bool running, string phase, int offset, int? lastGood, TimeSpan stepElapsed, TimeSpan stepDuration, int? result = null, bool? restored = null)
     {
         StepperStatus status;
         lock (_lock)
         {
-            status = new StepperStatus(running, phase, offset, lastGood, stepElapsed, stepDuration, _log.ToArray(), result);
+            status = new StepperStatus(running, phase, offset, lastGood, stepElapsed, stepDuration, _log.ToArray(), result, restored);
             _status = status;
         }
 
@@ -166,6 +187,18 @@ public sealed class StabilityStepper
 
     private void Run(StepperOptions options)
     {
+        // Without a core-offset knob there is nothing to step: CoreOffsetMaxMHz
+        // is 0, every "step" stays at offset 0, and the sweep used to burn a full
+        // cycle and then report +0 MHz as a confirmed stable offset — a verdict
+        // about a control the device does not have.
+        if (!_tuner.Capabilities.SupportsCoreOffset)
+        {
+            Log("This GPU exposes no core-clock offset, so there is no offset to step. " +
+                "Nothing was applied and no stability verdict was produced.");
+            Publish(false, "failed", 0, null, TimeSpan.Zero, TimeSpan.Zero, restored: true); // nothing was written
+            return;
+        }
+
         int step = Math.Max(5, options.StepMHz);
         int maxOffset = Math.Min(options.MaxOffsetMHz, _tuner.Capabilities.CoreOffsetMaxMHz);
         int startOffset = _tuner.ReadCurrent().CoreOffsetMHz;
@@ -179,8 +212,27 @@ public sealed class StabilityStepper
         {
             if (!ApplyOffset(current))
             {
+                if (lastGood is null && current == startOffset)
+                {
+                    // The very first write, of the offset the card already
+                    // holds, was refused: nothing changed, so there is nothing
+                    // to restore — re-issuing the same write "as a restore"
+                    // failed the same way and told the user the GPU "may still
+                    // be at" an offset that was never written.
+                    Log($"Could not apply the starting offset (+{current} MHz) — stopping; nothing was changed. " +
+                        "(Administrator rights required.)");
+                    Publish(false, "failed", startOffset, null, TimeSpan.Zero, TimeSpan.Zero, restored: true);
+                    return;
+                }
+
                 Log($"Could not apply +{current} MHz — stopping. (Administrator rights required.)");
-                Publish(false, "failed", current, lastGood, TimeSpan.Zero, TimeSpan.Zero);
+                // The refused offset never landed: the card holds the last one
+                // that did (the previous step, or the start), and that is where
+                // it "may still be" if the restore fails too.
+                int cardMayBeAt = lastGood ?? startOffset;
+                bool backAtStart = RestoreStart(startOffset, cardMayBeAt);
+                Publish(false, "failed", backAtStart ? startOffset : cardMayBeAt, lastGood,
+                    TimeSpan.Zero, TimeSpan.Zero, restored: backAtStart);
                 return;
             }
 
@@ -216,16 +268,25 @@ public sealed class StabilityStepper
                 if (backoff <= startOffset)
                 {
                     Log("No stable headroom found above the starting offset.");
-                    _ = ApplyOffset(startOffset);
-                    Publish(false, "done", startOffset, lastGood, TimeSpan.Zero, TimeSpan.Zero, startOffset);
+                    PublishEndOfSweep(current, lastGood, startOffset);
                     return;
                 }
 
+                int failedAt = current;
                 current = backoff;
                 Log($"Backing off to {Fmt(current)} for a {options.ConfirmSeconds} s confirmation burn…");
                 if (!ApplyOffset(current))
                 {
-                    Publish(false, "failed", current, lastGood, TimeSpan.Zero, TimeSpan.Zero);
+                    // Retract the line above: the backoff did NOT happen. The
+                    // card is still at the offset that just failed — and right
+                    // after a driver reset (see ApplyOffset) that refusal is the
+                    // expected outcome, not a rare one. Saying nothing left the
+                    // "Backing off to +N MHz" line standing as the last word in
+                    // a log both the app and MCP agents read.
+                    Log($"Could not apply the backoff {Fmt(current)} — this GPU is still at {Fmt(failedAt)}.");
+                    bool backAtStart = RestoreStart(startOffset, failedAt);
+                    Publish(false, "failed", backAtStart ? startOffset : failedAt, lastGood,
+                        TimeSpan.Zero, TimeSpan.Zero, restored: backAtStart);
                     return;
                 }
 
@@ -243,8 +304,7 @@ public sealed class StabilityStepper
                 else
                 {
                     Log($"{Fmt(current)} still failed — falling back to the starting offset.");
-                    _ = ApplyOffset(startOffset);
-                    Publish(false, "done", startOffset, lastGood, TimeSpan.Zero, TimeSpan.Zero, startOffset);
+                    PublishEndOfSweep(current, lastGood, startOffset);
                 }
 
                 return;
@@ -252,24 +312,98 @@ public sealed class StabilityStepper
             else
             {
                 Log($"Stress test could not run ({verdict}). Stopping.");
-                _ = ApplyOffset(startOffset);
-                Publish(false, "failed", startOffset, lastGood, TimeSpan.Zero, TimeSpan.Zero);
+                bool restoredAfterFailure = RestoreStart(startOffset, current);
+                Publish(false, "failed", restoredAfterFailure ? startOffset : current, lastGood,
+                    TimeSpan.Zero, TimeSpan.Zero, restored: restoredAfterFailure);
                 return;
             }
         }
 
         Log("Cancelled — restoring the starting offset.");
-        _ = ApplyOffset(startOffset);
-        Publish(false, "cancelled", startOffset, lastGood, TimeSpan.Zero, TimeSpan.Zero);
+
+        // The offset published is where the card actually is, not where we asked
+        // it to be: reporting startOffset after a failed restore is a fabricated
+        // reading of the very state the caller needs to act on.
+        bool restored = RestoreStart(startOffset, current);
+        Publish(false, "cancelled", restored ? startOffset : current, lastGood,
+            TimeSpan.Zero, TimeSpan.Zero, restored: restored);
+
+    }
+
+    /// <summary>
+    /// Ends a sweep that ran out of headroom, restoring the starting offset and
+    /// reporting only what is true afterwards.
+    /// <para>
+    /// Two rules live here so neither can be applied to one path and forgotten
+    /// on its twin. First, the starting offset is a RESULT only if a burn
+    /// actually passed at it — otherwise nothing was ever verified. Second, a
+    /// run whose restore FAILED is not "done": the card is still at the offset
+    /// that just miscalculated or reset the driver, so reporting a completed
+    /// sweep with a stable offset would hand an agent a clean finish over
+    /// exactly the state it was searching to avoid.
+    /// </para>
+    /// </summary>
+    /// <param name="failedAt">The offset the sweep failed at — where the card is
+    /// left if the restore does not land.</param>
+    private void PublishEndOfSweep(int failedAt, int? lastGood, int startOffset)
+    {
+        bool restored = RestoreStart(startOffset, failedAt);
+        bool completed = lastGood is not null && restored;
+
+        Publish(
+            false,
+            completed ? "done" : "failed",
+            restored ? startOffset : failedAt,
+            lastGood,
+            TimeSpan.Zero,
+            TimeSpan.Zero,
+            completed ? startOffset : null,
+            restored: restored);
+    }
+
+    /// <summary>
+    /// Puts the starting offset back, and says so out loud when it could not be.
+    /// <para>
+    /// Every terminal path goes through this. The restore was open-coded at five
+    /// sites, and two successive reviews each found a DIFFERENT subset of them
+    /// discarding the result, skipping the log line, or omitting the restore
+    /// entirely — the paths that follow a detected hardware fault, which are
+    /// exactly the ones where the driver is most likely to refuse the write.
+    /// </para>
+    /// </summary>
+    /// <param name="cardMayBeAt">Where the card is left if the restore fails.</param>
+    private bool RestoreStart(int startOffset, int cardMayBeAt)
+    {
+        if (ApplyOffset(startOffset))
+        {
+            return true;
+        }
+
+        Log($"The starting offset ({Fmt(startOffset)}) could NOT be restored — this GPU may still be at " +
+            $"{Fmt(cardMayBeAt)}, the offset that just failed. Reset it from the Tuning page or with " +
+            "`afterglow-cli reset`.");
+        return false;
     }
 
     private void Finish(int? stable, StepperOptions options)
     {
         int result = stable ?? 0;
-        _ = ApplyOffset(result);
+
+        // The sweep's finding stands either way, but "applied" is a separate
+        // claim from "stable" and this one used to be made without checking.
+        bool applied = ApplyOffset(result);
+        if (!applied)
+        {
+            // The last burn ran AT this offset, so the card most likely still
+            // holds it; what failed is the confirming re-write. Say that, not
+            // "the card moved" — which the evidence does not support.
+            Log($"WARNING: {Fmt(result)} passed, but the closing re-write of it was refused by the driver, so " +
+                "the applied offset could not be re-confirmed. Check it on the Tuning page.");
+        }
+
         Log($"Result: {Fmt(result)} core offset is stable under this test. " +
             "Validate in real games before marking the profile stable; game workloads can differ.");
-        Publish(false, "done", result, stable, TimeSpan.Zero, TimeSpan.Zero, result);
+        Publish(false, "done", result, stable, TimeSpan.Zero, TimeSpan.Zero, result, restored: applied);
     }
 
     private bool ApplyOffset(int offsetMHz)
@@ -283,7 +417,7 @@ public sealed class StabilityStepper
                 Name = "stepper",
                 CoreOffsetMHz = offsetMHz,
                 MemOffsetMHz = current.MemOffsetMHz,
-                LockedCoreClockMHz = current.LockedCoreClockMHz,
+                LockedCoreClockMHz = _tuner.AppliedLockMHz, // applied, never the observed ceiling
                 VoltageBoostPct = current.VoltageBoostPct,
             }, reconcileVfPoints: false).AllSucceeded)
             {
@@ -299,7 +433,11 @@ public sealed class StabilityStepper
 
     private StressState Burn(TimeSpan duration, int offset, int? lastGood)
     {
-        using var stress = new GpuStressTest { TargetPciBusId = TargetPciBusId };
+        using var stress = new GpuStressTest
+        {
+            TargetPciBusId = TargetPciBusId,
+            TargetVendorId = TargetVendorId,
+        };
         var done = new ManualResetEventSlim(false);
         StressState final = StressState.Failed;
 
@@ -346,7 +484,7 @@ public sealed class StabilityStepper
             Publish(true, "stopping", offset, lastGood, duration, duration);
         }
 
-        stress.StopAndWait(TimeSpan.FromSeconds(5));
+        bool stoppedCleanly = stress.StopAndWait(TimeSpan.FromSeconds(30));
         if (!terminal)
         {
             final = _cancel ? StressState.Stopped : stress.Progress.State switch
@@ -354,8 +492,24 @@ public sealed class StabilityStepper
                 StressState.ArtifactDetected => StressState.ArtifactDetected,
                 StressState.DeviceLost => StressState.DeviceLost,
                 StressState.Failed => StressState.Failed,
-                _ => StressState.Stopped,
+
+                // A burn still running past its stop was abandoned, not passed.
+                // Calling that Stopped would advance the sweep to a higher
+                // offset on evidence this step never actually gathered.
+                _ => stoppedCleanly ? StressState.Stopped : StressState.Failed,
             };
+        }
+
+        // A step that ran no load dispatches proved nothing about this offset —
+        // the engine's dispatch counter includes a one-off reference pass, and
+        // the closing verification on such a run compares the reference buffer
+        // against itself. Passing it would mark the offset good and raise the
+        // sweep, and find_stable_offset hands that number to an agent.
+        if (final == StressState.Stopped && !_cancel && !stress.Progress.IsCleanPass)
+        {
+            Log($"This step earned no verdict: {stress.Progress.VerdictGap ?? "the burn did not end in a clean stop"} " +
+                "— nothing was proven at this offset.");
+            return StressState.Failed;
         }
 
         return final;

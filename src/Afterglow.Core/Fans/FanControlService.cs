@@ -27,7 +27,7 @@ public sealed class FanControlService : IDisposable
 {
     private readonly Func<uint, NvmlReturn> _setAllFans;
     private readonly Func<NvmlReturn> _restoreAutoFans;
-    private readonly string? _gpuUuid;
+    private readonly string _recordKey;
     private readonly uint _fanMinDutyPct;
     private readonly object _lock = new();
     private readonly object _commandLock = new();
@@ -36,11 +36,19 @@ public sealed class FanControlService : IDisposable
     private FanCurveEvaluator? _evaluator;
     private FanTempSource _tempSource;
     private double _lastCommandedDuty = -1;
+
+    /// <summary>
+    /// The duty a per-fan manual set left the card at. Kept apart from
+    /// <see cref="_lastCommandedDuty"/>, which that path deliberately clears
+    /// (it is the curve's hysteresis memo), so the unclean-shutdown record can
+    /// still name the percentage the fans are stuck at if the release fails.
+    /// </summary>
+    private double _lastManualDuty = -1;
     private bool _weControlFans;
     private long _generation;
 
-    public FanControlService(GpuTuner tuner)
-        : this(tuner.SetAllFansRaw, tuner.RestoreAutoFansRaw, tuner.GpuUuid, tuner.Capabilities.FanMinDutyPct)
+    public FanControlService(IGpuTuner tuner)
+        : this(tuner.SetAllFansRaw, tuner.RestoreAutoFansRaw, tuner.RecordKey, tuner.Capabilities.FanMinDutyPct)
     {
     }
 
@@ -52,12 +60,12 @@ public sealed class FanControlService : IDisposable
     internal FanControlService(
         Func<uint, NvmlReturn> setAllFans,
         Func<NvmlReturn> restoreAutoFans,
-        string? gpuUuid,
+        string recordKey,
         uint fanMinDutyPct)
     {
         _setAllFans = setAllFans;
         _restoreAutoFans = restoreAutoFans;
-        _gpuUuid = gpuUuid;
+        _recordKey = recordKey;
         _fanMinDutyPct = fanMinDutyPct;
     }
 
@@ -79,7 +87,13 @@ public sealed class FanControlService : IDisposable
         {
             lock (_lock)
             {
-                return _weControlFans && _lastCommandedDuty >= 0 ? _lastCommandedDuty : null;
+                // A per-fan manual set clears the curve memo on purpose; the
+                // card is still at the manual duty, and saying null here read as
+                // "firmware controls the fans" for a card Afterglow had pinned.
+                return !_weControlFans ? null
+                    : _lastCommandedDuty >= 0 ? _lastCommandedDuty
+                    : _lastManualDuty >= 0 ? _lastManualDuty
+                    : null;
             }
         }
     }
@@ -108,8 +122,12 @@ public sealed class FanControlService : IDisposable
         {
             _mode = FanControlMode.Auto;
             _evaluator = null;
-            _lastCommandedDuty = -1;
             generation = ++_generation;
+
+            // The duty memos are cleared only once the release SUCCEEDS (below):
+            // clearing them here left a failed release — fans still pinned —
+            // with nothing for the unclean-shutdown record to name but a stale
+            // per-fan value.
         }
 
         NvmlReturn rc;
@@ -130,6 +148,8 @@ public sealed class FanControlService : IDisposable
                 lock (_lock)
                 {
                     _weControlFans = false;
+                    _lastCommandedDuty = -1;
+                    _lastManualDuty = -1;
                 }
             }
         }
@@ -153,7 +173,7 @@ public sealed class FanControlService : IDisposable
             return false;
         }
 
-        AppliedStateStore.RecordFans(null, null, _gpuUuid);
+        AppliedStateStore.RecordFans(null, null, _recordKey);
         return true;
     }
 
@@ -184,8 +204,45 @@ public sealed class FanControlService : IDisposable
             return false;
         }
 
-        AppliedStateStore.RecordFans("fixed", duty, _gpuUuid);
+        AppliedStateStore.RecordFans("fixed", duty, _recordKey);
         return true;
+    }
+
+    /// <summary>
+    /// Registers a manual fan write that was issued directly against the tuner
+    /// rather than through this service — today, the Fans page's per-cooler
+    /// buttons, which drive one cooler and leave the others alone.
+    /// <para>
+    /// Those writes are just as persistent as <see cref="SetFixed"/>: the driver
+    /// stays in manual control mode until something releases it. Without this,
+    /// the service did not consider itself in control, so <see cref="Dispose"/>
+    /// released nothing and no applied state was recorded — a cooler could be
+    /// left pinned (or stopped) at the driver level after the process exited,
+    /// with the next launch showing no warning at all. Arming the service here
+    /// puts the release path, the unclean-shutdown record and "Firmware (auto)"
+    /// back in charge of it. The mode is deliberately left alone: the per-fan
+    /// buttons do not define a whole-card policy, they just take control.
+    /// </para>
+    /// </summary>
+    public void NoteExternalManualControl(uint dutyPct)
+    {
+        lock (_lock)
+        {
+            _weControlFans = true;
+
+            // Deliberately NOT written into _lastCommandedDuty. That field is the
+            // curve controller's all-fan hysteresis memo ("we already commanded
+            // this duty, skip the write"), and a single cooler's duty is not a
+            // statement about all of them. Storing it there made the curve skip
+            // its next matching update and strand the OTHER coolers at their
+            // previous duty for the whole load, with the flat top of the curve
+            // meaning it never self-healed. Clearing it instead makes the curve's
+            // next evaluation re-command every cooler.
+            _lastCommandedDuty = -1;
+            _lastManualDuty = dutyPct;
+        }
+
+        AppliedStateStore.RecordFans("fixed", dutyPct, _recordKey);
     }
 
     public void SetCurve(FanCurveConfig config)
@@ -204,7 +261,7 @@ public sealed class FanControlService : IDisposable
             _generation++;
         }
 
-        AppliedStateStore.RecordFans("curve", null, _gpuUuid);
+        AppliedStateStore.RecordFans("curve", null, _recordKey);
     }
 
     /// <summary>Feed one telemetry snapshot (called on the polling thread).</summary>
@@ -272,6 +329,7 @@ public sealed class FanControlService : IDisposable
                 lock (_lock)
                 {
                     _lastCommandedDuty = duty;
+                    _lastManualDuty = -1; // an all-fan command supersedes any per-fan set
                     _weControlFans = true;
                 }
             }
@@ -290,11 +348,30 @@ public sealed class FanControlService : IDisposable
     public void Dispose()
     {
         bool release;
+        double lastDuty;
         lock (_lock)
         {
             release = _weControlFans;
+
+            // A per-fan manual set clears the curve memo on purpose, so fall
+            // back to the duty it recorded: the unclean-shutdown record below
+            // used to say "unknown" for a card stuck at exactly the value the
+            // user had just typed.
+            lastDuty = _lastCommandedDuty >= 0 ? _lastCommandedDuty : _lastManualDuty;
             _weControlFans = false;
             _lastCommandedDuty = -1;
+            _lastManualDuty = -1;
+
+            // Stop the curve too, exactly as SetAuto does. Leaving _mode at
+            // Curve with a live evaluator meant one telemetry snapshot arriving
+            // after this point passed the mode guard, found no previous duty to
+            // compare against (so hysteresis could not suppress it), read the
+            // NEW generation and therefore passed the staleness check, and wrote
+            // a fan duty AFTER the release — re-setting _weControlFans and
+            // leaving the card on manual fans (0% on a zero-RPM curve) once the
+            // process exited, with the session already stamped clean.
+            _mode = FanControlMode.Auto;
+            _evaluator = null;
             _generation++;
         }
 
@@ -314,10 +391,18 @@ public sealed class FanControlService : IDisposable
 
         if (rc != NvmlReturn.Success)
         {
-            // Logged, not raised: subscribers are being torn down with us. No
-            // applied-state write here either — App marks the clean shutdown
-            // before disposing services, and RecordFans clears that flag.
+            // Logged, not raised: subscribers are being torn down with us.
             Diagnostics.Log.Warn($"Fan release to firmware control on shutdown failed: {rc}");
+
+            // The fans are still under Afterglow's manual control — physically
+            // pinned at the last commanded duty, possibly stopped — and the
+            // session was already stamped clean by App.OnExit, so the next
+            // launch would show no banner and the Fans page would claim
+            // "Firmware (auto)" over a card that is nothing of the sort.
+            // Re-recording clears the clean flag on purpose: this shutdown did
+            // NOT leave the hardware as it found it, and the user needs to know.
+            AppliedStateStore.RecordFans(
+                "fixed", lastDuty >= 0 ? (uint)Math.Round(lastDuty) : null, _recordKey);
         }
     }
 }

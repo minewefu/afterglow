@@ -107,41 +107,18 @@ public unsafe struct NvmlPciInfo
 /// </summary>
 internal static unsafe class NvmlNative
 {
-    private const string Lib = "nvml.dll";
-
-    private static int _resolverInstalled;
+    // The resolver pins this name to System32; a private copy here could drift
+    // from the resolver's and silently hand the load back to default probing.
+    private const string Lib = VendorLibraryResolver.NvmlLib;
 
     /// <summary>
     /// Installs the DllImport resolver for this assembly exactly once. Must be called
     /// before the first NVML P/Invoke (done by <see cref="NvmlApi.TryCreate"/>).
+    /// The resolver itself lives in <see cref="VendorLibraryResolver"/> because
+    /// .NET permits only one per assembly and the Intel libraries need the same
+    /// System32 pinning; NVML's own resolution order is unchanged.
     /// </summary>
-    internal static void EnsureResolverInstalled()
-    {
-        if (Interlocked.Exchange(ref _resolverInstalled, 1) != 0)
-        {
-            return;
-        }
-
-        NativeLibrary.SetDllImportResolver(typeof(NvmlNative).Assembly, static (name, _, _) =>
-        {
-            if (!name.Equals(Lib, StringComparison.OrdinalIgnoreCase))
-            {
-                return IntPtr.Zero;
-            }
-
-            // Normal location since driver R445+: System32. Fall back to the legacy
-            // NVSMI folder used by very old drivers.
-            if (NativeLibrary.TryLoad(Path.Combine(Environment.SystemDirectory, Lib), out nint handle))
-            {
-                return handle;
-            }
-
-            string legacy = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-                "NVIDIA Corporation", "NVSMI", Lib);
-            return NativeLibrary.TryLoad(legacy, out handle) ? handle : IntPtr.Zero;
-        });
-    }
+    internal static void EnsureResolverInstalled() => VendorLibraryResolver.EnsureInstalled();
 
     // --- Lifecycle -----------------------------------------------------------
 

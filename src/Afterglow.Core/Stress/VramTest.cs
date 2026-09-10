@@ -15,7 +15,11 @@ public sealed record VramProgress(
     int Rounds,
     long ErrorCount,
     double GiBPerSecond,
-    string? Detail);
+    string? Detail)
+{
+    /// <summary>Twin of <see cref="StressProgress.IsHardwareVerdict"/>: the test ran and the card misbehaved.</summary>
+    public bool IsHardwareVerdict => State is StressState.ArtifactDetected or StressState.DeviceLost;
+}
 
 /// <summary>
 /// Full-capacity VRAM test: allocates as much of the card's memory budget as
@@ -98,9 +102,27 @@ public sealed class VramTest : IDisposable
 
     /// <summary>
     /// PCI bus of the card being tuned; binds the test to that exact adapter.
-    /// Null keeps the largest-VRAM NVIDIA fallback (single-GPU behavior).
+    /// Null keeps the largest-VRAM fallback for the target vendor.
     /// </summary>
     public uint? TargetPciBusId { get; set; }
+
+    /// <summary>PCI vendor of the card being tuned (defaults to NVIDIA).</summary>
+    public uint TargetVendorId { get; set; } = StressAdapter.NvidiaVendorId;
+
+    /// <summary>
+    /// Permit running on an adapter that could only be GUESSED (no PCI bus to
+    /// bind to and more than one candidate of the vendor).
+    /// <para>
+    /// Defaults to false — refusing — because almost every caller attributes the
+    /// result to a specific card. The safe behaviour has to be the default: as
+    /// an opt-IN it was set on the certifier and forgotten on the MCP engine and
+    /// the Stability page, which is how an agent could still be handed
+    /// stable:true for a card the run never bound to. Only a deliberately
+    /// unbound exploratory run — CLI `vram` with no --gpu, where the historical
+    /// largest-VRAM fallback is the documented behaviour — sets this true.
+    /// </para>
+    /// </summary>
+    public bool AllowUnboundGuess { get; set; }
 
     public event Action<VramProgress>? ProgressChanged;
 
@@ -128,6 +150,66 @@ public sealed class VramTest : IDisposable
         long target = Math.Min(
             budgetBytes - currentUsageBytes - SafetyReserveBytes,
             dedicatedBytes * 95 / 100);
+        return ChunksFor(target);
+    }
+
+    /// <summary>
+    /// Planner for unified-memory (UMA) GPUs, where "VRAM" is a budget carved
+    /// from system RAM: the dedicated-VRAM cap would be meaningless, and the
+    /// safety reserve must be much larger because every byte tested is a byte
+    /// taken from the OS and applications. A quarter of the budget (at least
+    /// the normal reserve) stays free, and the plan is additionally capped by
+    /// what is actually physically free right now — the DXGI budget alone can
+    /// exceed free RAM on a loaded low-memory machine, and UMA chunks are
+    /// pageable, so overshooting would page the system AND let tested bytes
+    /// silently round-trip through the pagefile instead of RAM.
+    /// </summary>
+    public static long[] PlanChunksShared(long budgetBytes, long currentUsageBytes, long availablePhysicalBytes)
+    {
+        long reserve = Math.Max(SafetyReserveBytes, budgetBytes / 4);
+        long target = Math.Min(
+            budgetBytes - currentUsageBytes - reserve,
+            availablePhysicalBytes - SafetyReserveBytes);
+        return ChunksFor(target);
+    }
+
+    /// <summary>
+    /// Free physical RAM right now, via the documented GlobalMemoryStatusEx.
+    /// long.MaxValue on failure so the budget-based caps decide alone.
+    /// </summary>
+    internal static long AvailablePhysicalBytes()
+    {
+        try
+        {
+            var status = new MemoryStatusEx { Length = (uint)System.Runtime.InteropServices.Marshal.SizeOf<MemoryStatusEx>() };
+            return GlobalMemoryStatusEx(ref status) ? (long)status.AvailPhys : long.MaxValue;
+        }
+        catch (DllNotFoundException)
+        {
+            return long.MaxValue;
+        }
+    }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct MemoryStatusEx
+    {
+        public uint Length;
+        public uint MemoryLoad;
+        public ulong TotalPhys;
+        public ulong AvailPhys;
+        public ulong TotalPageFile;
+        public ulong AvailPageFile;
+        public ulong TotalVirtual;
+        public ulong AvailVirtual;
+        public ulong AvailExtendedVirtual;
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool GlobalMemoryStatusEx(ref MemoryStatusEx status);
+
+    private static long[] ChunksFor(long target)
+    {
         if (target < MinChunkBytes)
         {
             return [];
@@ -169,10 +251,15 @@ public sealed class VramTest : IDisposable
 
     public void Stop() => _stop = true;
 
-    public void StopAndWait(TimeSpan timeout)
+    /// <summary>
+    /// Blocks until the worker has finished. Returns false when it was STILL
+    /// RUNNING at the timeout: the run was abandoned, so <see cref="Progress"/>
+    /// is a stale mid-run snapshot and must never be read as a clean pass.
+    /// </summary>
+    public bool StopAndWait(TimeSpan timeout)
     {
         _stop = true;
-        _thread?.Join(timeout);
+        return _thread?.Join(timeout) ?? true;
     }
 
     private void Report(
@@ -198,13 +285,21 @@ public sealed class VramTest : IDisposable
 
         try
         {
-            using var targetAdapter = StressAdapter.Select(TargetPciBusId, out string adapterName);
+            using var targetAdapter = StressAdapter.Select(TargetVendorId, TargetPciBusId, out string adapterName);
             if (targetAdapter is null)
             {
                 Report(StressState.Failed, stopwatch.Elapsed, 0, 0, 0, 0, 0,
                     adapterName.Length > 0
                         ? $"Adapter binding failed: {adapterName}"
-                        : "No NVIDIA adapter found — refusing to run the VRAM test on a different GPU.");
+                        : $"No {StressAdapter.VendorName(TargetVendorId)} adapter found — refusing to run the VRAM test on a different GPU.");
+                return;
+            }
+
+            if (!AllowUnboundGuess && StressAdapter.IsUnboundGuess(adapterName))
+            {
+                Report(StressState.Failed, stopwatch.Elapsed, 0, 0, 0, 0, 0,
+                    $"Cannot tell which card this would test ({adapterName}) — refusing, because the " +
+                    "result would be attributed to a specific GPU.");
                 return;
             }
 
@@ -237,11 +332,26 @@ public sealed class VramTest : IDisposable
                     usage = (long)info.CurrentUsage;
                 }
 
-                long[] plan = PlanChunks(budget, usage, dedicated);
+                // The device itself says whether its memory is unified with
+                // system RAM. On UMA the dedicated-VRAM planner would either
+                // produce a sliver (fake coverage) or misread the budget, so
+                // a shared-budget planner runs instead — and the result says
+                // plainly what was tested.
+                bool unifiedMemory = device.CheckFeatureSupport<Vortice.Direct3D11.FeatureDataD3D11Options2>(
+                    Vortice.Direct3D11.Feature.D3D11Options2).UnifiedMemoryArchitecture;
+
+                long[] plan = unifiedMemory
+                    ? PlanChunksShared(budget, usage, AvailablePhysicalBytes())
+                    : PlanChunks(budget, usage, dedicated);
+                string? memoryNote = unifiedMemory
+                    ? "tested the GPU's shared system-memory budget (UMA) — this device has no dedicated VRAM"
+                    : null;
                 if (plan.Length == 0)
                 {
                     Report(StressState.Failed, stopwatch.Elapsed, 0, 0, 0, 0, 0,
-                        "Not enough free VRAM to test (close GPU-heavy applications and retry).");
+                        unifiedMemory
+                            ? "Not enough free shared-memory budget to test (close memory-heavy applications and retry)."
+                            : "Not enough free VRAM to test (close GPU-heavy applications and retry).");
                     return;
                 }
 
@@ -345,10 +455,13 @@ public sealed class VramTest : IDisposable
                                 $"round {rounds + 1}, chunk {i + 1}/{buffers.Count}");
                         }
 
-                        if (_stop)
-                        {
-                            break;
-                        }
+                        // Deliberately NOT breaking on _stop before the readback:
+                        // the verify dispatches that did run have already counted
+                        // any mismatches into the error buffer, and leaving the
+                        // round here threw those away — a stopped run reported
+                        // "0 errors" while the GPU had in fact just recorded some.
+                        // Errors already found are reported whether or not the
+                        // round completed; the stop is honoured right after.
 
                         // One tiny readback per round: the error counter.
                         context.CopyResource(errStaging, errBuffer);
@@ -378,17 +491,32 @@ public sealed class VramTest : IDisposable
                         if (roundErrors > 0)
                         {
                             errors += roundErrors;
+                            // On UMA the tested memory IS system RAM: pointing at a GPU
+                            // memory offset (which this device may not even expose)
+                            // would misdirect the user away from the real suspect.
                             Report(StressState.ArtifactDetected, stopwatch.Elapsed, planned, verified, rounds, errors, 0,
-                                $"{errors} VRAM element(s) read back different data than was written " +
-                                $"(first at element {firstIndex} of the failing chunk) — memory errors at the " +
-                                "current memory clock/offset. Lower the memory offset.");
+                                unifiedMemory
+                                    ? $"{errors} element(s) of the GPU's shared system-memory budget read back " +
+                                      $"different data than was written (first at element {firstIndex} of the failing " +
+                                      "chunk) — on this unified-memory device that memory is system RAM, so check " +
+                                      "system-memory stability (XMP/EXPO profile, DRAM timings) before blaming the GPU."
+                                    : $"{errors} VRAM element(s) read back different data than was written " +
+                                      $"(first at element {firstIndex} of the failing chunk) — memory errors at the " +
+                                      "current memory clock/offset. Lower the memory offset.");
                             return;
+                        }
+
+                        // Only a fully verified pass counts as a round; a stop
+                        // partway through leaves the sweep incomplete.
+                        if (_stop)
+                        {
+                            break;
                         }
 
                         rounds++;
                     }
 
-                    Report(StressState.Stopped, stopwatch.Elapsed, planned, verified, rounds, errors, 0);
+                    Report(StressState.Stopped, stopwatch.Elapsed, planned, verified, rounds, errors, 0, memoryNote);
                 }
                 finally
                 {

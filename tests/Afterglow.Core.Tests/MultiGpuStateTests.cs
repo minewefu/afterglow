@@ -15,26 +15,9 @@ public sealed class AppliedStateStoreTests : IDisposable
     private const string UuidA = "GPU-aaaa1111-2222-3333-4444-555566667777";
     private const string UuidB = "GPU-bbbb1111-2222-3333-4444-555566667777";
 
-    private readonly string _root;
+    private readonly Fakes.StoreScope _store = new();
 
-    public AppliedStateStoreTests()
-    {
-        _root = Path.Combine(Path.GetTempPath(), $"afterglow-test-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(_root);
-        AppPaths.OverrideRoot = _root;
-    }
-
-    public void Dispose()
-    {
-        AppPaths.OverrideRoot = null;
-        try
-        {
-            Directory.Delete(_root, recursive: true);
-        }
-        catch (IOException)
-        {
-        }
-    }
+    public void Dispose() => _store.Dispose();
 
     private static TuningProfile Profile(string name, int core = 100) =>
         new() { Name = name, CoreOffsetMHz = core, MemOffsetMHz = 500 };
@@ -42,8 +25,8 @@ public sealed class AppliedStateStoreTests : IDisposable
     [Fact]
     public void Two_gpus_keep_independent_records()
     {
-        AppliedStateStore.Record(Profile("card A"), allSucceeded: true, lockedClock: 2800, UuidA);
-        AppliedStateStore.Record(Profile("card B"), allSucceeded: true, lockedClock: null, UuidB);
+        AppliedStateStore.Record(Profile("card A"), allSucceeded: true, lockWrittenByAfterglow: 2800, UuidA);
+        AppliedStateStore.Record(Profile("card B"), allSucceeded: true, lockWrittenByAfterglow: null, UuidB);
 
         var a = AppliedStateStore.Load(UuidA);
         var b = AppliedStateStore.Load(UuidB);
@@ -55,18 +38,19 @@ public sealed class AppliedStateStoreTests : IDisposable
     }
 
     [Fact]
-    public void Legacy_single_file_is_read_until_superseded_then_retired()
+    public void Legacy_single_file_is_adopted_by_its_card_on_first_start_then_retired()
     {
-        // A record written the pre-multi-GPU way (no uuid → legacy file).
-        AppliedStateStore.Record(Profile("legacy"), allSucceeded: true, lockedClock: 2700, gpuUuid: null);
-        Assert.Equal("legacy", AppliedStateStore.Load(UuidA)!.ProfileName);
+        // A record written the pre-multi-GPU way (no key, the single file).
+        AppliedStateStore.WriteLegacyRecord(new AppliedStateStore.AppliedState("legacy", DateTimeOffset.Now, true, false, 2700));
 
-        // First per-GPU write supersedes and retires the legacy file.
-        AppliedStateStore.Record(Profile("fresh"), allSucceeded: true, lockedClock: null, UuidA);
+        // A tuner's first read adopts it into the card's own file and retires it.
+        Assert.Equal("legacy", AppliedStateStore.LoadOrAdoptLegacy(UuidA, UuidA)!.ProfileName);
         Assert.False(File.Exists(AppPaths.AppliedStateFile));
-        Assert.Equal("fresh", AppliedStateStore.Load(UuidA)!.ProfileName);
+        Assert.Equal(2700u, AppliedStateStore.Load(UuidA)!.LockedCoreClockMHz);
 
-        // And the whole-store scan reports exactly one record, not a duplicate.
+        // Later writes go to that file; the whole-store scan reports one record.
+        AppliedStateStore.Record(Profile("fresh"), allSucceeded: true, lockWrittenByAfterglow: null, UuidA);
+        Assert.Equal("fresh", AppliedStateStore.Load(UuidA)!.ProfileName);
         Assert.Single(AppliedStateStore.LoadAll());
     }
 
