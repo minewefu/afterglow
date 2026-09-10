@@ -1,6 +1,23 @@
 # Changelog
 
-## Unreleased — post-beta.1 review fixes
+## 1.3.0-beta.2 — 2026-09-10
+
+**What this beta is about.** Two things a beta.1 user will notice. First, the
+clock-lock state on Intel Arc is honest again: no phantom lock that a reset
+cannot clear, no GPU left pinned at an exact clock when the app exits during a
+V/F probe, and no crash banner that returns on every launch after the card was
+freed. Second, every verdict the CLI and the MCP server hand to a script or an
+agent is now earned: a burn that never finished, a refused clock lock, or a
+restore that did not land is reported as such, with a non-zero exit code or an
+error field, instead of as success. The clock-lock logic now runs under a
+scenario suite against an in-memory IGCL device, and its driver assumptions were
+measured on the Arc B390 and recorded in the research notes.
+
+**Upgrade note.** Applied-state records are now filed one per card
+(`applied-state-<key>.json`, keyed by the GPU's UUID or by `index:N` when the
+driver reports none). The pre-multi-GPU single file is adopted into the card's
+own file the first time its tuner starts and then retired; nothing to do by
+hand. Profiles, presets and fan settings are unchanged.
 
 A full review of 1.3.0-beta.1 (and of 1.2.0-beta.4 underneath it) found defects
 across both, including several that let the tool report a stability verdict it
