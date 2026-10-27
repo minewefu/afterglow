@@ -66,8 +66,15 @@ A full-version review reported 49 defects; all 49 were confirmed in the code.
     Every output is finite, and a one-bit fault reaches the output.
   - A run whose reference isn't finite ends without a verdict.
   - The FP32/INT32 work per gather is unchanged.
-  - Sustained, transitions and excursions certificates, and stepper results,
-    from earlier builds proved little more than "no driver reset". Re-run them.
+  - Sustained, transitions and excursions passes from earlier builds proved
+    little more than "no driver reset", so they no longer count toward
+    "Certified". Certificates now record which burn earned them.
+  - Old burn passes stay in the profile. The Profiles page, `certify` and MCP
+    `list_profiles` mark such a profile "Re-certify" and say why.
+  - VRAM-test passes are unaffected.
+  - Stable marks are left alone, so a profile you marked stable still applies
+    at startup. Certify it again to restore the "Certified" badge.
+  - Stepper results from earlier builds are worth re-running too.
 - **A certification or stepper run now owns the card's tuning while it runs.**
   The Tuning page, a hotkey, a game rule, automation, a reset or another program
   can all change the tuning. If any of them does, the run stops as
