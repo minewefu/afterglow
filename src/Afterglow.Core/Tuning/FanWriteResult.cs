@@ -23,12 +23,10 @@ public readonly record struct FanWriteResult(NvmlReturn Result, bool FansMayBeMa
     /// </summary>
     public static FanWriteResult FromRaw(NvmlReturn rc) => new(rc, rc != NvmlReturn.NotSupported);
 
-    /// <summary>
-    /// An all-fans write through the best answer the tuner can give: the NVIDIA
-    /// tuner says what a refused write left on the card (it rolls back, or puts
-    /// it on record); any other tuner answers with one code, read as
-    /// <see cref="FromRaw"/> does (Arc: always NotSupported, nothing touched).
-    /// </summary>
-    public static FanWriteResult SetAllFans(IGpuTuner tuner, uint dutyPct) =>
-        tuner is GpuTuner nvidia ? nvidia.SetAllFans(dutyPct) : FromRaw(tuner.SetAllFansRaw(dutyPct));
+    /// <summary>An all-fans write through <see cref="IGpuTuner.SetAllFans"/>, whichever tuner it is.</summary>
+    public static FanWriteResult SetAllFans(IGpuTuner tuner, uint dutyPct)
+    {
+        ArgumentNullException.ThrowIfNull(tuner);
+        return tuner.SetAllFans(dutyPct);
+    }
 }

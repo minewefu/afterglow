@@ -255,6 +255,14 @@ public interface IGpuTuner
 
     NvmlReturn SetAllFansRaw(uint dutyPct);
 
+    /// <summary>
+    /// An all-fans write that says what a refusal left on the card
+    /// (<see cref="FanWriteResult.FansMayBeManual"/>). A tuner that can't tell per
+    /// fan answers as <see cref="FanWriteResult.FromRaw"/> reads one code; the
+    /// NVIDIA tuner rolls a partial write back, or puts it on record (R-06).
+    /// </summary>
+    FanWriteResult SetAllFans(uint dutyPct) => FanWriteResult.FromRaw(SetAllFansRaw(dutyPct));
+
     NvmlReturn SetFanRaw(uint coolerId, uint dutyPct);
 
     NvmlReturn RestoreAutoFansRaw();

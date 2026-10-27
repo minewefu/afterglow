@@ -237,7 +237,8 @@ A full-version review reported 49 defects; all 49 were confirmed in the code.
   - `drs` without `--cap` no longer rewrites the cap.
 - **Overlapping games hand over.** Closing the game whose profile is applied,
   while another configured game is still running, applies that game's profile.
-  Your tuning from before the first game comes back when the last one closes.
+  When the last one closes, your tuning from before the first game comes back
+  if the active rule says to revert.
 - **Clearing a game's driver settings reports failures**, and a successful clear
   is verified.
 - **The hidden `drs --probe-create` diagnostic no longer deletes an existing
