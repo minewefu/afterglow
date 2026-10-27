@@ -46,6 +46,175 @@
 - `tools/ui-check.ps1` drives the new Settings section, with the Spanish layout
   installed. `tools/keyboard-layout-survey.cs` reproduces the layout survey.
 
+### Fixes from the 27 October full review
+
+A full-version review reported 49 defects; all 49 were confirmed in the code.
+- **How each fix was confirmed.** Most were reproduced by a regression test that
+  failed before the fix and passes after. The rest are in app-only code or new
+  APIs, and were confirmed with scratch harnesses driving the real view models.
+- **Test count.** The suite went from 619 to over 1,000 tests.
+- **No physical GPUs.** Nothing here was verified on real hardware. Driver
+  behaviour comes from vendor documentation, and from fake drivers built to that
+  documentation (NVIDIA, Intel IGCL, NVIDIA DRS). The burn shader ran on the
+  D3D WARP software device.
+
+#### Stability testing and certification
+- **The burn couldn't detect a miscalculation.** Its arithmetic overflowed to
+  infinity within the first few gathers. Corrupted inputs or wrong FMA results
+  therefore reproduced the reference exactly and passed.
+  - The burn now uses bounded chaotic arithmetic with a lossless integer digest.
+    Every output is finite, and a one-bit fault reaches the output.
+  - A run whose reference isn't finite ends without a verdict.
+  - The FP32/INT32 work per gather is unchanged.
+  - Sustained, transitions and excursions certificates, and stepper results,
+    from earlier builds proved little more than "no driver reset". Re-run them.
+- **A certification or stepper run now owns the card's tuning while it runs.**
+  The Tuning page, a hotkey, a game rule, automation, a reset or another program
+  can all change the tuning. If any of them does, the run stops as
+  "interrupted": no pass, and no further writes over your change. Before, the
+  stepper could even re-apply its offset over a reset.
+- **Certification is tied to the exact configuration tested:** clocks, power,
+  lock, V/F curve, card and fans.
+  - Saving a different profile under the same name during a run no longer gets
+    that profile marked stable.
+  - Changing anything a profile applies makes its old certificates stop
+    counting.
+- **A run that catches an artifact or driver reset removes the profile's stable
+  mark** and that mode's certificate. Startup can no longer auto-apply settings
+  that just failed.
+- **Certification runs under the profile's own fan setting**, and puts yours
+  back afterwards. CLI `certify` refuses fan-curve profiles and hands the fans
+  back to automatic control when it finishes.
+
+#### Fans, resets and shutdown
+- **Handing the fans back at exit is guaranteed.** A full or disconnected log
+  drive used to stop it.
+  - Each shutdown step now runs on its own, and the fans are released before
+    any file is written.
+  - The session counts as a clean exit only after every card's fans were
+    actually released.
+- **Partly refused fan commands are released at exit.** On NVIDIA's per-fan
+  fallback, a command one fan refused could still have moved the others.
+  Afterglow now treats those fans as under its control: it releases them at
+  exit, and the curve writes every fan again.
+- **Closing during the first fan-curve command no longer leaves it landing late.**
+  That command could land after the release. Exit now waits for it, then
+  releases.
+- **The Tuning page's Reset also stops a running fan curve.** Before, the curve
+  took the fans back one tick later.
+- **Resets report what they couldn't undo.** This covers the panic reset, the
+  reset after a driver crash and the automation "reset" action. They no longer
+  announce "all tuning returned to driver defaults" over a write the driver
+  refused; they list what may still be applied, and the log has each card's
+  per-setting answer.
+- **A failed fan hand-back is reported as a failure.** If the GPU dropped off the
+  bus, Afterglow used to claim the fans were released.
+
+#### NVIDIA tuning and crash recovery
+- **A power- or fan-only change no longer wipes a per-point V/F curve.** This
+  covers `set --power-limit`, a fan-only MCP `apply_tuning`, and the Tuning page
+  with the offset unchanged. The core offset isn't re-written when it's already
+  in force, because that write levels the whole curve.
+- **V/F edits are recorded before they reach the driver.** This covers the V/F
+  Curve page and `vfpoints --set/--flatten`. A crash they cause now shows the
+  recovery banner and holds back the startup profile.
+- **After a restart, Afterglow no longer reports a clock lock the driver already
+  dropped**, and a later `set` won't quietly re-apply it.
+- **A CLI `set` on one GPU no longer clears another GPU's crash-recovery
+  record.** It also leaves its own GPU's record alone if that was unfinished.
+- **Crash reports know what was applied at the moment of the crash.** Every
+  tuning change is recorded as it happens, with the clock lock, per-point edits
+  and which card.
+  - Before, the recorder checked once a minute and only for two offsets. A crash
+    right after applying a profile could be reported as a stock-settings
+    failure.
+  - "Afterglow's tuning is not implicated" is only shown when the recording
+    covers every setting.
+- **No more invented hard resets.** When Windows' event log can't be read, the
+  report says the cause is unknown.
+
+#### V/F curve
+- **Undervolt plans no longer mix offsets.** The measured curve belongs to the
+  tuning it was measured under, and changing the core offset or per-point edits
+  starts it over. Planning twice can no longer stack the offset.
+- **A Reset during a V/F probe stops the probe.** Any outside change ends it with
+  "stopped: tuning changed elsewhere". Before, the probe locked the clock again.
+- **Each probe step samples until it has enough readings to plan from.** Probes
+  run somewhat longer; steps that still fall short are reported.
+- **NaN and Infinity are rejected everywhere a clock or voltage is entered.** A
+  NaN target used to clear the whole curve. `vfpoints --set "30=-2147483648"` is
+  now a validation error instead of a crash.
+
+#### Intel Arc
+- **Board power uses the whole-card energy counter where the driver has one.**
+  Otherwise it falls back to the chip and says so: the dashboard reads "GPU chip
+  power", and `--json`/MCP report `powerIsChipOnly`. Power rules on discrete
+  cards may fire sooner, because readings are no longer understated.
+- **A driver-reported VRAM temperature is no longer dropped.** It is labelled
+  VRAM, not memory junction.
+- **A V/F probe that failed to put your clock lock back no longer loses it on
+  the next try.**
+- **Raised factory minimum clocks no longer block unlock, reset and probing.**
+  On cards whose factory minimum is above the hardware minimum, the raised floor
+  used to be read as a stuck pin. Tested against a simulated driver only.
+- **`selftest` sends the GPU-lock query with its Size filled in**, as Intel's
+  header requires.
+
+#### FPS capture and session reports
+- **A new capture no longer blends in the previous run's frames.** A game that
+  switches swap chains no longer keeps showing the old chain's frame rate.
+- **Session reports take the offsets that were applied while the game was
+  presenting.** A game profile's exit restore no longer stamps a tuned run as
+  untuned, and a run whose tuning changed mid-window is marked.
+- **The GUI and CLI can capture together.** Each capture has its own ETW session.
+  The app no longer stays on "Capturing" after PresentMon exits, and switching
+  to Afterglow mid-game no longer makes Afterglow "the game".
+- **`afterglow-cli fps` lists every app that presented**, including one that
+  finished before the capture did.
+
+#### Games, driver profiles and profiles
+- **Back-to-back games each get their own profile.** Closing one and starting
+  another within a poll interval used to leave the second on the first one's
+  profile.
+- **A per-game frame cap of 0 is stored as the driver's explicit "off"** for that
+  game, instead of silently inheriting a global cap. Removing the rule or `drs
+  --clear` hands the game back to the global settings. A cap outside 0–1000 is
+  refused.
+- **Clearing a game's driver settings reports failures**, and a successful clear
+  is verified.
+- **The hidden `drs --probe-create` diagnostic no longer deletes an existing
+  profile.**
+- **A damaged profile file no longer stops Afterglow from starting.** It is
+  skipped, counted and logged.
+- **Profile names that would share a file are refused** instead of overwriting
+  each other. Windows file names ignore case and drop characters such as `:`.
+- **Saving a profile through MCP keeps the per-point V/F curve**, using the same
+  capture as the Profiles page.
+- **A profile applied to a GPU that isn't selected now saves that card's fans**,
+  and no longer wipes unapplied slider changes on the selected card.
+
+#### Settings, automation and the fan-curve editor
+- **Bad automation thresholds are refused.** NaN, Infinity and 1e999 broke every
+  later settings save. Settings are now saved before they're kept.
+- **Changing an unrelated setting no longer resets automation rules'** timers and
+  cooldowns.
+- **"Add rule" works after leaving Settings and coming back.**
+- **The fan-curve editor no longer creates duplicate points or throws while
+  dragging.**
+
+#### CLI, MCP and system integration
+- **`mcp` refuses options it doesn't understand.** A typo such as `--gpuu 1` used
+  to bind the server to GPU 0.
+- **A removed NVIDIA card no longer blocks stress tests on Intel Arc.** NVIDIA
+  fan RPM also comes back after a driver reset.
+- **"Start with Windows" now belongs to whoever is signed in.**
+  - Each account gets its own logon task.
+  - The toggle reflects whether the task is actually enabled.
+  - Installing with another administrator's password creates the task for you.
+  - Uninstalling removes every user's task.
+  - On a standard account, Afterglow asks for elevation at sign-in, as on any
+    launch.
+
 ## 1.5.0 — 2026-10-12
 
 The first stable release since 1.1.0. It brings together everything from the 1.2.0 betas
