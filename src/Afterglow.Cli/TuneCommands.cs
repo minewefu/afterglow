@@ -232,6 +232,12 @@ internal static class TuneCommands
             VoltageBoostPct = voltageBoost,
         };
 
+        // Claimed before the first write (R-15): the clean mark at the end
+        // vouches for this card's record only, and only if this command found
+        // it clean — a running app's unfinished record, or an unacknowledged
+        // crash, on this card or any other, is not this command's to clear.
+        var claim = AppliedStateStore.BeginCommand(gpu.Tuner.RecordKey);
+
         // An explicit `--lock-clock off` is one operation with one verdict:
         // Apply releases the lock itself — whether or not this session tracks
         // one — and reports it as the "clock lock" knob. Releasing from here
@@ -263,8 +269,10 @@ internal static class TuneCommands
         }
 
         // A completed CLI apply is a clean session end — don't trip the app's
-        // crash-recovery banner on its next start.
-        AppliedStateStore.MarkCleanShutdown();
+        // crash-recovery banner on its next start for it. The mark covers this
+        // command's own card (see the claim above); it used to mark every
+        // card's record clean.
+        claim.MarkClean();
 
         if (!allOk)
         {

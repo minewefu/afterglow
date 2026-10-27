@@ -294,4 +294,27 @@ public sealed class GameSessionRestoreTests : IDisposable
         Assert.Contains("temp limit", failed, StringComparison.Ordinal);
         Assert.Contains("fans", failed, StringComparison.Ordinal);
     }
+
+    [Fact]
+    public void A_power_only_game_profile_keeps_the_curve_for_the_whole_session()
+    {
+        // R-12, through the real tuner over a fake driver that levels the table
+        // on every core-offset write, as the measured RTX 5090 does.
+        var driver = new Fakes.FakeNvidiaDriver(UuidA);
+        var tuner = new GpuTuner(driver, driver, UuidA);
+        Assert.True(tuner.Apply(new TuningProfile { Name = "Daily", CoreOffsetMHz = 100 }).AllSucceeded);
+        Assert.True(tuner.SetVfPointOffsets(new Dictionary<int, int> { [30] = 200, [31] = -100 }).Applied);
+        int[] curve = [200, -100, 100, 100, 100];
+
+        // A game profile with no curve opinion and the offset already in force.
+        var game = new TuningProfile { Name = "Quiet", CoreOffsetMHz = 100, PowerLimitW = 250 };
+        var pre = GameSessionRestore.Capture(tuner, 0, "game.exe", game, fans: null);
+        Assert.True(tuner.Apply(game).AllSucceeded);
+        Assert.Equal(curve, driver.TableOffsets);
+
+        var plan = GameSessionRestore.Plan(pre);
+        Assert.True(tuner.Apply(plan.Profile, reconcileVfPoints: false).AllSucceeded);
+        Assert.Equal(curve, driver.TableOffsets);
+        Assert.Equal(300_000u, driver.PowerLimitMw);
+    }
 }

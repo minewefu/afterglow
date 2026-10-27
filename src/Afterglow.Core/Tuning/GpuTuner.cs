@@ -136,8 +136,8 @@ public sealed record ApplyResult(bool AllSucceeded, IReadOnlyList<KnobResult> Re
 /// </summary>
 public sealed class GpuTuner : IGpuTuner
 {
-    private readonly NvmlDevice _nvml;
-    private readonly NvapiGpu? _nvapi;
+    private readonly INvmlTuningDevice _nvml;
+    private readonly INvapiTuningGpu? _nvapi;
     private readonly Lock _applyLock = new();
     private uint? _appliedLockMHz;
 
@@ -151,6 +151,12 @@ public sealed class GpuTuner : IGpuTuner
     /// or the index fallback the GPU manager derives when NVML reports none.
     /// </param>
     public GpuTuner(NvmlDevice nvml, NvapiGpu? nvapi, string recordKey)
+        : this((INvmlTuningDevice)nvml, (INvapiTuningGpu?)nvapi, recordKey)
+    {
+    }
+
+    /// <summary>The same tuner over any driver surface — the fake driver in tests.</summary>
+    internal GpuTuner(INvmlTuningDevice nvml, INvapiTuningGpu? nvapi, string recordKey)
     {
         _nvml = nvml;
         _nvapi = nvapi;
@@ -160,10 +166,19 @@ public sealed class GpuTuner : IGpuTuner
 
         // The record is this card's own file — adopted from the pre-multi-GPU
         // single file on the first start after an upgrade — so a lock applied
-        // to another card can never be adopted here.
+        // to another card can never be adopted here. Nor one applied before
+        // the last restart (R-14): the driver dropped it then, and adopting
+        // the shadow made `get` report it and a later partial `set` write it
+        // back. The record keeps it, still dated to its boot, so every later
+        // read refuses it the same way until an apply replaces it.
         if (AppliedStateStore.LoadOrAdoptLegacy(_recordKey, _gpuUuid) is { } state)
         {
-            _appliedLockMHz = state.LockedCoreClockMHz;
+            _appliedLockMHz = AppliedStateStore.LockFromThisBoot(state);
+            if (state.LockedCoreClockMHz is uint stale && _appliedLockMHz is null)
+            {
+                Log.Info($"The {stale} MHz clock lock on record for this GPU was applied before the last " +
+                         "restart; the driver does not keep a lock across one, so it is not tracked as applied.");
+            }
         }
     }
 
@@ -323,7 +338,10 @@ public sealed class GpuTuner : IGpuTuner
     /// offsets means the stock curve. Applying the core offset is what levels
     /// the shared clock-boost table on the hardware this was measured on, so the
     /// reconcile below usually finds nothing to do and stays silent; when it
-    /// does have to remove offsets, it says so as its own knob.
+    /// does have to remove offsets, it says so as its own knob. For the same
+    /// reason a profile with no opinion on the curve does not re-write a core
+    /// offset the driver already holds (R-12): a partial apply carrying the
+    /// current offset forward must not level a curve it never mentioned.
     /// </summary>
     /// <param name="reconcileVfPoints">
     /// Hard opt-out for callers that must never touch the V/F table. Removing a
@@ -373,9 +391,19 @@ public sealed class GpuTuner : IGpuTuner
             ApplyOffset(NvmlClockType.Mem, profile.MemOffsetMHz,
                 Capabilities.SupportsMemOffset, Capabilities.MemOffsetMinMHz, Capabilities.MemOffsetMaxMHz,
                 "memory offset", results);
+
+            // R-12: the core-offset write levels every V/F point (driver-apis.md,
+            // Blackwell section), so it is a curve write as much as an offset
+            // write. A profile with no opinion on the curve — a power-only `set`
+            // or a fan-only MCP apply_tuning carry the current offset forward,
+            // as does any profile assembled from ReadCurrent — must not level a
+            // curve just to write back the value already in force; the guard
+            // below that skips reconciliation for such a profile ran only
+            // after the shape was gone. A changed offset is still written: that
+            // is the request, and the levelling is the driver's.
             ApplyOffset(NvmlClockType.Graphics, profile.CoreOffsetMHz,
                 Capabilities.SupportsCoreOffset, Capabilities.CoreOffsetMinMHz, Capabilities.CoreOffsetMaxMHz,
-                "core offset", results);
+                "core offset", results, keepWhenUnchanged: !HasCurveOpinion(profile, reconcileVfPoints));
             ApplyLockedClock(profile.LockedCoreClockMHz, results, releaseLock);
 
             // Runs after the core offset above, on purpose: the global offset
@@ -547,13 +575,18 @@ public sealed class GpuTuner : IGpuTuner
         return _nvapi is null ? NvapiStatus.NoImplementation : _nvapi.TryGetVfpPoints(out points);
     }
 
-    /// <summary>Writes per-point curve offsets (UI/CLI entry point; serialized with Apply).</summary>
+    /// <summary>
+    /// Writes per-point curve offsets (UI/CLI entry point; serialized with Apply).
+    /// Like a profile apply, the write goes on record before it reaches the
+    /// driver (R-13), so a crash it causes raises the recovery banner and holds
+    /// back the startup profile on the next launch.
+    /// </summary>
     public KnobResult SetVfPointOffsets(IReadOnlyDictionary<int, int> offsetsMHzByIndex)
     {
         KnobResult result;
         lock (_applyLock)
         {
-            result = ApplyVfPointOffsetsCore(offsetsMHzByIndex);
+            result = ApplyVfPointOffsetsCore(offsetsMHzByIndex, recordDirectWrite: true);
         }
 
         return Notify(result);
@@ -703,6 +736,15 @@ public sealed class GpuTuner : IGpuTuner
     }
 
     /// <summary>
+    /// Whether applying <paramref name="profile"/> says anything about the V/F
+    /// curve — the same two cases <see cref="ApplyVfPointOffsets"/> acts on: it
+    /// carries point offsets, or it recorded a table reading and reconciliation
+    /// is allowed. Anything else must leave the curve as it is (R-12).
+    /// </summary>
+    private static bool HasCurveOpinion(TuningProfile profile, bool reconcile) =>
+        profile.VfPointOffsetsMHz is { Count: > 0 } || (reconcile && profile.CapturedVfPoints);
+
+    /// <summary>
     /// Reconciles the per-point curve table with what the profile asks for.
     /// A profile carrying no point offsets means the stock curve — not "leave
     /// whatever the last profile flattened in force" — so an earlier flatten is
@@ -828,7 +870,14 @@ public sealed class GpuTuner : IGpuTuner
         results.Add(KnobResult.Ok(knob, detail));
     }
 
-    private KnobResult ApplyVfPointOffsetsCore(IReadOnlyDictionary<int, int> offsetsMHzByIndex)
+    /// <param name="recordDirectWrite">
+    /// True for a write that is not part of a profile apply (which has put
+    /// itself on record already): the record is marked pending once the request
+    /// has passed validation — a refusal writes nothing and records nothing —
+    /// and before the driver call (R-13). A driver refusal leaves it pending:
+    /// what the card holds after a refused or half-taken write is not known.
+    /// </param>
+    private KnobResult ApplyVfPointOffsetsCore(IReadOnlyDictionary<int, int> offsetsMHzByIndex, bool recordDirectWrite = false)
     {
         const string knob = "V/F points";
         if (!Capabilities.SupportsVfPoints || _nvapi is null)
@@ -851,6 +900,11 @@ public sealed class GpuTuner : IGpuTuner
             return KnobResult.Fail(knob, refusal);
         }
 
+        if (recordDirectWrite)
+        {
+            AppliedStateStore.RecordPending(AppliedStateStore.VfPointEditName, _recordKey);
+        }
+
         var rc = _nvapi.TrySetVfpPointOffsets(offsetsMHzByIndex);
         if (rc != NvapiStatus.Ok)
         {
@@ -861,14 +915,30 @@ public sealed class GpuTuner : IGpuTuner
         // agrees with what was asked for. Points the driver silently ignored or
         // altered fail the knob loudly.
         var readRc = _nvapi.TryGetVfpPoints(out var readback);
-        return readRc == NvapiStatus.Ok
+        var result = readRc == NvapiStatus.Ok
             ? VfPointPlanner.VerifyPointWrite(offsetsMHzByIndex, readback)
             : KnobResult.Ok(knob,
                 $"{offsetsMHzByIndex.Count} point offsets written — not verified (the table did not read back: {readRc})");
+
+        if (recordDirectWrite)
+        {
+            // Still unclean: the session that wrote the curve vouches for it at
+            // its clean exit, exactly as for an apply.
+            AppliedStateStore.RecordDirectWrite(AppliedStateStore.VfPointEditName, result.Applied, _recordKey);
+        }
+
+        return result;
     }
 
+    /// <param name="keepWhenUnchanged">
+    /// Skip the write when the driver already reports the target (R-12): for the
+    /// core offset of a profile with no curve opinion, whose write would level
+    /// the per-point curve for nothing. The readback that finds the value in
+    /// force is the verification. An unreadable offset is written as before.
+    /// </param>
     private void ApplyOffset(
-        NvmlClockType type, int requested, bool supported, int min, int max, string knob, List<KnobResult> results)
+        NvmlClockType type, int requested, bool supported, int min, int max, string knob, List<KnobResult> results,
+        bool keepWhenUnchanged = false)
     {
         if (requested == 0 && !supported)
         {
@@ -885,6 +955,16 @@ public sealed class GpuTuner : IGpuTuner
         string detail = wasClamped
             ? $"{clamped} MHz (requested {requested}, clamped to driver range {min}..{max})"
             : $"{clamped} MHz";
+
+        if (keepWhenUnchanged &&
+            _nvml.TryGetClockOffset(type, out var inForce) == NvmlReturn.Success &&
+            inForce.ClockOffsetMHz == clamped)
+        {
+            results.Add(KnobResult.Ok(knob, detail + (Capabilities.SupportsVfPoints
+                ? " (already in force; not re-written, so any per-point curve stays)"
+                : " (already in force; not re-written)")));
+            return;
+        }
 
         var rc = _nvml.TrySetClockOffset(type, clamped);
         if (rc == NvmlReturn.Success && _nvml.TryGetClockOffset(type, out var readback) == NvmlReturn.Success)
@@ -1185,16 +1265,42 @@ public sealed class GpuTuner : IGpuTuner
         return NvmlReturn.NotSupported;
     }
 
-    /// <summary>Returns fans to firmware control; NVAPI preferred, NVML fallback.</summary>
+    /// <summary>
+    /// Returns fans to firmware control; NVAPI preferred, NVML fallback.
+    /// <see cref="NvmlReturn.NotSupported"/> means there was no fan control to
+    /// hand back on either interface — callers (FanControlService.SetAuto, the
+    /// reset) count that as released — so it is answered only for statuses that
+    /// say the interface is absent (R-08). A lost GPU, a refused call or an
+    /// NVAPI release that failed where NVML has no fallback is a failed
+    /// release, and is reported as one.
+    /// </summary>
     public NvmlReturn RestoreAutoFansRaw()
     {
-        if (_nvapi is not null && _nvapi.TryRestoreAutoFans() == NvapiStatus.Ok)
+        NvapiStatus? nvapiRc = _nvapi?.TryRestoreAutoFans();
+        if (nvapiRc == NvapiStatus.Ok)
         {
             return NvmlReturn.Success;
         }
 
-        if (_nvml.TryGetNumFans(out uint fans) != NvmlReturn.Success)
+        var countRc = _nvml.TryGetNumFans(out uint fans);
+        if (countRc is not NvmlReturn.Success and not NvmlReturn.NotSupported and not NvmlReturn.FunctionNotFound)
         {
+            Log.Warn($"Fan release: the NVML fallback could not count the fans ({countRc})" +
+                     (nvapiRc is { } failed ? $" after NVAPI refused the release ({failed})." : "."));
+            return countRc;
+        }
+
+        if (countRc != NvmlReturn.Success || fans == 0)
+        {
+            // NVML has no fans to hand back. That is "nothing to release" only
+            // when NVAPI had no fan control either; a real NVAPI failure means
+            // the fans may still be manual, with no fallback left to try.
+            if (nvapiRc is { } nvapiFailure && !IsAbsent(nvapiFailure))
+            {
+                Log.Warn($"Fan release failed: NVAPI refused it ({nvapiFailure}) and NVML has no fan control to fall back on.");
+                return NvmlReturn.Unknown;
+            }
+
             return NvmlReturn.NotSupported;
         }
 
@@ -1210,6 +1316,11 @@ public sealed class GpuTuner : IGpuTuner
 
         return worst;
     }
+
+    /// <summary>An NVAPI status that says the fan interface is not there, as opposed to a call that failed.</summary>
+    private static bool IsAbsent(NvapiStatus status) =>
+        status is NvapiStatus.NotSupported or NvapiStatus.NoImplementation or NvapiStatus.FunctionNotFound
+            or NvapiStatus.LibraryNotFound or NvapiStatus.ApiNotInitialized;
 
     private void RestoreAutoFans(List<KnobResult> results)
     {
@@ -1278,6 +1389,13 @@ public static class AppliedStateStore
     /// </summary>
     public const string ProbeLockPendingName = "v/f probe clock lock";
 
+    /// <summary>
+    /// The record name for a direct per-point V/F write (the V/F page's point
+    /// edits and flatten, <c>vfpoints --set/--flatten</c>) — what the next
+    /// launch's banner names when such a write was the last thing applied (R-13).
+    /// </summary>
+    public const string VfPointEditName = "per-point V/F edit";
+
     /// <summary>The prefix of the index-fallback key a card without a driver UUID is recorded under.</summary>
     public const string IndexKeyPrefix = "index:";
 
@@ -1288,6 +1406,10 @@ public static class AppliedStateStore
     /// <summary>
     /// One card's record. <paramref name="GpuUuid"/> is the key the record is
     /// filed under (a UUID or an index key; the JSON name predates index keys).
+    /// <paramref name="LockBoot"/> dates <paramref name="LockedCoreClockMHz"/> to
+    /// the OS boot it was written in (R-14); it is written with the lock and
+    /// only with it, so no later write of another field can re-date a lock from
+    /// an earlier boot. Null on records older than the stamp.
     /// </summary>
     public sealed record AppliedState(
         string ProfileName,
@@ -1298,18 +1420,29 @@ public static class AppliedStateStore
         string? FanMode = null,
         uint? FanDuty = null,
         string? GpuUuid = null,
-        bool ProbeLockPending = false);
+        bool ProbeLockPending = false,
+        BootStamp? LockBoot = null);
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly Lock Sync = new();
 
-    public static void RecordPending(string profileName, string key)
+    public static void RecordPending(string profileName, string key) => RecordUnclean(profileName, false, key);
+
+    /// <summary>
+    /// How a direct write that is not a profile apply ended — a per-point V/F
+    /// edit (R-13). Its pending mark went on record before the write; the
+    /// record stays unclean either way, like an apply's, until the session that
+    /// wrote it ends cleanly.
+    /// </summary>
+    public static void RecordDirectWrite(string name, bool succeeded, string key) => RecordUnclean(name, succeeded, key);
+
+    private static void RecordUnclean(string name, bool allSucceeded, string key)
     {
-        Mutate(key, state => (state ?? Empty(profileName)) with
+        Mutate(key, state => (state ?? Empty(name)) with
         {
-            ProfileName = profileName,
+            ProfileName = name,
             AppliedAt = DateTimeOffset.Now,
-            AllKnobsSucceeded = false,
+            AllKnobsSucceeded = allSucceeded,
             CleanShutdown = false,
             GpuUuid = key,
         });
@@ -1333,8 +1466,36 @@ public static class AppliedStateStore
             AllKnobsSucceeded = allSucceeded,
             CleanShutdown = false,
             LockedCoreClockMHz = lockWrittenByAfterglow,
+
+            // A lock recorded now is one this boot holds: written by this
+            // process, or adopted from a record LockFromThisBoot accepted.
+            LockBoot = lockWrittenByAfterglow is null ? null : BootIdentity.Now(),
             GpuUuid = key,
         });
+    }
+
+    /// <summary>
+    /// The clock lock on <paramref name="state"/> if the driver can still be
+    /// holding it — it was recorded in the OS boot running now — else null
+    /// (R-14). NVML locks do not survive a restart, and NVML has no getter to
+    /// ask. A record older than the boot stamp is judged by its AppliedAt: no
+    /// write leaves that earlier than the lock's own, so a record last written
+    /// before this boot is refused for certain; one written since is taken as
+    /// this boot's, which is as much as an unstamped record can say.
+    /// </summary>
+    public static uint? LockFromThisBoot(AppliedState state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        if (state.LockedCoreClockMHz is not uint lockMHz)
+        {
+            return null;
+        }
+
+        var now = BootIdentity.Now();
+        bool thisBoot = state.LockBoot is { } stamp
+            ? BootIdentity.IsSameBoot(stamp, now)
+            : BootIdentity.WasWrittenThisBoot(state.AppliedAt, now);
+        return thisBoot ? lockMHz : null;
     }
 
     /// <summary>Records that Afterglow took manual control of the fans (or released it with null).</summary>
@@ -1428,7 +1589,9 @@ public static class AppliedStateStore
     /// cleanly shut down. The probe flag is kept across the mark unless
     /// <paramref name="resolveProbeLocks"/> is true (the user dismissing the
     /// banner) — then it is cleared, and a record that held nothing else is
-    /// dropped so no orphan lingers.
+    /// dropped so no orphan lingers. Only a caller that answers for every card
+    /// may use this form; a command that wrote one card uses
+    /// <see cref="BeginCommand"/> or the keyed overload (R-15).
     /// </summary>
     public static void MarkCleanShutdown(bool resolveProbeLocks = false)
     {
@@ -1436,33 +1599,101 @@ public static class AppliedStateStore
         {
             foreach (string path in AllFiles())
             {
-                try
-                {
-                    if (ReadFile(path) is not { } state)
-                    {
-                        continue;
-                    }
-
-                    if (resolveProbeLocks && state.ProbeLockPending && IsProbeOnly(state))
-                    {
-                        File.Delete(path);
-                        continue;
-                    }
-
-                    bool clearFlag = resolveProbeLocks && state.ProbeLockPending;
-                    if (!state.CleanShutdown || clearFlag)
-                    {
-                        WriteFile(path, state with
-                        {
-                            CleanShutdown = true,
-                            ProbeLockPending = state.ProbeLockPending && !clearFlag,
-                        });
-                    }
-                }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                {
-                }
+                MarkClean(path, resolveProbeLocks);
             }
+        }
+    }
+
+    /// <summary>
+    /// Marks only the records filed under <paramref name="keys"/> as cleanly
+    /// shut down (R-15) — the cards the caller wrote and answers for. Another
+    /// card's record, and a legacy file no tuner has adopted, are left as they
+    /// are: they are another session's evidence, and marking them clean hid a
+    /// running app's unfinished tuning from the next launch's crash check.
+    /// </summary>
+    public static void MarkCleanShutdown(IEnumerable<string> keys, bool resolveProbeLocks = false)
+    {
+        ArgumentNullException.ThrowIfNull(keys);
+        lock (Sync)
+        {
+            foreach (string path in keys.Select(PathFor).Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                MarkClean(path, resolveProbeLocks);
+            }
+        }
+    }
+
+    /// <summary>
+    /// A one-shot command's claim on one card's record, taken BEFORE its first
+    /// write (R-15). The CLI holds no hardware-owner lock, so the app can be
+    /// running beside it with unfinished tuning of its own: a record the
+    /// command finds already unclean is that session's — or a crash nobody has
+    /// acknowledged yet — and the command's clean end must not erase it. The
+    /// command's own write then leaves the record unclean, which overstates
+    /// nothing: the evidence it found is still unresolved.
+    /// </summary>
+    public static CommandRecordClaim BeginCommand(string key)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        return new CommandRecordClaim(key, foundUnclean: Load(key) is { CleanShutdown: false });
+    }
+
+    /// <summary>See <see cref="BeginCommand"/>.</summary>
+    public sealed class CommandRecordClaim
+    {
+        private readonly string _key;
+        private readonly bool _foundUnclean;
+
+        internal CommandRecordClaim(string key, bool foundUnclean)
+        {
+            _key = key;
+            _foundUnclean = foundUnclean;
+        }
+
+        /// <summary>
+        /// The command completed: mark its card's record clean — unless the
+        /// record was already unclean when the claim was taken. No other card's
+        /// record is touched. Returns whether the mark was made.
+        /// </summary>
+        public bool MarkClean()
+        {
+            if (_foundUnclean)
+            {
+                return false;
+            }
+
+            MarkCleanShutdown([_key]);
+            return true;
+        }
+    }
+
+    private static void MarkClean(string path, bool resolveProbeLocks)
+    {
+        try
+        {
+            if (ReadFile(path) is not { } state)
+            {
+                return;
+            }
+
+            if (resolveProbeLocks && state.ProbeLockPending && IsProbeOnly(state))
+            {
+                File.Delete(path);
+                return;
+            }
+
+            bool clearFlag = resolveProbeLocks && state.ProbeLockPending;
+            if (!state.CleanShutdown || clearFlag)
+            {
+                WriteFile(path, state with
+                {
+                    CleanShutdown = true,
+                    ProbeLockPending = state.ProbeLockPending && !clearFlag,
+                });
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
         }
     }
 

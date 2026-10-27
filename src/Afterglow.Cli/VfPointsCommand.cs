@@ -101,7 +101,12 @@ internal static class VfPointsCommand
             case VfPointsAction.Set:
             {
                 Console.WriteLine($"GPU {gpu.Index} ({gpu.Name}):");
+
+                // The write goes on record as pending (R-13); a completed
+                // command vouches for its own card's record, as `set` does (R-15).
+                var claim = AppliedStateStore.BeginCommand(gpu.Tuner.RecordKey);
                 var result = gpu.Tuner.SetVfPointOffsets(request.Offsets!);
+                claim.MarkClean();
                 Console.WriteLine($"{result.Knob}: {(result.Applied ? "ok" : "FAILED")} — {result.Detail}");
                 return result.Applied ? 0 : 1;
             }
@@ -128,7 +133,9 @@ internal static class VfPointsCommand
                     (plan.LowerPointsCapped > 0
                         ? FormattableString.Invariant($", {plan.LowerPointsCapped} lower points brought down to the target.")
                         : "."));
+                var claim = AppliedStateStore.BeginCommand(gpu.Tuner.RecordKey); // as for --set (R-13, R-15)
                 var result = gpu.Tuner.SetVfPointOffsets(plan.OffsetsMHz);
+                claim.MarkClean();
                 Console.WriteLine($"{result.Knob}: {(result.Applied ? "ok" : "FAILED")} — {result.Detail}");
                 return result.Applied ? 0 : 1;
             }
