@@ -322,9 +322,10 @@ public partial class FansViewModel : ObservableObject, ILivePage
                         (uint)FixedDuty, _gpu?.Tuner.Capabilities.FanMinDutyPct ?? 30);
                     bool pinned = _fanControl.SetFixed((uint)FixedDuty);
                     StatusText = !pinned
-                        // A refusal can be partial (R-06: the per-fan fallback may
-                        // have moved some coolers), so don't promise nothing moved.
-                        ? $"The driver did not accept fixed {duty}% on every fan — some may have changed; Afterglow releases them at exit."
+                        // A refusal can be partial (R-06): the per-fan fallback hands
+                        // any fan that took the duty back to firmware control, and
+                        // puts it on record when even that is refused.
+                        ? $"The driver did not accept fixed {duty}%. Any fan that took it was handed back to automatic control (or, if the driver refused that too, is released at exit)."
                         : duty == (uint)FixedDuty
                             ? $"Fixed {duty}% applied to all fans."
                             : $"Fixed {duty}% applied (requested {FixedDuty:F0}%, raised to the hardware minimum spin duty).";

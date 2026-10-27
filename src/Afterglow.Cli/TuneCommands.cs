@@ -245,6 +245,7 @@ internal static class TuneCommands
         // a FAIL followed by a verified release and exit 1.
         var result = gpu.Tuner.Apply(profile, releaseLock: unlock);
         bool allOk = result.AllSucceeded;
+        bool fansLeftOnRecord = false;
         foreach (var knob in result.Results)
         {
             Console.WriteLine($"  {(knob.Applied ? "ok  " : "FAIL")} {knob.Knob,-18} {knob.Detail}");
@@ -260,7 +261,9 @@ internal static class TuneCommands
         else if (fan is not null && uint.TryParse(fan, out uint requestedDuty))
         {
             uint duty = TuningMath.NormalizeFixedFanDuty(requestedDuty, gpu.Tuner.Capabilities.FanMinDutyPct);
-            var rc = gpu.Tuner.SetAllFansRaw(duty);
+            var write = FanWriteResult.SetAllFans(gpu.Tuner, duty);
+            var rc = write.Result;
+            fansLeftOnRecord = !write.Succeeded && write.FansMayBeManual;
             string detail = duty == requestedDuty
                 ? $"{duty}% fixed"
                 : $"{duty}% fixed (requested {requestedDuty}%, raised to the hardware minimum spin duty)";
@@ -271,8 +274,13 @@ internal static class TuneCommands
         // A completed CLI apply is a clean session end — don't trip the app's
         // crash-recovery banner on its next start for it. The mark covers this
         // command's own card (see the claim above); it used to mark every
-        // card's record clean.
-        claim.MarkClean();
+        // card's record clean. Not after a refused fan write that may have left
+        // a fan pinned (R-06): that is on record as possibly manual, and
+        // marking it clean here would hide it from the next launch's banner.
+        if (!fansLeftOnRecord)
+        {
+            claim.MarkClean();
+        }
 
         if (!allOk)
         {

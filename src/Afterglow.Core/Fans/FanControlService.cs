@@ -126,14 +126,9 @@ public sealed class FanControlService : IDisposable
         _fanMinDutyPct = fanMinDutyPct;
     }
 
-    /// <summary>
-    /// The NVIDIA tuner says what a refused write left on the card; any other
-    /// tuner answers with one code (Arc: always NotSupported, nothing touched).
-    /// </summary>
+    /// <summary>See <see cref="FanWriteResult.SetAllFans"/>.</summary>
     private static Func<uint, FanWriteResult> AllFansWriter(IGpuTuner tuner) =>
-        tuner is GpuTuner nvidia
-            ? nvidia.SetAllFans
-            : duty => FanWriteResult.FromRaw(tuner.SetAllFansRaw(duty));
+        duty => FanWriteResult.SetAllFans(tuner, duty);
 
     /// <summary>
     /// True once the shutdown release gave up on this card's fan driver (a call
