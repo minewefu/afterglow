@@ -1,9 +1,9 @@
 namespace Afterglow.Core.Profiles;
 
 /// <summary>
-/// One passed stability mode for a profile, pinned to the exact offsets that
-/// were tested — editing the profile's clocks silently invalidates its
-/// certifications (they stay recorded but no longer count).
+/// One passed stability mode for a profile, pinned to the exact configuration
+/// that was tested — editing the profile's tuning or fan policy silently
+/// invalidates its certifications (they stay recorded but no longer count).
 /// </summary>
 public sealed record ProfileCertification
 {
@@ -21,6 +21,16 @@ public sealed record ProfileCertification
 
     /// <summary>Human-readable pass evidence ("9 transitions, 0 errors").</summary>
     public string Evidence { get; init; } = string.Empty;
+
+    /// <summary>
+    /// <see cref="ProfileFingerprint.TuningFingerprint"/> of the configuration
+    /// that passed (R-03). The two offsets above were all that tied a pass to
+    /// what it tested, so a lock, power limit, V/F table, fan policy or card
+    /// change kept the approval. Null on certifications from builds that predate
+    /// this field — those fall back to the offset comparison rather than
+    /// silently expiring.
+    /// </summary>
+    public string? TuningFingerprint { get; init; }
 
     /// <summary>
     /// Driver version the pass ran on, for the GPU it ran on. Offset stability
@@ -78,14 +88,23 @@ public static class CertificationModes
 
     /// <summary>
     /// A certification counts only when it was earned at the profile's current
-    /// offsets — the values that actually get applied — and on the driver
+    /// configuration — the values that actually get applied — and on the driver
     /// that is running now (an update changes clock management under the
     /// tuning, so old passes stop being evidence).
     /// </summary>
     public static bool IsValidFor(this ProfileCertification cert, TuningProfile profile) =>
+        cert.MatchesConfigurationOf(profile) && IsDriverCurrent(cert);
+
+    /// <summary>
+    /// The configuration half of <see cref="IsValidFor"/>: the pass was earned
+    /// by exactly this profile's configuration (its fingerprint, R-03), or — for
+    /// a certification recorded before fingerprints existed — at its offsets.
+    /// </summary>
+    public static bool MatchesConfigurationOf(this ProfileCertification cert, TuningProfile profile) =>
         cert.CoreOffsetMHz == profile.CoreOffsetMHz &&
         cert.MemOffsetMHz == profile.MemOffsetMHz &&
-        IsDriverCurrent(cert);
+        (cert.TuningFingerprint is not { } fingerprint ||
+         string.Equals(fingerprint, profile.TuningFingerprint(), StringComparison.Ordinal));
 
     private static bool IsDriverCurrent(ProfileCertification cert)
     {
@@ -99,14 +118,14 @@ public static class CertificationModes
             string.Equals(c.Mode, mode, StringComparison.OrdinalIgnoreCase) && c.IsValidFor(profile));
 
     /// <summary>
-    /// Latest certification for a mode that matches the profile's offsets,
-    /// even if it was earned on a different driver — lets the UI distinguish
-    /// "never certified" from "certified, but the driver changed".
+    /// Latest certification for a mode that matches the profile's configuration
+    /// (see <see cref="MatchesConfigurationOf"/>), even if it was earned on a
+    /// different driver — lets the UI distinguish "never certified" from
+    /// "certified, but the driver changed".
     /// </summary>
     public static ProfileCertification? OffsetMatchedCertification(this TuningProfile profile, string mode) =>
         profile.Certifications.LastOrDefault(c =>
-            string.Equals(c.Mode, mode, StringComparison.OrdinalIgnoreCase) &&
-            c.CoreOffsetMHz == profile.CoreOffsetMHz && c.MemOffsetMHz == profile.MemOffsetMHz);
+            string.Equals(c.Mode, mode, StringComparison.OrdinalIgnoreCase) && c.MatchesConfigurationOf(profile));
 
     public static bool IsFullyCertified(this TuningProfile profile) =>
         All.All(mode => profile.ValidCertification(mode) is not null);

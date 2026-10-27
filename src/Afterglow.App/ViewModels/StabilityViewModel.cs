@@ -535,6 +535,17 @@ public partial class StabilityViewModel : ObservableObject, IDisposable, ILivePa
             { ResultOffsetMHz: int result } =>
                 $"Finished — stable core offset: {(result >= 0 ? "+" : string.Empty)}{result} MHz",
 
+            // Another tuning write reached the card mid-run (R-02). The stepper
+            // scored nothing and wrote nothing after it, so the headline says
+            // where the card was left — and whose offset that is.
+            { Phase: "interrupted", StartOffsetRestored: false } =>
+                "Interrupted by another tuning change — no result. This GPU still reads " +
+                $"{(status.CurrentOffsetMHz >= 0 ? "+" : string.Empty)}{status.CurrentOffsetMHz} MHz, the offset " +
+                "this run applied; reset it from the Tuning page if that is not what you want.",
+            { Phase: "interrupted" } =>
+                "Interrupted by another tuning change — no result; the card was left as that change set it " +
+                $"({(status.CurrentOffsetMHz >= 0 ? "+" : string.Empty)}{status.CurrentOffsetMHz} MHz core offset).",
+
             // A failed or cancelled run's headline is where the card was LEFT.
             // The MCP payload was fixed to carry this; the app's status line is
             // its twin, and "failed" alone hid a card still at the crashed offset.

@@ -67,6 +67,20 @@ public class StepperShutdownTests
     }
 
     [Fact]
+    public void An_interrupted_run_is_settled_only_when_the_other_writer_moved_the_card()
+    {
+        // R-02: another writer reset the card mid-run and the stepper wrote
+        // nothing after it — the card is the other writer's, at +0.
+        Assert.True(StepperShutdown.LeftSettled(
+            wasRunning: true, unwound: true, Final("interrupted", 0), liveCoreOffsetMHz: 0));
+
+        // The other write did not move the core offset: the run's own +180 is
+        // still applied and nothing restored it.
+        Assert.False(StepperShutdown.LeftSettled(
+            wasRunning: true, unwound: true, Final("interrupted", 180, restored: false), liveCoreOffsetMHz: 180));
+    }
+
+    [Fact]
     public void A_run_that_finished_at_its_result_during_exit_is_a_clean_exit()
     {
         Assert.True(StepperShutdown.LeftSettled(wasRunning: true, unwound: true, Final("done", 120), liveCoreOffsetMHz: 120));

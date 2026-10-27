@@ -1,3 +1,4 @@
+using Afterglow.Core.Fans;
 using Afterglow.Core.Hardware;
 using Afterglow.Core.Profiles;
 
@@ -55,6 +56,12 @@ internal static class CertifyCommand
             return 2;
         }
 
+        if (FanPolicyRefusal(profile) is string fanRefusal)
+        {
+            Console.Error.WriteLine(fanRefusal);
+            return 2;
+        }
+
         using var manager = new GpuManager();
         if (manager.Gpus.Count == 0)
         {
@@ -75,7 +82,14 @@ internal static class CertifyCommand
             return 2;
         }
 
-        var certifier = new ProfileCertifier(gpu.Tuner, store, gpu.PciBusId, gpu.PciVendorId);
+        // The profile's fan policy is part of what gets certified (R-11), so the
+        // run goes through the card's fan control. This process cannot tell what
+        // the fans were doing before it started — no telemetry, no saved fan
+        // settings of its own — so afterwards they are handed back to firmware
+        // control, and the log says that is what happened.
+        using var fanService = new FanControlService(gpu.Tuner);
+        var certifier = new ProfileCertifier(gpu.Tuner, store, gpu.PciBusId, gpu.PciVendorId,
+            new CertificationFans(fanService, () => null));
         var done = new ManualResetEventSlim(false);
         int lastLogCount = 0;
         CertifierStatus? final = null;
@@ -117,4 +131,19 @@ internal static class CertifyCommand
 
         return final?.Passed == true ? 0 : 1;
     }
+
+    /// <summary>
+    /// Why this command cannot certify the profile as saved, or null. A fan
+    /// curve is software: it moves the fans only while something feeds it
+    /// temperatures, which the app's telemetry does and this one-shot command
+    /// does not. Burning a curve profile here would test its clocks under
+    /// whatever the fans happened to be doing — the different thermal
+    /// configuration certification must not stamp (R-11).
+    /// </summary>
+    internal static string? FanPolicyRefusal(TuningProfile profile) =>
+        profile.FanMode == FanMode.Curve
+            ? $"Profile '{profile.Name}' drives its fans with a software fan curve, which runs only while the " +
+              "Afterglow app is open. Certify it from the app's Profiles page; certifying it here would burn its " +
+              "clocks under a different fan configuration."
+            : null;
 }

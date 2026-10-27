@@ -16,6 +16,12 @@ namespace Afterglow.Core.Stress;
 /// 1.3 the stepper publishes where the card actually is when a restore is
 /// refused (the offset under test, with StartOffsetRestored false), so the
 /// readback alone would then agree with the status and pass.
+/// <para>
+/// A run interrupted by another writer (R-02) writes nothing afterwards, so it
+/// restores nothing either. It publishes the offset it found on the card, with
+/// StartOffsetRestored false when that is still the run's own offset — the same
+/// two rules then decide, with no case of their own.
+/// </para>
 /// </summary>
 public static class StepperShutdown
 {

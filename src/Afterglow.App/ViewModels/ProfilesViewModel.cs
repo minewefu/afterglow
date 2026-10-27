@@ -115,7 +115,14 @@ public partial class ProfilesViewModel : ObservableObject
         }
 
         var profile = Selected;
-        _certifier = new ProfileCertifier(gpu.Tuner, _services.Profiles, gpu.PciBusId, gpu.PciVendorId);
+
+        // The run happens under the profile's own fan policy, through this
+        // card's fan service, and puts back what that service was doing (R-11).
+        var fans = _services.FanControl.TryGetValue(gpu.Index, out var fanService)
+            ? new CertificationFans(fanService, () => Core.Tuning.GameSessionRestore.CaptureFans(
+                fanService.Mode, fanService.CommandedDuty, _services.FanSettingsFor(gpu)))
+            : null;
+        _certifier = new ProfileCertifier(gpu.Tuner, _services.Profiles, gpu.PciBusId, gpu.PciVendorId, fans);
         _certifier.StatusChanged += status =>
             System.Windows.Application.Current?.Dispatcher.BeginInvoke(() => OnCertifierStatus(status));
         CertifyRunning = true;
@@ -130,6 +137,12 @@ public partial class ProfilesViewModel : ObservableObject
             ? $"[{status.ModeIndex + 1}/{status.ModeCount}] {status.Phase} — {status.ModeElapsed:mm\\:ss} / {status.ModeDuration:mm\\:ss}"
             : status.Passed == true
                 ? "Certified across all four modes — marked stable."
+                : status.Phase == "interrupted"
+                    ? "Interrupted — the configuration under test, or the saved profile, changed during the run. " +
+                      "Nothing more was stamped or written to the GPU. See the log."
+                : status.FailedMode == "fans"
+                    ? "Failed before the run: the profile's fan policy could not be applied, so nothing else was. " +
+                      "See the log."
                 : status.FailedMode is { } failed
                     // Say what happened, not what was intended. This line
                     // asserted a reset for every failure — including the "apply"
