@@ -11,7 +11,8 @@ namespace Afterglow.Core.Diagnostics;
 /// exactly one card, and an unlabelled report was read as describing the whole
 /// machine.
 /// <paramref name="TuningApplied"/> covers every recorded knob — offsets, clock
-/// lock and V/F-point edits (R-43) — and <paramref name="Cause"/> keeps an
+/// lock and V/F-point edits (R-43) — and a tuning write the recording ended
+/// inside; <paramref name="Cause"/> keeps an
 /// unknown cause apart from a confirmed reset or power loss (R-44).
 /// <paramref name="RecordedGpuId"/> is the card identity the recording itself
 /// names, when it names one.
@@ -114,7 +115,7 @@ public static class CrashForensics
             end,
             verdict.Headline,
             text,
-            TuningApplied: evidence.TuningApplied,
+            TuningApplied: evidence.TuningImplicated, // a card that died mid-write names the report
             Cause: verdict.Cause,
             RecordedGpuId: session.Tuning?.GpuId);
     }
@@ -148,6 +149,10 @@ public static class CrashForensics
             VfPointsEdited = tuning?.VfPointsEdited ?? 0,
             VfPointMaxOffsetMHz = tuning?.VfPointMaxOffsetMHz ?? 0,
             TuningFullyRecorded = tuning?.FullyRecorded ?? false,
+
+            // A write whose start reached the disk and whose return did not:
+            // the session died inside it (R-43 follow-up).
+            WriteInProgress = session.WriteInProgress,
 
             // How stale the reset evidence is. Without this the classifier
             // asserted an instant reset "under sustained load" from records that
@@ -468,6 +473,13 @@ public static class CrashForensics
         if (tuning?.GpuId is { } recordedGpu)
         {
             sb.Append("  Tuning recorded for: ").AppendLine(recordedGpu);
+        }
+
+        // The tuning above is what was in force BEFORE this write.
+        if (e.WriteInProgress is { } write)
+        {
+            sb.Append("  Unfinished tuning write: ").Append(write.What)
+              .AppendLine(" (started; its return was never recorded — the settings above are from before it)");
         }
 
         sb.AppendLine();

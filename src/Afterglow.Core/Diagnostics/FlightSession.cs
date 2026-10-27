@@ -44,6 +44,14 @@ public sealed class FlightSession
 
     public IReadOnlyList<string> Markers { get; private init; } = [];
 
+    /// <summary>
+    /// The tuning write the recording ends inside: its start is on record and
+    /// its end is not, so the session died between the driver call and its
+    /// return — or within the moment it took to record the return. The latest
+    /// such write when there are several. Null when every write finished.
+    /// </summary>
+    public FlightWrite? WriteInProgress { get; private init; }
+
     /// <summary>True when the parsed lines include an "offsets" marker.</summary>
     internal bool HasOffsetsMarker { get; private init; }
 
@@ -149,6 +157,9 @@ public sealed class FlightSession
         FlightTuning? tuning = null;
         DateTimeOffset? endedAt = null;
 
+        // In start order; a start that a segment roll re-stated is the same write.
+        var openWrites = new List<FlightWrite>();
+
         foreach (string line in lines)
         {
             if (string.IsNullOrWhiteSpace(line))
@@ -182,6 +193,15 @@ public sealed class FlightSession
                 else if (text.StartsWith("offsets ", StringComparison.Ordinal))
                 {
                     tuning = FlightTuning.Parse(text, tuning);
+                }
+                else if (FlightWrite.TryParseStart(text, out var started))
+                {
+                    openWrites.RemoveAll(w => w.Id == started.Id);
+                    openWrites.Add(started);
+                }
+                else if (FlightWrite.TryParseEnd(text, out long ended))
+                {
+                    openWrites.RemoveAll(w => w.Id == ended);
                 }
 
                 continue;
@@ -220,6 +240,9 @@ public sealed class FlightSession
             Tuning = tuning,
             Markers = markers,
             HasOffsetsMarker = tuning is not null,
+
+            // A clean end closes every write: Afterglow exited on purpose.
+            WriteInProgress = clean || openWrites.Count == 0 ? null : openWrites[^1],
         };
     }
 

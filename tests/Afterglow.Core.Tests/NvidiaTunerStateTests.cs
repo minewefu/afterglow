@@ -23,9 +23,13 @@ public sealed class NvidiaTunerStateTests : IDisposable
 
     private readonly StoreScope _store = new();
 
-    // Two hours into a boot, at a fixed wall-clock moment.
-    private (DateTimeOffset UtcNow, long UptimeMs) _clock =
-        (new DateTimeOffset(2026, 10, 27, 12, 0, 0, TimeSpan.Zero), (long)TimeSpan.FromHours(2).TotalMilliseconds);
+    // Two hours into a boot, at a fixed wall-clock moment, not slept since it
+    // began. The interrupt time runs with the uptime (both include sleep).
+    private BootClockReading _clock = new(
+        new DateTimeOffset(2026, 10, 27, 12, 0, 0, TimeSpan.Zero),
+        (long)TimeSpan.FromHours(2).TotalMilliseconds,
+        InterruptTime: TimeSpan.FromHours(2).Ticks,
+        LastWakeInterruptTime: 0);
 
     public NvidiaTunerStateTests() => BootIdentity.Clock = () => _clock;
 
@@ -38,10 +42,29 @@ public sealed class NvidiaTunerStateTests : IDisposable
     private static GpuTuner Tuner(FakeNvidiaDriver driver) => new(driver, driver, driver.Uuid);
 
     private void Elapse(TimeSpan span) =>
-        _clock = (_clock.UtcNow + span, _clock.UptimeMs + (long)span.TotalMilliseconds);
+        _clock = _clock with
+        {
+            UtcNow = _clock.UtcNow + span,
+            UptimeMs = _clock.UptimeMs + (long)span.TotalMilliseconds,
+            InterruptTime = _clock.InterruptTime + span.Ticks,
+        };
 
     private void Restart(TimeSpan downtime, TimeSpan upSince) =>
-        _clock = (_clock.UtcNow + downtime + upSince, (long)upSince.TotalMilliseconds);
+        _clock = new BootClockReading(
+            _clock.UtcNow + downtime + upSince, (long)upSince.TotalMilliseconds, upSince.Ticks, LastWakeInterruptTime: 0);
+
+    /// <summary>
+    /// Sleep or hibernate — Fast Startup's "shut down" included — for
+    /// <paramref name="asleep"/>, then wake. The uptime and the interrupt time
+    /// both run on through it (that is why R-14 counts it as the same boot);
+    /// Windows dates the wake in interrupt time.
+    /// </summary>
+    private void SleepAndWake(TimeSpan asleep)
+    {
+        Elapse(asleep);
+        _clock = _clock with { LastWakeInterruptTime = _clock.InterruptTime };
+        Elapse(TimeSpan.FromSeconds(20)); // logged in and launched again
+    }
 
     /// <summary>What `set` and MCP apply_tuning build when the core offset is not given: the current values carried forward.</summary>
     private static TuningProfile CarriedForward(GpuTuner tuner, string name, double? powerW = null)
@@ -256,7 +279,7 @@ public sealed class NvidiaTunerStateTests : IDisposable
         // RTC skew, a dead CMOS battery): dated by the wall clock alone, the
         // new boot would seem to predate the lock.
         Restart(downtime: TimeSpan.FromSeconds(30), upSince: TimeSpan.FromMinutes(10));
-        _clock = (_clock.UtcNow - TimeSpan.FromHours(3), _clock.UptimeMs);
+        _clock = _clock with { UtcNow = _clock.UtcNow - TimeSpan.FromHours(3) };
 
         Assert.Null(Tuner(new FakeNvidiaDriver(before.Uuid)).AppliedLockMHz);
     }
@@ -304,6 +327,139 @@ public sealed class NvidiaTunerStateTests : IDisposable
         AppliedStateStore.WriteLegacyRecord(new AppliedStateStore.AppliedState(
             "Daily OC", bootedAt + TimeSpan.FromMinutes(30), true, true, 2700));
         Assert.Equal(2700u, Tuner(driver).AppliedLockMHz);
+    }
+
+    // --- R-14 follow-up: sleep and hibernation since the lock ------------------
+
+    [Fact]
+    public void A_lock_applied_before_a_hibernate_is_not_adopted_but_is_not_hidden()
+    {
+        var driver = new FakeNvidiaDriver();
+        Assert.True(Tuner(driver).Apply(new TuningProfile { Name = "lock", LockedCoreClockMHz = 2500 }).AllSucceeded);
+        AppliedStateStore.MarkCleanShutdown();
+
+        // Fast Startup's "shut down" overnight: the uptime ran on, so R-14
+        // alone called this the same session and adopted the lock.
+        SleepAndWake(TimeSpan.FromHours(9));
+        var tuner = Tuner(driver);
+
+        Assert.Null(tuner.AppliedLockMHz);
+        Assert.Null(tuner.ReadCurrent().LockedCoreClockMHz);
+        Assert.Equal(2500u, tuner.UnconfirmedLockMHz);
+        Assert.Contains("2500 MHz clock lock was applied before the system last slept or hibernated",
+            GpuTuner.DescribeUnconfirmedLock(tuner.UnconfirmedLockMHz!.Value), StringComparison.Ordinal);
+
+        // Still on record, still dated before the wake: the next launch says the same.
+        Assert.Equal(2500u, AppliedStateStore.Load(driver.Uuid)!.LockedCoreClockMHz);
+        Assert.Equal(2500u, Tuner(driver).UnconfirmedLockMHz);
+    }
+
+    [Fact]
+    public void A_memory_only_set_after_a_wake_releases_the_lock_visibly_instead_of_dropping_it()
+    {
+        var driver = new FakeNvidiaDriver();
+        Assert.True(Tuner(driver).Apply(new TuningProfile { Name = "lock", LockedCoreClockMHz = 2500 }).AllSucceeded);
+        SleepAndWake(TimeSpan.FromMinutes(40));
+        var tuner = Tuner(driver);
+
+        // `set --mem 500`: the lock is carried forward as the applied one — none.
+        var result = tuner.Apply(CarriedForward(tuner, "cli") with { MemOffsetMHz = 500 });
+
+        Assert.True(result.AllSucceeded, result.Summary);
+        Assert.Contains("before the system last slept", Assert.Single(result.Results, r => r.Knob == "clock lock").Detail,
+            StringComparison.Ordinal);
+        Assert.Null(driver.LockedClocks); // the driver kept it in this model; it is gone now either way
+        Assert.Null(tuner.UnconfirmedLockMHz);
+        Assert.Null(AppliedStateStore.Load(driver.Uuid)!.LockedCoreClockMHz);
+    }
+
+    [Fact]
+    public void A_release_the_driver_refuses_keeps_the_record_dated_before_the_wake()
+    {
+        var driver = new FakeNvidiaDriver();
+        Assert.True(Tuner(driver).Apply(new TuningProfile { Name = "lock", LockedCoreClockMHz = 2500 }).AllSucceeded);
+        SleepAndWake(TimeSpan.FromMinutes(40));
+        var tuner = Tuner(driver);
+        driver.ResetLockedClocksRc = NvmlReturn.NoPermission;
+
+        var result = tuner.Apply(CarriedForward(tuner, "cli") with { MemOffsetMHz = 500 });
+
+        Assert.False(result.AllSucceeded);
+        Assert.Equal(2500u, tuner.UnconfirmedLockMHz);
+
+        // Re-dated by this apply, the next launch would adopt it as in force.
+        Elapse(TimeSpan.FromMinutes(5));
+        var next = Tuner(driver);
+        Assert.Null(next.AppliedLockMHz);
+        Assert.Equal(2500u, next.UnconfirmedLockMHz);
+    }
+
+    [Fact]
+    public void Writing_the_lock_again_after_a_wake_makes_it_the_applied_lock()
+    {
+        var driver = new FakeNvidiaDriver();
+        Assert.True(Tuner(driver).Apply(new TuningProfile { Name = "lock", LockedCoreClockMHz = 2500 }).AllSucceeded);
+        SleepAndWake(TimeSpan.FromHours(1));
+        var tuner = Tuner(driver);
+
+        Assert.True(tuner.Apply(new TuningProfile { Name = "lock", LockedCoreClockMHz = 2500 }).AllSucceeded);
+
+        Assert.Equal(2500u, tuner.AppliedLockMHz);
+        Assert.Null(tuner.UnconfirmedLockMHz);
+        Elapse(TimeSpan.FromHours(1));
+        Assert.Equal(2500u, Tuner(driver).AppliedLockMHz); // written after the wake: adopted
+    }
+
+    [Fact]
+    public void A_process_left_open_across_a_sleep_stops_claiming_its_lock()
+    {
+        var driver = new FakeNvidiaDriver();
+        var tuner = Tuner(driver);
+        Assert.True(tuner.Apply(new TuningProfile { Name = "lock", LockedCoreClockMHz = 2500 }).AllSucceeded);
+        Assert.Equal(2500u, tuner.AppliedLockMHz);
+
+        SleepAndWake(TimeSpan.FromMinutes(15));
+
+        Assert.Null(tuner.AppliedLockMHz);
+        Assert.Equal(2500u, tuner.UnconfirmedLockMHz);
+    }
+
+    [Fact]
+    public void A_sleep_before_the_lock_was_written_does_not_count()
+    {
+        SleepAndWake(TimeSpan.FromHours(3));
+        var driver = new FakeNvidiaDriver();
+        Assert.True(Tuner(driver).Apply(new TuningProfile { Name = "lock", LockedCoreClockMHz = 2500 }).AllSucceeded);
+        Elapse(TimeSpan.FromHours(2));
+
+        var tuner = Tuner(driver);
+        Assert.Equal(2500u, tuner.AppliedLockMHz);
+        Assert.Null(tuner.UnconfirmedLockMHz);
+    }
+
+    [Fact]
+    public void An_unreadable_wake_time_adopts_as_before()
+    {
+        var driver = new FakeNvidiaDriver();
+        Assert.True(Tuner(driver).Apply(new TuningProfile { Name = "lock", LockedCoreClockMHz = 2500 }).AllSucceeded);
+        SleepAndWake(TimeSpan.FromHours(1));
+        _clock = _clock with { LastWakeInterruptTime = null };
+
+        Assert.Equal(2500u, Tuner(driver).AppliedLockMHz);
+    }
+
+    [Fact]
+    public void A_lock_from_a_build_that_stamped_no_interrupt_time_is_judged_by_its_uptime()
+    {
+        // R-14's stamp carried the uptime only; the wake is compared with it.
+        var driver = new FakeNvidiaDriver();
+        AppliedStateStore.WriteLegacyRecord(new AppliedStateStore.AppliedState(
+            "Daily OC", _clock.UtcNow, true, true, 2700,
+            LockBoot: new BootStamp(_clock.UtcNow, _clock.UptimeMs)));
+
+        SleepAndWake(TimeSpan.FromHours(1));
+
+        Assert.Equal(2700u, Tuner(driver).UnconfirmedLockMHz);
     }
 
     // --- R-08: a failed fan release is a failure ---------------------------------

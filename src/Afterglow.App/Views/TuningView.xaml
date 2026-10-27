@@ -131,6 +131,8 @@
                                 <StackPanel Margin="0,0,24,0">
                                     <TextBlock Text="{Binding ClockLockTitle}" Style="{StaticResource SectionTitle}" />
                                     <TextBlock Text="{Binding ClockLockDescription}" Style="{StaticResource SectionDescription}" />
+                                    <TextBlock Text="{Binding ClockLockNote}" Style="{StaticResource Footnote}" Margin="0,8,0,0"
+                                               Visibility="{Binding ClockLockNote, Converter={x:Static views:Converters.NonEmptyToVisibility}}" />
                                 </StackPanel>
                                 <CheckBox Grid.Column="1" Style="{StaticResource ToggleSwitch}" VerticalAlignment="Center"
                                           AutomationProperties.Name="Clock lock"

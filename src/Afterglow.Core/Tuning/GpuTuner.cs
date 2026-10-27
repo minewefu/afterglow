@@ -141,6 +141,16 @@ public sealed class GpuTuner : IGpuTuner
     private readonly Lock _applyLock = new();
     private uint? _appliedLockMHz;
 
+    /// <summary>
+    /// When <see cref="_appliedLockMHz"/> was written — or adopted, which is
+    /// only done for a lock no sleep has followed — so a sleep after it can be
+    /// detected while this process keeps running (see <see cref="DemoteLockAfterSleep"/>).
+    /// </summary>
+    private BootStamp? _appliedLockStamp;
+
+    /// <summary>See <see cref="IGpuTuner.UnconfirmedLockMHz"/>.</summary>
+    private uint? _unconfirmedLockMHz;
+
     public TuningCapabilities Capabilities { get; }
 
     private readonly string? _gpuUuid;
@@ -171,13 +181,34 @@ public sealed class GpuTuner : IGpuTuner
         // the shadow made `get` report it and a later partial `set` write it
         // back. The record keeps it, still dated to its boot, so every later
         // read refuses it the same way until an apply replaces it.
+        //
+        // A lock applied in this boot but before the system last slept or
+        // hibernated — Fast Startup's "shut down" included — is neither (R-14
+        // follow-up): whether the driver kept it is unmeasured, so it is not
+        // adopted silently. It stays on record, undated, and the front-ends
+        // say it may or may not still be in force; a lock-less apply releases
+        // it, and any lock write replaces it.
         if (AppliedStateStore.LoadOrAdoptLegacy(_recordKey, _gpuUuid) is { } state)
         {
-            _appliedLockMHz = AppliedStateStore.LockFromThisBoot(state);
-            if (state.LockedCoreClockMHz is uint stale && _appliedLockMHz is null)
+            var (standing, recorded) = AppliedStateStore.ClassifyLock(state);
+            switch (standing)
             {
-                Log.Info($"The {stale} MHz clock lock on record for this GPU was applied before the last " +
-                         "restart; the driver does not keep a lock across one, so it is not tracked as applied.");
+                case AppliedStateStore.RecordedLockStanding.ThisBoot:
+                    _appliedLockMHz = recorded;
+                    _appliedLockStamp = BootIdentity.Now();
+                    break;
+                case AppliedStateStore.RecordedLockStanding.BeforeSleep:
+                    _unconfirmedLockMHz = recorded;
+                    Log.Info($"The {recorded} MHz clock lock on record for this GPU was applied before the system " +
+                             "last slept or hibernated; whether the driver kept it is unknown, so it is not tracked " +
+                             "as applied.");
+                    break;
+                case AppliedStateStore.RecordedLockStanding.EarlierBoot:
+                    Log.Info($"The {recorded} MHz clock lock on record for this GPU was applied before the last " +
+                             "restart; the driver does not keep a lock across one, so it is not tracked as applied.");
+                    break;
+                default:
+                    break;
             }
         }
     }
@@ -201,6 +232,12 @@ public sealed class GpuTuner : IGpuTuner
     /// </summary>
     public event Action<IGpuTuner>? StateWritten;
 
+    /// <inheritdoc />
+    public event Action<IGpuTuner, TuningWrite>? WriteStarting;
+
+    /// <inheritdoc />
+    public event Action<IGpuTuner, TuningWrite>? WriteFinished;
+
     private T Notify<T>(T result)
     {
         WriteNotification.Raise(StateWritten, this);
@@ -208,9 +245,18 @@ public sealed class GpuTuner : IGpuTuner
     }
 
     /// <summary>
+    /// Announces a driver write (see <see cref="IGpuTuner.WriteStarting"/>);
+    /// call under <see cref="_applyLock"/>, after validation, immediately
+    /// before the first driver call, and dispose when the last one returned.
+    /// </summary>
+    private TuningWriteScope BeginWrite(TuningWriteKind kind, string what) =>
+        TuningWriteScope.Begin(this, WriteStarting, WriteFinished, kind, what);
+
+    /// <summary>
     /// The clock lock Afterglow last applied (null = none). NVML has no getter
     /// for locked clocks, so this is Afterglow-tracked state, persisted across
-    /// restarts via the applied-state file.
+    /// restarts via the applied-state file. A lock the system has slept or
+    /// hibernated since is not reported here any more (see <see cref="UnconfirmedLockMHz"/>).
     /// </summary>
     public uint? AppliedLockMHz
     {
@@ -218,10 +264,58 @@ public sealed class GpuTuner : IGpuTuner
         {
             lock (_applyLock)
             {
+                DemoteLockAfterSleep();
                 return _appliedLockMHz;
             }
         }
     }
+
+    /// <inheritdoc />
+    public uint? UnconfirmedLockMHz
+    {
+        get
+        {
+            lock (_applyLock)
+            {
+                DemoteLockAfterSleep();
+                return _unconfirmedLockMHz;
+            }
+        }
+    }
+
+    /// <summary>
+    /// A process that stays open across a sleep holds the same unknown a new
+    /// process adopting the record would: the lock it wrote may not have
+    /// survived the resume. Once the system has slept since the lock was
+    /// written, the lock moves from applied to unconfirmed — the same rule the
+    /// constructor applies to the record. An unreadable wake time moves
+    /// nothing: there is no evidence of a sleep, and this process wrote the lock.
+    /// Call under <see cref="_applyLock"/>; costs one power-information query
+    /// while a lock is applied, none otherwise.
+    /// </summary>
+    private void DemoteLockAfterSleep()
+    {
+        if (_appliedLockMHz is not uint lockMHz || _appliedLockStamp is not { } stamp
+            || BootIdentity.SleptSince(stamp, BootIdentity.Read()) != true)
+        {
+            return;
+        }
+
+        _appliedLockMHz = null;
+        _appliedLockStamp = null;
+        _unconfirmedLockMHz = lockMHz;
+        Log.Info($"The system slept or hibernated after the {lockMHz} MHz clock lock was applied; whether the " +
+                 "driver kept it is unknown, so it is no longer tracked as applied.");
+    }
+
+    /// <summary>
+    /// The sentence the front-ends show for <see cref="IGpuTuner.UnconfirmedLockMHz"/>:
+    /// the CLI's <c>get</c> and the Tuning page say the same thing.
+    /// </summary>
+    public static string DescribeUnconfirmedLock(uint lockMHz) =>
+        $"A {lockMHz} MHz clock lock was applied before the system last slept or hibernated. The driver may or " +
+        "may not still hold it, and it can't be read back, so it is not shown as applied. Apply it again, or " +
+        "release it, to be sure.";
 
     private TuningCapabilities DiscoverCapabilities()
     {
@@ -383,6 +477,11 @@ public sealed class GpuTuner : IGpuTuner
                 return new ApplyResult(false, results);
             }
 
+            // A lock the system has slept since is settled before the lock knob
+            // reads the shadow, so a lock-less profile releases it as one.
+            DemoteLockAfterSleep();
+
+            using var write = BeginWrite(TuningWriteKind.Apply, TuningWrite.DescribeApply(profile));
             AppliedStateStore.RecordPending(profile.Name, _recordKey);
 
             ApplyPowerLimit(profile, results);
@@ -411,7 +510,12 @@ public sealed class GpuTuner : IGpuTuner
             ApplyVfPointOffsets(profile, results, reconcileVfPoints);
 
             bool all = results.All(r => r.Applied);
-            AppliedStateStore.Record(profile, all, AppliedLockMHz, _recordKey); // never the probe's pin
+
+            // Never the probe's pin. An unconfirmed lock still standing (its
+            // release was refused) keeps its record and its pre-sleep date:
+            // re-dated now, the next launch would adopt it as in force.
+            AppliedStateStore.Record(profile, all, AppliedLockMHz, _recordKey,
+                keepRecordedLock: _unconfirmedLockMHz is not null);
             Log.Info($"Apply '{profile.Name}': {(all ? "ok" : "PARTIAL")} — {string.Join("; ", results.Select(r => $"{r.Knob}={(r.Applied ? "ok" : "fail")}"))}");
             return new ApplyResult(all, results);
         }
@@ -431,6 +535,8 @@ public sealed class GpuTuner : IGpuTuner
     private void ClearShadow()
     {
         _appliedLockMHz = null;
+        _appliedLockStamp = null;
+        _unconfirmedLockMHz = null; // a verified release settles it either way
         _probePinMHz = null;
     }
 
@@ -469,6 +575,7 @@ public sealed class GpuTuner : IGpuTuner
         lock (_applyLock)
         {
             var results = new List<KnobResult>();
+            using var write = BeginWrite(TuningWriteKind.Reset, "resetting the card to driver defaults");
 
             if (Capabilities.SupportsCoreOffset)
             {
@@ -638,9 +745,15 @@ public sealed class GpuTuner : IGpuTuner
         KnobResult result;
         lock (_applyLock)
         {
-            result = !Capabilities.SupportsVfPoints || _nvapi is null
-                ? KnobResult.Fail("V/F points", "per-point curve control is not supported on this GPU/driver")
-                : ClearVfPointsKeepingCoreOffset();
+            if (!Capabilities.SupportsVfPoints || _nvapi is null)
+            {
+                result = KnobResult.Fail("V/F points", "per-point curve control is not supported on this GPU/driver");
+            }
+            else
+            {
+                using var write = BeginWrite(TuningWriteKind.VfPoints, "clearing the per-point V/F offsets");
+                result = ClearVfPointsKeepingCoreOffset();
+            }
         }
 
         return Notify(result);
@@ -900,6 +1013,10 @@ public sealed class GpuTuner : IGpuTuner
             return KnobResult.Fail(knob, refusal);
         }
 
+        // A profile apply has announced itself already; a direct edit is its own write.
+        using var write = recordDirectWrite
+            ? BeginWrite(TuningWriteKind.VfPoints, TuningWrite.DescribeVfPoints(offsetsMHzByIndex))
+            : default;
         if (recordDirectWrite)
         {
             AppliedStateStore.RecordPending(AppliedStateStore.VfPointEditName, _recordKey);
@@ -1095,8 +1212,13 @@ public sealed class GpuTuner : IGpuTuner
         // NVML has no getter, so a lock another process wrote is invisible
         // here, and the explicit request must yield exactly one verdict
         // rather than a front-end's reconciliation of two.
+        // A lock applied before the system slept may still be on the card; a
+        // profile without one means no lock, so it is released the same way.
         string? releaseDetail = _probePinMHz is uint pin ? $"released the V/F probe's {pin} MHz pin"
             : _appliedLockMHz is uint was ? $"removed (was {RangeLockFloorMHz}..{was} MHz)"
+            : _unconfirmedLockMHz is uint maybe
+                ? $"released the {RangeLockFloorMHz}..{maybe} MHz lock applied before the system last slept " +
+                  "(the driver may already have dropped it)"
             : releaseLock ? "released (explicit)"
             : null;
         if (releaseDetail is not null)
@@ -1111,7 +1233,17 @@ public sealed class GpuTuner : IGpuTuner
     /// path must use this, not <see cref="LockClockForProbe"/>: restoring a
     /// range lock as an exact pin would hold the GPU at full clocks at idle.
     /// </summary>
-    public NvmlReturn RestoreTuningLock(uint lockMHz) => Notify(RestoreTuningLockCore(lockMHz));
+    public NvmlReturn RestoreTuningLock(uint lockMHz)
+    {
+        NvmlReturn rc;
+        lock (_applyLock)
+        {
+            using var write = BeginWrite(TuningWriteKind.Lock, $"setting a {RangeLockFloorMHz}..{lockMHz} MHz clock lock");
+            rc = RestoreTuningLockCore(lockMHz);
+        }
+
+        return Notify(rc);
+    }
 
     /// <summary>
     /// The write behind <see cref="RestoreTuningLock"/>, without the notification:
@@ -1126,6 +1258,8 @@ public sealed class GpuTuner : IGpuTuner
             if (rc == NvmlReturn.Success)
             {
                 _appliedLockMHz = lockMHz;
+                _appliedLockStamp = BootIdentity.Now();
+                _unconfirmedLockMHz = null; // replaced by a lock this process wrote
                 _probePinMHz = null;
                 ResolveProbeRecord(); // a range lock this process wrote supersedes any pin
             }
@@ -1147,12 +1281,14 @@ public sealed class GpuTuner : IGpuTuner
             // the record is what the next launch reads. A refused write has
             // pinned nothing, so a record THIS call created is resolved again
             // at once — one an earlier session left is still true and stays.
+            using var write = BeginWrite(TuningWriteKind.ProbePin, $"pinning the core clock at {clockMHz} MHz for the V/F probe");
             bool alreadyPending = AppliedStateStore.RecordProbeLockPending(_recordKey);
             rc = _nvml.TrySetGpuLockedClocks(clockMHz, clockMHz);
             if (rc == NvmlReturn.Success)
             {
                 _probePinMHz = clockMHz;
                 _probePinLanded = true;
+                _unconfirmedLockMHz = null; // whatever lock survived the sleep, the pin replaced it
             }
             else if (!alreadyPending)
             {
@@ -1191,6 +1327,8 @@ public sealed class GpuTuner : IGpuTuner
             // which must keep the displaced lock apart, matches this.
             if (_appliedLockMHz is uint restore)
             {
+                using var restoreWrite = BeginWrite(TuningWriteKind.Lock,
+                    $"restoring the {RangeLockFloorMHz}..{restore} MHz clock lock after the V/F probe");
                 var rc = RestoreTuningLockCore(restore);
                 return rc == NvmlReturn.Success
                     ? KnobResult.Ok("clock lock", $"restored the {restore} MHz lock")
@@ -1202,6 +1340,7 @@ public sealed class GpuTuner : IGpuTuner
                 return KnobResult.Ok("clock lock", "nothing was pinned");
             }
 
+            using var write = BeginWrite(TuningWriteKind.Lock, "releasing the V/F probe's clock pin");
             var release = ReleaseLockCore();
             if (release != NvmlReturn.Success)
             {
@@ -1223,6 +1362,7 @@ public sealed class GpuTuner : IGpuTuner
         NvmlReturn rc;
         lock (_applyLock)
         {
+            using var write = BeginWrite(TuningWriteKind.Lock, "releasing the clock lock");
             rc = ReleaseLockCore();
         }
 
@@ -1514,45 +1654,96 @@ public static class AppliedStateStore
     /// to adopt it forever; a pin persisted here is restored as a range lock
     /// the user never set.
     /// </summary>
-    public static void Record(TuningProfile profile, bool allSucceeded, uint? lockWrittenByAfterglow, string key)
+    /// <param name="keepRecordedLock">
+    /// With no lock written: leave the record's lock and its date as they are,
+    /// rather than clearing them — for a lock applied before the system slept
+    /// that this apply could not release (see <see cref="ClassifyLock"/>).
+    /// Re-dating it now would make the next launch adopt it as in force.
+    /// </param>
+    public static void Record(
+        TuningProfile profile, bool allSucceeded, uint? lockWrittenByAfterglow, string key, bool keepRecordedLock = false)
     {
-        Mutate(key, state => (state ?? Empty(profile.Name)) with
+        Mutate(key, state =>
         {
-            ProfileName = profile.Name,
-            AppliedAt = DateTimeOffset.Now,
-            AllKnobsSucceeded = allSucceeded,
-            CleanShutdown = false,
-            LockedCoreClockMHz = lockWrittenByAfterglow,
+            bool keep = keepRecordedLock && lockWrittenByAfterglow is null;
+            return (state ?? Empty(profile.Name)) with
+            {
+                ProfileName = profile.Name,
+                AppliedAt = DateTimeOffset.Now,
+                AllKnobsSucceeded = allSucceeded,
+                CleanShutdown = false,
+                LockedCoreClockMHz = keep ? state?.LockedCoreClockMHz : lockWrittenByAfterglow,
 
-            // A lock recorded now is one this boot holds: written by this
-            // process, or adopted from a record LockFromThisBoot accepted.
-            LockBoot = lockWrittenByAfterglow is null ? null : BootIdentity.Now(),
-            GpuUuid = key,
+                // A lock recorded now is one this boot holds, with no sleep
+                // since: written by this process, or adopted from a record
+                // ClassifyLock found to be this boot's and not slept through.
+                LockBoot = keep ? state?.LockBoot
+                    : lockWrittenByAfterglow is null ? null
+                    : BootIdentity.Now(),
+                GpuUuid = key,
+            };
         });
     }
 
+    /// <summary>How a recorded clock lock stands against the running boot and the system's sleeps.</summary>
+    public enum RecordedLockStanding
+    {
+        /// <summary>The record holds no lock.</summary>
+        None,
+
+        /// <summary>Written in this boot, with no sleep or hibernation since that Windows reports: adopted.</summary>
+        ThisBoot,
+
+        /// <summary>Written in this boot, before the system last slept or hibernated: may or may not be in force.</summary>
+        BeforeSleep,
+
+        /// <summary>Written before the last restart: the driver dropped it.</summary>
+        EarlierBoot,
+    }
+
     /// <summary>
-    /// The clock lock on <paramref name="state"/> if the driver can still be
-    /// holding it — it was recorded in the OS boot running now — else null
-    /// (R-14). NVML locks do not survive a restart, and NVML has no getter to
-    /// ask. A record older than the boot stamp is judged by its AppliedAt: no
-    /// write leaves that earlier than the lock's own, so a record last written
-    /// before this boot is refused for certain; one written since is taken as
-    /// this boot's, which is as much as an unstamped record can say.
+    /// Whether the driver can still be holding the clock lock on
+    /// <paramref name="state"/>. NVML locks do not survive a restart (R-14),
+    /// and NVML has no getter to ask: a lock recorded in an earlier boot is
+    /// <see cref="RecordedLockStanding.EarlierBoot"/>. One recorded in this
+    /// boot but before the system last slept or hibernated — Fast Startup
+    /// included — is <see cref="RecordedLockStanding.BeforeSleep"/>: whether
+    /// the driver puts a lock back on resume is unmeasured, so it is neither
+    /// adopted nor dismissed. A record older than the boot stamp is judged by
+    /// its AppliedAt: no write leaves that earlier than the lock's own, so a
+    /// record last written before this boot (or before the last wake) is
+    /// refused for certain; one written since is taken as this boot's, which
+    /// is as much as an unstamped record can say. When Windows will not say
+    /// when it last woke, the lock is taken as this boot's, as before the
+    /// question was asked.
     /// </summary>
-    public static uint? LockFromThisBoot(AppliedState state)
+    public static (RecordedLockStanding Standing, uint? LockMHz) ClassifyLock(AppliedState state)
     {
         ArgumentNullException.ThrowIfNull(state);
         if (state.LockedCoreClockMHz is not uint lockMHz)
         {
-            return null;
+            return (RecordedLockStanding.None, null);
         }
 
-        var now = BootIdentity.Now();
-        bool thisBoot = state.LockBoot is { } stamp
-            ? BootIdentity.IsSameBoot(stamp, now)
-            : BootIdentity.WasWrittenThisBoot(state.AppliedAt, now);
-        return thisBoot ? lockMHz : null;
+        var reading = BootIdentity.Read();
+        var now = new BootStamp(reading.UtcNow, reading.UptimeMs, reading.InterruptTime);
+        bool thisBoot;
+        bool? slept;
+        if (state.LockBoot is { } stamp)
+        {
+            thisBoot = BootIdentity.IsSameBoot(stamp, now);
+            slept = thisBoot ? BootIdentity.SleptSince(stamp, reading) : null;
+        }
+        else
+        {
+            thisBoot = BootIdentity.WasWrittenThisBoot(state.AppliedAt, now);
+            slept = thisBoot ? BootIdentity.SleptSince(state.AppliedAt, reading) : null;
+        }
+
+        var standing = !thisBoot ? RecordedLockStanding.EarlierBoot
+            : slept == true ? RecordedLockStanding.BeforeSleep
+            : RecordedLockStanding.ThisBoot;
+        return (standing, lockMHz);
     }
 
     /// <summary>Records that Afterglow took manual control of the fans (or released it with null).</summary>
@@ -1908,7 +2099,13 @@ public static class AppliedStateStore
     /// "INTEL-0000:00:02.0-…" or "index:0" → stable suffix). Vendor prefixes are
     /// stripped so the 12-character budget is spent on the identifying digits.
     /// </summary>
-    public static string PathFor(string key)
+    public static string PathFor(string key) =>
+        Path.Combine(
+            Path.GetDirectoryName(AppPaths.AppliedStateFile)!,
+            $"applied-state-{FileSuffixFor(key)}.json");
+
+    /// <summary>The per-card file-name suffix <see cref="PathFor"/> uses; other per-card stores name their files the same way.</summary>
+    internal static string FileSuffixFor(string key)
     {
         var keep = new string(key.Where(char.IsLetterOrDigit).ToArray());
         if (keep.StartsWith("INTEL", StringComparison.OrdinalIgnoreCase))
@@ -1920,10 +2117,7 @@ public static class AppliedStateStore
             keep = keep[3..];
         }
 
-        string suffix = keep.Length > 0 ? keep[..Math.Min(12, keep.Length)].ToLowerInvariant() : "unknown";
-        return Path.Combine(
-            Path.GetDirectoryName(AppPaths.AppliedStateFile)!,
-            $"applied-state-{suffix}.json");
+        return keep.Length > 0 ? keep[..Math.Min(12, keep.Length)].ToLowerInvariant() : "unknown";
     }
 
     private static IEnumerable<string> PerGpuFiles()
@@ -2022,6 +2216,29 @@ public static class WriteNotification
             {
                 // Deliberately broad: a display refresh may fail any way it
                 // likes; the write already happened and must not be undone by it.
+                Log.Error("A tuning-write subscriber failed; the write itself is unaffected.", ex);
+            }
+        }
+    }
+
+    /// <summary>The two-argument form, for <see cref="IGpuTuner.WriteStarting"/> and <see cref="IGpuTuner.WriteFinished"/>.</summary>
+    public static void Raise<T1, T2>(Action<T1, T2>? handlers, T1 sender, T2 argument)
+    {
+        if (handlers is null)
+        {
+            return;
+        }
+
+        foreach (var handler in handlers.GetInvocationList().Cast<Action<T1, T2>>())
+        {
+            try
+            {
+                handler(sender, argument);
+            }
+            catch (Exception ex)
+            {
+                // As above: the write must neither be stopped nor undone by a
+                // subscriber — the flight recorder included.
                 Log.Error("A tuning-write subscriber failed; the write itself is unaffected.", ex);
             }
         }

@@ -215,6 +215,75 @@ public class CrashClassifierTests
 
         Assert.Null(verdict);
     }
+
+    // --- a session that ended inside a tuning write (R-43 follow-up) ------------
+
+    private static readonly FlightWrite LockWrite =
+        new(4, Tuning.TuningWriteKind.Lock, "setting a 210..2400 MHz clock lock");
+
+    [Fact]
+    public void Every_signature_inside_a_write_names_the_write_and_keeps_its_cause()
+    {
+        var inWrite = Base() with { CoreOffsetMHz = 100, WriteInProgress = LockWrite };
+
+        var tdr = CrashClassifier.Classify(inWrite with { TdrLogged = true });
+        var whea = CrashClassifier.Classify(inWrite with { WheaErrorsLogged = true });
+        var bsod = CrashClassifier.Classify(inWrite with { BugcheckCode = 0x133 });
+        var reset = CrashClassifier.Classify(inWrite);
+
+        Assert.Equal(CrashCause.DriverReset, tdr!.Cause);
+        Assert.Equal(CrashCause.HardwareError, whea!.Cause);
+        Assert.Equal(CrashCause.Bluescreen, bsod!.Cause);
+        Assert.Contains("0x133", bsod.Headline, StringComparison.Ordinal);
+        Assert.Equal(CrashCause.HardReset, reset!.Cause);
+        foreach (var verdict in new[] { tdr, whea, bsod, reset })
+        {
+            Assert.EndsWith("while Afterglow was setting a 210..2400 MHz clock lock.", verdict.Headline, StringComparison.Ordinal);
+            Assert.Contains("In force before the write: +100 MHz core", verdict.Interpretation, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void An_unreadable_event_log_still_says_the_recording_ends_inside_a_write_and_blames_nothing()
+    {
+        var verdict = CrashClassifier.Classify(new CrashEvidence
+        {
+            SessionEnd = DateTimeOffset.UtcNow,
+            EventLogAvailable = false,
+            WriteInProgress = LockWrite,
+        });
+
+        Assert.NotNull(verdict);
+        Assert.Equal(CrashCause.Unknown, verdict.Cause);
+        Assert.Contains("ends inside a tuning write", verdict.Interpretation, StringComparison.Ordinal);
+        Assert.Contains("neither implicates nor clears", verdict.Interpretation, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Stale_reset_records_stay_hedged_even_inside_a_write()
+    {
+        var verdict = CrashClassifier.Classify(Base() with
+        {
+            ResetLoggedAfter = TimeSpan.FromHours(6),
+            WriteInProgress = LockWrite,
+        });
+
+        Assert.NotNull(verdict);
+        Assert.Equal(CrashCause.Uncorrelated, verdict.Cause);
+        Assert.Contains("ends inside a tuning write", verdict.Interpretation, StringComparison.Ordinal);
+        Assert.Contains("Re-run the stability tests", verdict.Recommendation, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void A_write_in_flight_with_windows_still_running_is_not_a_crash()
+    {
+        // Afterglow ended mid-write while Windows logged nothing: no crash to report.
+        Assert.Null(CrashClassifier.Classify(new CrashEvidence
+        {
+            SessionEnd = DateTimeOffset.UtcNow,
+            WriteInProgress = LockWrite,
+        }));
+    }
 }
 
 public class FlightSessionTests

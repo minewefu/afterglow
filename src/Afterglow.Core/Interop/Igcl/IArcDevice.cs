@@ -25,4 +25,10 @@ public interface IArcDevice
     CtlResult TryGetOcPowerLimitV2(out double limit);
 
     CtlResult TrySetOcPowerLimitV2(double limit);
+
+    /// <summary>
+    /// The driver version, dotted; null when unknown. The tuner keys the
+    /// factory range it verified on it (see <see cref="Tuning.ReleasedRangeStore"/>).
+    /// </summary>
+    string? DriverVersion => null;
 }

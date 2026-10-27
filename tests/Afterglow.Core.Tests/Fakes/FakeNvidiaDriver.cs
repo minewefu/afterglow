@@ -57,6 +57,15 @@ internal sealed class FakeNvidiaDriver : INvmlTuningDevice, INvapiTuningGpu
     /// <summary>Runs inside the per-point write, before it lands — to see what is on record at that moment.</summary>
     public Action? OnVfpWrite { get; set; }
 
+    /// <summary>Runs inside every clock-offset write, before it lands: a driver call the machine dies in.</summary>
+    public Action? OnClockOffsetWrite { get; set; }
+
+    /// <summary>Runs inside every clock-lock write (pin or range), before it lands.</summary>
+    public Action? OnLockWrite { get; set; }
+
+    /// <summary>The answer to a lock release; a refusal leaves the lock in force.</summary>
+    public NvmlReturn ResetLockedClocksRc { get; set; } = NvmlReturn.Success;
+
     public NvmlReturn CoreOffsetReadRc { get; set; } = NvmlReturn.Success;
 
     public NvapiStatus VfpWriteRc { get; set; } = NvapiStatus.Ok;
@@ -108,6 +117,7 @@ internal sealed class FakeNvidiaDriver : INvmlTuningDevice, INvapiTuningGpu
 
     public NvmlReturn TrySetClockOffset(NvmlClockType type, int offsetMHz)
     {
+        OnClockOffsetWrite?.Invoke();
         if (type == NvmlClockType.Graphics)
         {
             CoreOffsetWrites++;
@@ -194,6 +204,7 @@ internal sealed class FakeNvidiaDriver : INvmlTuningDevice, INvapiTuningGpu
 
     public NvmlReturn TrySetGpuLockedClocks(uint minMhz, uint maxMhz)
     {
+        OnLockWrite?.Invoke();
         LockWrites.Add((minMhz, maxMhz));
         LockedClocks = (minMhz, maxMhz);
         return NvmlReturn.Success;
@@ -201,6 +212,11 @@ internal sealed class FakeNvidiaDriver : INvmlTuningDevice, INvapiTuningGpu
 
     public NvmlReturn TryResetGpuLockedClocks()
     {
+        if (ResetLockedClocksRc != NvmlReturn.Success)
+        {
+            return ResetLockedClocksRc;
+        }
+
         LockedClocks = null;
         return NvmlReturn.Success;
     }

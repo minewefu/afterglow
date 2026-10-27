@@ -90,6 +90,10 @@ internal static class TuneCommands
         var (core, mem, power, boost, lockMHz) = gpu.Tuner.ReadCurrent();
         var caps = gpu.Tuner.Capabilities;
 
+        // A lock applied before the system slept or hibernated: not shown as
+        // applied, and not hidden either — the driver may still hold it.
+        uint? unconfirmedLock = lockMHz is null ? gpu.Tuner.UnconfirmedLockMHz : null;
+
         // A knob this device does not expose has no "current value": printing 0
         // there is the same fabrication the power-limit slot was made nullable
         // to avoid, and it directly contradicts what `caps` says one line over.
@@ -107,6 +111,7 @@ internal static class TuneCommands
                 power_limit_w = power,
                 voltage_boost_pct = boost,
                 lock_clock_mhz = lockMHz,
+                lock_clock_unconfirmed_mhz = unconfirmedLock,
             }, JsonOut));
             return 0;
         }
@@ -126,7 +131,9 @@ internal static class TuneCommands
             ? gpu.Vendor == GpuVendor.Intel
                 ? $"  Clock lock      clamped to {lc} MHz (read back from the driver)"
                 : $"  Clock lock      210..{lc} MHz (Afterglow-tracked; the driver has no getter)"
-            : "  Clock lock      none");
+            : unconfirmedLock is uint maybe
+                ? $"  Clock lock      unconfirmed: {GpuTuner.DescribeUnconfirmedLock(maybe)}"
+                : "  Clock lock      none");
 
         return 0;
     }

@@ -17,11 +17,28 @@ namespace Afterglow.Core.Diagnostics;
 /// fixed wall-clock period, for writes this process cannot see: the CLI, the MCP
 /// server and other tools.
 /// </para>
+/// <para>
+/// <see cref="IGpuTuner.StateWritten"/> comes only after a write returns, so a
+/// crash or TDR the write itself caused left the recording on the tuning before
+/// it. Each write is therefore also recorded as it starts — on
+/// <see cref="IGpuTuner.WriteStarting"/>, synchronously and flushed to disk
+/// before the driver call goes ahead — and as it finishes. A recording that
+/// ends between the two ended inside that write, and the crash report says so
+/// (see <see cref="FlightSession.WriteInProgress"/>).
+/// </para>
 /// </summary>
 public sealed class TuningFlightSampler
 {
     /// <summary>How often the state is re-read for writes made outside this process.</summary>
     public static readonly TimeSpan PollPeriod = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// The longest a tuning write waits for its start marker to reach the
+    /// disk. A flush takes about a millisecond on an SSD; a disk that has not
+    /// answered in this long is not going to save the evidence in time anyway,
+    /// and the write is the user's.
+    /// </summary>
+    public static readonly TimeSpan DurableMarkerTimeout = TimeSpan.FromMilliseconds(250);
 
     private readonly IGpuTuner _tuner;
     private readonly FlightRecorder _recorder;
@@ -53,7 +70,19 @@ public sealed class TuningFlightSampler
         // tuner is in use there anyway, so the read is never later than the
         // write it follows.
         _tuner.StateWritten += _ => Capture();
+
+        // No driver reads here: the start runs under the tuner's lock, just
+        // before the driver call, and waits only for the disk; the end is
+        // flushed by the writer thread without waiting. A write's end marker
+        // can lag its return by that flush, so a crash in the moment right
+        // after a write may still be attributed to it — never one after a
+        // later write, or after the recording moved on.
+        _tuner.WriteStarting += (_, write) => RecordWriteStarting(write);
+        _tuner.WriteFinished += (_, write) => _recorder.MarkerFlushed(FlightWrite.EndMarkerText(write.Id));
     }
+
+    private void RecordWriteStarting(TuningWrite write) =>
+        _ = _recorder.MarkerDurable(FlightWrite.StartMarkerText(write), DurableMarkerTimeout);
 
     /// <summary>
     /// Called with each telemetry snapshot's time; re-reads the state when

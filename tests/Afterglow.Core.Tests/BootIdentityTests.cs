@@ -66,12 +66,76 @@ public class BootIdentityTests
     public void The_stamp_round_trips_through_the_record_json()
     {
         var state = new AppliedStateStore.AppliedState(
-            "Gaming", Noon, true, true, 2500, LockBoot: At(Noon, TimeSpan.FromHours(2)));
+            "Gaming", Noon, true, true, 2500,
+            LockBoot: At(Noon, TimeSpan.FromHours(2)) with { InterruptTime = TimeSpan.FromHours(2).Ticks });
 
         string json = System.Text.Json.JsonSerializer.Serialize(state);
         var back = System.Text.Json.JsonSerializer.Deserialize<AppliedStateStore.AppliedState>(json);
 
         Assert.Equal(state, back);
         Assert.DoesNotContain("BootedAtUtc", json, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void A_stamp_written_before_the_interrupt_time_was_recorded_still_reads()
+    {
+        const string r14 = """{"WrittenAtUtc":"2026-10-27T12:00:00+00:00","UptimeMs":7200000}""";
+
+        var stamp = System.Text.Json.JsonSerializer.Deserialize<BootStamp>(r14);
+
+        Assert.NotNull(stamp);
+        Assert.Null(stamp!.InterruptTime);
+        Assert.Equal(7_200_000, stamp.UptimeMs);
+    }
+
+    // --- sleep and hibernation since a write (R-14 follow-up) -------------------
+
+    private static BootClockReading Reading(TimeSpan uptime, long? lastWake, DateTimeOffset? utc = null) =>
+        new(utc ?? Noon, (long)uptime.TotalMilliseconds, uptime.Ticks, lastWake);
+
+    [Fact]
+    public void A_wake_after_the_write_is_a_sleep_since_it()
+    {
+        var written = At(Noon, TimeSpan.FromHours(2)) with { InterruptTime = TimeSpan.FromHours(2).Ticks };
+
+        Assert.True(BootIdentity.SleptSince(written, Reading(TimeSpan.FromHours(12), TimeSpan.FromHours(11).Ticks)));
+        Assert.False(BootIdentity.SleptSince(written, Reading(TimeSpan.FromHours(12), TimeSpan.FromHours(1).Ticks)));
+        Assert.False(BootIdentity.SleptSince(written, Reading(TimeSpan.FromHours(12), lastWake: 0))); // never slept
+        Assert.Null(BootIdentity.SleptSince(written, Reading(TimeSpan.FromHours(12), lastWake: null))); // unreadable
+    }
+
+    [Fact]
+    public void A_stamp_without_an_interrupt_time_is_compared_by_its_uptime()
+    {
+        var written = At(Noon, TimeSpan.FromHours(2)); // as R-14 wrote it
+
+        Assert.True(BootIdentity.SleptSince(written, Reading(TimeSpan.FromHours(5), TimeSpan.FromHours(3).Ticks)));
+        Assert.False(BootIdentity.SleptSince(written, Reading(TimeSpan.FromHours(5), TimeSpan.FromHours(1).Ticks)));
+    }
+
+    [Fact]
+    public void A_wall_clock_only_record_is_dated_against_the_wake_on_the_wall_clock()
+    {
+        // Now is noon, 5 h into the boot; the system woke 2 h ago (3 h in).
+        var now = Reading(TimeSpan.FromHours(5), TimeSpan.FromHours(3).Ticks, Noon);
+
+        Assert.True(BootIdentity.SleptSince(Noon - TimeSpan.FromHours(3), now));
+        Assert.False(BootIdentity.SleptSince(Noon - TimeSpan.FromHours(1), now));
+        Assert.False(BootIdentity.SleptSince(Noon - TimeSpan.FromHours(3), now with { LastWakeInterruptTime = 0 }));
+    }
+
+    [Fact]
+    public void The_system_clocks_answer_on_this_windows()
+    {
+        // Read-only OS queries (QueryInterruptTime, CallNtPowerInformation
+        // LastWakeTime): proves the entry points bind, and that the interrupt
+        // time runs with the tick count, as the uptime fallback assumes.
+        var reading = BootIdentity.SystemClock();
+
+        Assert.NotNull(reading.InterruptTime);
+        Assert.NotNull(reading.LastWakeInterruptTime);
+        long tickCountAsInterrupt = reading.UptimeMs * TimeSpan.TicksPerMillisecond;
+        Assert.InRange(reading.InterruptTime!.Value - tickCountAsInterrupt, -TimeSpan.TicksPerSecond, TimeSpan.TicksPerSecond);
+        Assert.InRange(reading.LastWakeInterruptTime!.Value, 0, reading.InterruptTime.Value);
     }
 }

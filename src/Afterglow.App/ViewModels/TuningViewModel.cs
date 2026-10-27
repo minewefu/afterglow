@@ -47,6 +47,14 @@ public partial class TuningViewModel : ObservableObject
     [ObservableProperty]
     public partial string ApplyResultText { get; set; } = string.Empty;
 
+    /// <summary>
+    /// Set when the card's record holds a clock lock applied before the system
+    /// last slept or hibernated: not shown as applied, but it may still be on
+    /// the card (see <see cref="IGpuTuner.UnconfirmedLockMHz"/>). Empty otherwise.
+    /// </summary>
+    [ObservableProperty]
+    public partial string ClockLockNote { get; set; } = string.Empty;
+
     [ObservableProperty]
     public partial bool LastApplyFailed { get; set; }
 
@@ -285,6 +293,9 @@ public partial class TuningViewModel : ObservableObject
         // reads as a lock there, and ticking the box with it made the next
         // Apply write the ceiling back as a clamp with written provenance.
         uint? appliedLock = _gpu.Tuner.AppliedLockMHz;
+        ClockLockNote = appliedLock is null && _gpu.Tuner.UnconfirmedLockMHz is uint maybe
+            ? GpuTuner.DescribeUnconfirmedLock(maybe)
+            : string.Empty;
         LockEnabled = appliedLock is not null;
         if (appliedLock is uint lc)
         {

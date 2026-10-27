@@ -1,4 +1,5 @@
 using System.Globalization;
+using Afterglow.Core.Tuning;
 
 namespace Afterglow.Core.Diagnostics;
 
@@ -52,6 +53,18 @@ public sealed record CrashEvidence
     /// <summary>True when any recorded knob was off stock.</summary>
     public bool TuningApplied =>
         CoreOffsetMHz != 0 || MemOffsetMHz != 0 || LockedCoreClockMHz is not null || VfPointsEdited > 0;
+
+    /// <summary>
+    /// The tuning write the recording ends inside: its start reached the disk
+    /// before the driver call, and its return was never recorded (see
+    /// <see cref="FlightSession.WriteInProgress"/>). The offsets, lock and V/F
+    /// points above are then the tuning in force BEFORE that write. Null when
+    /// every write finished, or the recording predates write markers.
+    /// </summary>
+    public FlightWrite? WriteInProgress { get; init; }
+
+    /// <summary>True when Afterglow's tuning is in play: applied, or being written when the recording ended.</summary>
+    public bool TuningImplicated => TuningApplied || WriteInProgress is not null;
 
     /// <summary>True when a core offset or an edited V/F point raised the core clock.</summary>
     public bool CoreClockRaised => CoreOffsetMHz > 0 || (VfPointsEdited > 0 && VfPointMaxOffsetMHz > 0);
@@ -127,6 +140,14 @@ public static class CrashClassifier
 
         string tuning = DescribeTuning(e);
 
+        // The recording ends inside a tuning write. Said in every verdict that
+        // reaches the hedged branches below; the signature branches get a
+        // verdict of their own (DuringWrite).
+        string inWrite = e.WriteInProgress is { } open
+            ? $"The recording ends inside a tuning write: Afterglow had started {open.What}, and the write's " +
+              "return was never recorded. "
+            : string.Empty;
+
         // No signature because the log could not be READ (R-44). The session
         // still ended uncleanly, so silence could hide a real crash — but
         // falling through to the hard-reset branches below asserted an instant
@@ -139,13 +160,13 @@ public static class CrashClassifier
                 "Cause unknown — the Windows event log could not be read.",
                 "Afterglow's recording stopped without a clean shutdown, but the Windows System event log could " +
                 "not be read, so there is no evidence of what happened: a hard reset, a bluescreen, a driver reset " +
-                $"and Afterglow simply being ended abnormally all look the same from here. {tuning}" +
-                (e.TuningApplied
+                $"and Afterglow simply being ended abnormally all look the same from here. {inWrite}{tuning}" +
+                (e.TuningImplicated
                     ? "Without crash evidence, this neither implicates nor clears that tuning."
                     : "Without crash evidence, nothing here points at a cause."),
                 "Open Event Viewer → Windows Logs → System around the time the session ended and look for " +
                 "Kernel-Power 41, EventLog 6008, Display 4101 or WHEA-Logger entries." +
-                (e.TuningApplied
+                (e.TuningImplicated
                     ? " If the machine did crash, treat these settings as unproven and re-run the stability " +
                       "tests before relying on them."
                     : string.Empty),
@@ -172,8 +193,8 @@ public static class CrashClassifier
                 $"{char.ToUpperInvariant(what[0])}{what[1..]} {gap} after this session ended.",
                 "Afterglow's recording stopped without a clean shutdown, and Windows logged this at the next " +
                 $"boot — but {gap} later, so it cannot be tied to what the GPU was doing when this session " +
-                "ended. It may be this crash, or something unrelated since.",
-                e.TuningApplied
+                $"ended. It may be this crash, or something unrelated since. {inWrite}".TrimEnd(),
+                e.TuningImplicated
                     ? "Re-run the stability tests at these settings to establish whether they are actually " +
                       "implicated; do not treat this as proof either way."
                     : e.TuningFullyRecorded
@@ -182,6 +203,16 @@ public static class CrashClassifier
                           "lock or per-point V/F edits were applied, so Afterglow's settings are unlikely to be " +
                           "implicated.",
                 CrashCause.Uncorrelated);
+        }
+
+        // A crash inside a write is that write's, whatever signature it left
+        // (R-43 follow-up). The recording names it only because its start was
+        // flushed to disk before the driver call; a write that returned has
+        // its end on record and never reaches here, however soon the crash
+        // followed it.
+        if (e.WriteInProgress is { } write)
+        {
+            return DuringWrite(e, write);
         }
 
         if (e.TdrLogged)
@@ -366,11 +397,77 @@ public static class CrashClassifier
     }
 
     /// <summary>
+    /// The verdict for a session that died inside a tuning write. The
+    /// signature still names the kind of failure; the write names what was
+    /// happening when it struck, and the recorded tuning is what was in force
+    /// before it — not what the write was putting on the card.
+    /// </summary>
+    private static CrashVerdict DuringWrite(CrashEvidence e, FlightWrite write)
+    {
+        var (signature, happened, cause) = e switch
+        {
+            { TdrLogged: true } => (
+                "The GPU driver reset (TDR)",
+                "the display driver stopped responding and was reset",
+                CrashCause.DriverReset),
+            { WheaErrorsLogged: true } => (
+                "A hardware error (WHEA) was logged",
+                "Windows recorded a machine-level hardware error",
+                CrashCause.HardwareError),
+            { BugcheckCode: int code and > 0 } => (
+                $"Windows bluescreened (bugcheck 0x{code.ToString("X", CultureInfo.InvariantCulture)})",
+                "the kernel crashed and wrote a bugcheck",
+                CrashCause.Bluescreen),
+            _ => (
+                "Hard reset",
+                "the machine lost power or reset instantly, with no bluescreen or driver fault logged",
+                CrashCause.HardReset),
+        };
+
+        string storm = e.DisplayDriverEventCount >= 3
+            ? $" The display driver logged {e.DisplayDriverEventCount.ToString(CultureInfo.InvariantCulture)} " +
+              "errors in the final seconds."
+            : string.Empty;
+
+        string recommendation = write.Kind switch
+        {
+            TuningWriteKind.Reset =>
+                "The write was returning the card to driver defaults, so the tuning in force before it is the " +
+                "likelier suspect, along with the driver: keep the card at stock until those settings have been " +
+                "re-validated with the stability tests. If crashes continue at stock, suspect the driver version or " +
+                "the card.",
+            TuningWriteKind.ProbePin =>
+                "The V/F probe holds the core at one exact clock per step, so this points at that clock and its " +
+                "voltage, or at the driver's handling of an exact pin: don't plan from this probe's data, and run " +
+                "the probe again only after a restart. If it recurs, try another driver version.",
+            TuningWriteKind.Lock =>
+                "A clock-lock change caps the clock rather than raising it, so this points more at the driver's " +
+                "handling of the change than at the clock itself. Make the change again only after a restart; if it " +
+                "recurs, try another driver version.",
+            _ =>
+                "Treat the values being written as unproven: apply them in smaller steps, one setting at a time, and " +
+                "re-validate each with the stability tests before relying on it. If it recurs at stock, suspect the " +
+                "driver version or the card.",
+        };
+
+        return new CrashVerdict(
+            $"{signature} while Afterglow was {write.What}.",
+            $"The recording ends inside a tuning write: Afterglow had started {write.What} — recorded on disk " +
+            $"before the driver call — and the write's return was never recorded, so {happened} during that write " +
+            $"or within moments of it.{storm} A failure inside a write points first at the write: the values it " +
+            "was putting on the card, or the driver's handling of the change itself, rather than the tuning in " +
+            $"force before it. {DescribeTuning(e, beforeWrite: true)}".TrimEnd(),
+            recommendation,
+            cause);
+    }
+
+    /// <summary>
     /// The "Applied at the time" sentence: offsets, clock lock and V/F-point
     /// edits as recorded, and — when the recording could not say — that it
-    /// could not, rather than "nothing".
+    /// could not, rather than "nothing". With <paramref name="beforeWrite"/>,
+    /// the same facts stated as the tuning in force before an unfinished write.
     /// </summary>
-    private static string DescribeTuning(CrashEvidence e)
+    private static string DescribeTuning(CrashEvidence e, bool beforeWrite = false)
     {
         var parts = new List<string>(3);
         if (e.CoreOffsetMHz != 0 || e.MemOffsetMHz != 0)
@@ -391,11 +488,13 @@ public static class CrashClassifier
 
         if (parts.Count > 0)
         {
-            return $"Applied at the time: {string.Join(", ", parts)}. ";
+            return beforeWrite
+                ? $"In force before the write: {string.Join(", ", parts)}. "
+                : $"Applied at the time: {string.Join(", ", parts)}. ";
         }
 
         return e.TuningFullyRecorded
-            ? "No tuning was applied at the time. "
+            ? beforeWrite ? "No tuning was in force before the write. " : "No tuning was applied at the time. "
             : "The recording shows no clock offsets and does not say whether a clock lock or per-point V/F " +
               "edits were applied. ";
     }

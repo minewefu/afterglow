@@ -48,6 +48,16 @@ internal sealed class FakeArcDevice : IArcDevice
         set => _max = value;
     }
 
+    /// <summary>
+    /// The driver version the device reports. Null by default — like a driver
+    /// that does not fill the field — so the tuner records no factory range and
+    /// every scenario that builds several tuners still starts each from nothing.
+    /// </summary>
+    public string? DriverVersion { get; init; }
+
+    /// <summary>Runs inside every range write (min, max as requested), before it lands: a driver call the machine dies in.</summary>
+    public Action<double, double>? OnWrite { get; set; }
+
     /// <summary>Result of every ordinary range write. A refusal models a non-elevated session.</summary>
     public CtlResult WriteResult { get; set; } = CtlResult.Success;
 
@@ -110,6 +120,7 @@ internal sealed class FakeArcDevice : IArcDevice
             return CtlResult.ErrorInvalidArgument;
         }
 
+        OnWrite?.Invoke(minMhz, maxMhz);
         Writes.Add((minMhz, maxMhz));
         bool restore = minMhz < 0 && maxMhz < 0;
         var rc = restore ? RestoreResult : WriteResult;
