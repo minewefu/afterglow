@@ -46,6 +46,20 @@
 - `tools/ui-check.ps1` drives the new Settings section, with the Spanish layout
   installed. `tools/keyboard-layout-survey.cs` reproduces the layout survey.
 
+### The stepper and certification logs keep the whole run ([#7](https://github.com/minewefu/afterglow/issues/7))
+
+- **The whole run, scrollable.** "Find my stable overclock" and "Certify a
+  profile" used to show only the last 14 and 10 lines. Both now keep the whole
+  run in a box that grows to about 14 lines and then scrolls.
+- **It follows the newest line unless you've scrolled up.** At the bottom, new
+  lines come into view; scrolled up to read, you stay where you are.
+- **The text can be selected and copied**, and a **Copy log** button copies all
+  of it.
+- **A run keeps its newest 5,000 lines.** Real runs are far shorter: about 130
+  lines for a full stepper sweep, about 30 for a certification.
+- **A progress update no longer copies the whole log.** The box adds new lines
+  instead of laying everything out again.
+
 ### Fixes from the 27 October full review
 
 A full-version review reported 49 defects; all 49 were confirmed in the code.
@@ -75,6 +89,8 @@ A full-version review reported 49 defects; all 49 were confirmed in the code.
   - Stable marks are left alone, so a profile you marked stable still applies
     at startup. Certify it again to restore the "Certified" badge.
   - Stepper results from earlier builds are worth re-running too.
+  - A stable startup profile carrying such passes says so, in the startup notice
+    and under the Settings picker.
 - **A certification or stepper run now owns the card's tuning while it runs.**
   The Tuning page, a hotkey, a game rule, automation, a reset or another program
   can all change the tuning. If any of them does, the run stops as
@@ -116,6 +132,14 @@ A full-version review reported 49 defects; all 49 were confirmed in the code.
   per-setting answer.
 - **A failed fan hand-back is reported as a failure.** If the GPU dropped off the
   bus, Afterglow used to claim the fans were released.
+- **Exit can't hang on a driver that stops answering.** Releasing the fans waits
+  at most 8 seconds per card. After that the session isn't counted as clean, so
+  the next launch warns.
+- **A partly refused fan command no longer leaves a fan pinned or stopped.** The
+  fans that took it are handed back to firmware control. If the driver refuses
+  that too, it's recorded at once, so a crash still warns on the next launch.
+- **A fan command refused outright no longer causes a false "didn't shut down
+  cleanly" warning.**
 
 #### NVIDIA tuning and crash recovery
 - **A power- or fan-only change no longer wipes a per-point V/F curve.** This
@@ -127,6 +151,10 @@ A full-version review reported 49 defects; all 49 were confirmed in the code.
   recovery banner and holds back the startup profile.
 - **After a restart, Afterglow no longer reports a clock lock the driver already
   dropped**, and a later `set` won't quietly re-apply it.
+- **A lock applied before the PC slept or hibernated (Fast Startup included) is
+  no longer shown as applied after it wakes.** Whether the driver keeps it is
+  untested, so `get` and the Tuning page say it may or may not still be in
+  force. Crash records treat it as unknown.
 - **A CLI `set` on one GPU no longer clears another GPU's crash-recovery
   record.** It also leaves its own GPU's record alone if that was unfinished.
 - **Crash reports know what was applied at the moment of the crash.** Every
@@ -137,6 +165,10 @@ A full-version review reported 49 defects; all 49 were confirmed in the code.
     failure.
   - "Afterglow's tuning is not implicated" is only shown when the recording
     covers every setting.
+- **A crash caused by a tuning change itself is attributed to that change.**
+  Afterglow writes each change to the crash recorder on disk before sending it to
+  the driver, waiting at most 250 ms for the disk. A reset, bluescreen or driver
+  reset during the change now names it and its values.
 - **No more invented hard resets.** When Windows' event log can't be read, the
   report says the cause is unknown.
 
@@ -174,6 +206,9 @@ A full-version review reported 49 defects; all 49 were confirmed in the code.
   used to be read as a stuck pin. Tested against a simulated driver only.
 - **`selftest` sends the GPU-lock query with its Size filled in**, as Intel's
   header requires.
+- **A factory minimum clock above the hardware minimum is remembered** for that
+  card and driver. A new launch no longer reports it as a clamp nobody applied.
+  Tested on a simulated driver only.
 
 #### FPS capture and session reports
 - **A new capture no longer blends in the previous run's frames.** A game that
@@ -191,14 +226,24 @@ A full-version review reported 49 defects; all 49 were confirmed in the code.
 - **Back-to-back games each get their own profile.** Closing one and starting
   another within a poll interval used to leave the second on the first one's
   profile.
-- **A per-game frame cap of 0 is stored as the driver's explicit "off"** for that
-  game, instead of silently inheriting a global cap. Removing the rule or `drs
-  --clear` hands the game back to the global settings. A cap outside 0–1000 is
-  refused.
+- **A game's frame cap can now be left alone, turned off, or set.**
+  - **Empty:** the cap is left to the driver, so a global NVIDIA Control Panel
+    cap still applies.
+  - **0 or `off`:** the limiter is off for that game, even with a global cap.
+  - **1–1000:** caps the game at that rate.
+  - Rules saved by earlier versions read a 0 as empty, which is what they
+    actually did. An invalid cap is refused.
+  - Afterglow only takes back caps it wrote itself, and only while unchanged.
+  - `drs` without `--cap` no longer rewrites the cap.
+- **Overlapping games hand over.** Closing the game whose profile is applied,
+  while another configured game is still running, applies that game's profile.
+  Your tuning from before the first game comes back when the last one closes.
 - **Clearing a game's driver settings reports failures**, and a successful clear
   is verified.
 - **The hidden `drs --probe-create` diagnostic no longer deletes an existing
   profile.**
+- **Profile names are found whatever their case**, so `certify --profile quiet`
+  finds "Quiet".
 - **A damaged profile file no longer stops Afterglow from starting.** It is
   skipped, counted and logged.
 - **Profile names that would share a file are refused** instead of overwriting
@@ -222,13 +267,16 @@ A full-version review reported 49 defects; all 49 were confirmed in the code.
   to bind the server to GPU 0.
 - **A removed NVIDIA card no longer blocks stress tests on Intel Arc.** NVIDIA
   fan RPM also comes back after a driver reset.
+- **Stress and VRAM tests no longer guess the card.** If none is named and
+  Windows' device list can't be read, or it shows an NVIDIA card that DirectX
+  doesn't, the run is refused with a hint to use `--gpu N`.
 - **"Start with Windows" now belongs to whoever is signed in.**
   - Each account gets its own logon task.
   - The toggle reflects whether the task is actually enabled.
   - Installing with another administrator's password creates the task for you.
   - Uninstalling removes every user's task.
-  - On a standard account, Afterglow asks for elevation at sign-in, as on any
-    launch.
+  - On a standard account, Windows asks for an administrator's password at
+    every sign-in. Without it Afterglow only monitors, and Settings now says so.
 
 ## 1.5.0 — 2026-10-12
 
