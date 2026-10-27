@@ -74,6 +74,59 @@ public sealed record GameRule
     public bool LowLatency { get; init; }
 }
 
+/// <summary>
+/// Global keyboard shortcuts. Each is null for the default (see
+/// <see cref="Hotkeys.HotkeyDefaults"/>), an empty string for none, or the user's
+/// own "Ctrl+Alt+O"-style text. Settings files from before shortcuts were
+/// configurable have no such section, so everything is the default. Whatever is
+/// set, a shortcut that types a character on one of the user's keyboard layouts
+/// is never registered (<see cref="Hotkeys.HotkeyPlanner"/>).
+/// </summary>
+public sealed record HotkeySettings
+{
+    /// <summary>Off: Afterglow registers no global shortcut at all.</summary>
+    public bool Enabled { get; init; } = true;
+
+    public string? ToggleOverlay { get; init; }
+
+    public string? PanicReset { get; init; }
+
+    /// <summary>Profile slots 1 to 5 (saved profiles in alphabetical order); missing entries are the default.</summary>
+    public IReadOnlyList<string?> ProfileSlots { get; init; } = [];
+
+    /// <summary>The user's text for <paramref name="action"/>: null for the default, empty for none.</summary>
+    public string? For(Hotkeys.HotkeyAction action)
+    {
+        string? text = action switch
+        {
+            Hotkeys.HotkeyAction.ToggleOverlay => ToggleOverlay,
+            Hotkeys.HotkeyAction.PanicReset => PanicReset,
+            _ => Hotkeys.HotkeyActions.SlotOf(action) is int slot && ProfileSlots is { } slots && slot < slots.Count
+                ? slots[slot]
+                : null,
+        };
+        return text?.Trim();
+    }
+
+    /// <param name="text">Null for the default, empty for none, otherwise the shortcut.</param>
+    public HotkeySettings With(Hotkeys.HotkeyAction action, string? text)
+    {
+        switch (action)
+        {
+            case Hotkeys.HotkeyAction.ToggleOverlay:
+                return this with { ToggleOverlay = text };
+            case Hotkeys.HotkeyAction.PanicReset:
+                return this with { PanicReset = text };
+            default:
+                var slots = Enumerable.Range(0, Hotkeys.HotkeyActions.ProfileSlotCount)
+                    .Select(i => For(Hotkeys.HotkeyActions.ProfileSlot(i)))
+                    .ToArray();
+                slots[Hotkeys.HotkeyActions.SlotOf(action)!.Value] = text;
+                return this with { ProfileSlots = slots };
+        }
+    }
+}
+
 /// <summary>Sustained-condition automation: when a metric breaches for long enough, act.</summary>
 public sealed record AutomationRule
 {
@@ -108,6 +161,8 @@ public sealed record AppSettings
     public bool ResetOnDriverCrash { get; init; } = true;
 
     public OverlaySettings Overlay { get; init; } = new();
+
+    public HotkeySettings Hotkeys { get; init; } = new();
 
     /// <summary>
     /// Fan mode/curve for the primary GPU, restored automatically at startup
@@ -163,7 +218,10 @@ public static class SettingsStore
             string? json = Security.DataRootProtection.TryReadAllText(AppPaths.SettingsFile);
             if (json is not null)
             {
-                return JsonSerializer.Deserialize<AppSettings>(json, JsonOptions) ?? new AppSettings();
+                var settings = JsonSerializer.Deserialize<AppSettings>(json, JsonOptions) ?? new AppSettings();
+
+                // A hand-edited "hotkeys": null means the defaults, not a crash.
+                return settings.Hotkeys is null ? settings with { Hotkeys = new HotkeySettings() } : settings;
             }
         }
         catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)

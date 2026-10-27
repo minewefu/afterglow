@@ -2,6 +2,7 @@ using System.IO;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Afterglow.Core;
+using Afterglow.Core.Hotkeys;
 using Afterglow.Core.Settings;
 using Afterglow.Core.Telemetry;
 
@@ -34,9 +35,149 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
             if (value)
             {
                 RefreshStartupProfileOptions();
+                RefreshHotkeys();
+            }
+            else
+            {
+                CancelRecording();
             }
         }
     }
+
+    // Keyboard shortcuts
+    public System.Collections.ObjectModel.ObservableCollection<HotkeyRowViewModel> HotkeyRows { get; } = [];
+
+    [ObservableProperty] public partial bool HotkeysEnabled { get; set; }
+
+    /// <summary>The overlay card's line about toggling it, naming the shortcut actually registered.</summary>
+    [ObservableProperty] public partial string OverlayShortcutHint { get; set; } = string.Empty;
+
+    private HotkeyRowViewModel? _recording;
+    private bool _slotDetailsShown;
+
+    /// <summary>A row is waiting for its new shortcut; the view sends it the next key press.</summary>
+    public bool IsRecordingShortcut => _recording is not null;
+
+    partial void OnHotkeysEnabledChanged(bool value)
+    {
+        if (_loading)
+        {
+            return;
+        }
+
+        CancelRecording();
+        _services.UpdateSettings(s => s with { Hotkeys = s.Hotkeys with { Enabled = value } });
+    }
+
+    internal void BeginRecording(HotkeyRowViewModel row)
+    {
+        if (_recording == row)
+        {
+            CancelRecording();
+            return;
+        }
+
+        CancelRecording();
+        row.RecordingError = string.Empty;
+        row.Warning = string.Empty;
+        _recording = row;
+        row.IsRecording = true;
+        OnPropertyChanged(nameof(IsRecordingShortcut));
+
+        // Registered shortcuts would fire instead of reaching the page — pressing
+        // Ctrl+Alt+R to pick it again would reset the GPU.
+        _services.Hotkeys.Suspend();
+    }
+
+    public void CancelRecording()
+    {
+        if (_recording is not { } row)
+        {
+            return;
+        }
+
+        _recording = null;
+        row.IsRecording = false;
+        OnPropertyChanged(nameof(IsRecordingShortcut));
+        _services.Hotkeys.Resume();
+    }
+
+    /// <summary>The key press the recording row was waiting for.</summary>
+    public void CompleteRecording(HotkeyChord chord, bool withWindowsKey)
+    {
+        if (_recording is not { } row)
+        {
+            return;
+        }
+
+        string? problem = withWindowsKey
+            ? "Windows keeps shortcuts with the Windows key for itself"
+            : HotkeyChord.KeyName(chord.VirtualKey) is null
+                ? "Afterglow can't use that key; pick a letter, a digit, F1–F24, the number pad, Insert, Delete, Home, End, Page Up or Page Down"
+                : Services.HotkeyService.Check(chord);
+
+        // Resume first: while recording nothing is registered, so only now does
+        // the status say which shortcut another action really holds.
+        CancelRecording();
+        if (problem is null &&
+            _services.Hotkeys.Status.FirstOrDefault(s => s.Action != row.Action && s.IsActive && s.Chord == chord) is { } owner)
+        {
+            problem = $"{chord} is already set for \"{HotkeyActions.Describe(owner.Action)}\"";
+        }
+
+        if (problem is not null)
+        {
+            row.RecordingError = problem + ". The shortcut wasn't changed.";
+            row.Warning = row.RecordingError;
+            return;
+        }
+
+        SetShortcut(row, chord.ToString());
+    }
+
+    /// <param name="text">The new shortcut; empty for none, null for the default.</param>
+    internal void SetShortcut(HotkeyRowViewModel row, string? text)
+    {
+        CancelRecording();
+        row.RecordingError = string.Empty;
+        _services.UpdateSettings(s => s with { Hotkeys = s.Hotkeys.With(row.Action, text) });
+    }
+
+    [RelayCommand]
+    private void RestoreDefaultShortcuts()
+    {
+        CancelRecording();
+        foreach (var row in HotkeyRows)
+        {
+            row.RecordingError = string.Empty;
+        }
+
+        _services.UpdateSettings(s => s with { Hotkeys = new HotkeySettings { Enabled = s.Hotkeys.Enabled } });
+    }
+
+    private void RefreshHotkeys()
+    {
+        // Which profile each slot applies comes from disk: read it while the page
+        // is shown (and once to start with), not on every re-registration.
+        var profiles = _isLive || !_slotDetailsShown ? _services.Profiles.LoadAll() : null;
+        _slotDetailsShown = true;
+        foreach (var row in HotkeyRows)
+        {
+            row.Show(_services.Hotkeys.StatusOf(row.Action));
+            if (profiles is not null && HotkeyActions.SlotOf(row.Action) is int slot)
+            {
+                row.Detail = slot < profiles.Count
+                    ? $"Now \"{profiles[slot].Name}\", the {Ordinal(slot + 1)} saved profile in alphabetical order"
+                    : "No saved profile in this slot yet";
+            }
+        }
+
+        OverlayShortcutHint = _services.Hotkeys.StatusOf(HotkeyAction.ToggleOverlay) is { IsActive: true, Chord: { } chord }
+            ? $"Toggle it with {chord} or from the tray menu."
+            : "Toggle it from the tray menu, or give it a shortcut under General.";
+    }
+
+    private static string Ordinal(int n) => n switch { 1 => "1st", 2 => "2nd", 3 => "3rd", _ => $"{n}th" };
 
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(PollingLabel))]
@@ -165,6 +306,21 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
         _services = services;
         RefreshStartupProfileOptions();
         LoadFrom(services.Settings);
+
+        foreach (var action in HotkeyActions.All)
+        {
+            HotkeyRows.Add(new HotkeyRowViewModel(this, action));
+        }
+
+        // Before the window exists nothing is registered yet; planning shows what
+        // will be (and is all a --screenshot run ever does). Attach re-plans.
+        if (services.Hotkeys.Status.Count == 0)
+        {
+            services.Hotkeys.Apply(services.Settings.Hotkeys);
+        }
+
+        services.Hotkeys.StatusChanged += RefreshHotkeys;
+        RefreshHotkeys();
     }
 
     /// <summary>
@@ -287,6 +443,7 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
         StartMinimizedToTray = s.StartMinimizedToTray;
         ResetOnDriverCrash = s.ResetOnDriverCrash;
         UpdateCheckEnabled = s.UpdateCheckEnabled;
+        HotkeysEnabled = s.Hotkeys.Enabled;
         AlertGpuTemp = s.AlertGpuTempC == 0 ? 49 : s.AlertGpuTempC;
         AlertMemTemp = s.AlertMemJunctionTempC == 0 ? 49 : s.AlertMemJunctionTempC;
         OverlayCornerIndex = (int)s.Overlay.Corner;

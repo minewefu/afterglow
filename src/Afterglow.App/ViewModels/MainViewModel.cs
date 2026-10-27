@@ -608,9 +608,12 @@ public partial class MainViewModel : ObservableObject
         }
 
         var result = ApplyProfileFull(profiles[slot]);
+        string shortcut = _services.Hotkeys.StatusOf(Core.Hotkeys.HotkeyActions.ProfileSlot(slot))?.Chord is { } chord
+            ? $" ({chord})"
+            : string.Empty;
         TrayAlert?.Invoke(
             "Afterglow profile applied",
-            $"'{profiles[slot].Name}' (Ctrl+Alt+{slot + 1})" + (result.AllSucceeded ? string.Empty : " — some knobs failed"));
+            $"'{profiles[slot].Name}'{shortcut}" + (result.AllSucceeded ? string.Empty : " — some knobs failed"));
     }
 
     /// <summary>

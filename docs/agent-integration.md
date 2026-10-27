@@ -53,7 +53,8 @@ agent loop:
 
 Watch `peak_gpu_temp_c` / `peak_power_w` between steps and stop early on thermal ceilings —
 the same signal a human tuner uses. Afterglow's TDR watchdog remains armed the whole time,
-and a human can always pull the plug with Ctrl+Alt+R.
+and a human can always pull the plug with the panic shortcut (Ctrl+Alt+R by default; Settings
+shows the one in use) or the tray menu's reset.
 
 Note: `find_stable_offset` packages this whole loop into a single blocking MCP call (step
 up, back off on failure, confirmation burn, restore-on-timeout), so an agent that just

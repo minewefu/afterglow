@@ -24,7 +24,6 @@ public partial class App : Application
     private bool _ephemeralRun;
     private MainViewModel? _mainViewModel;
     private TrayService? _tray;
-    private HotkeyService? _hotkeys;
     private DispatcherTimer? _tooltipTimer;
     private bool _exitRequested;
     private System.Threading.Mutex? _singleInstanceMutex;
@@ -242,11 +241,15 @@ public partial class App : Application
             Shutdown();
         };
 
-        _hotkeys = new HotkeyService();
-        _hotkeys.OverlayToggle += () => _mainViewModel?.ToggleOverlay();
-        _hotkeys.PanicReset += () => _mainViewModel?.PanicReset();
-        _hotkeys.ApplyProfileSlot += slot => _mainViewModel?.ApplyProfileSlot(slot);
-        _hotkeys.Attach(window);
+        var hotkeys = Services.Hotkeys;
+        hotkeys.OverlayToggle += () => _mainViewModel?.ToggleOverlay();
+        hotkeys.PanicReset += () => _mainViewModel?.PanicReset();
+        hotkeys.ApplyProfileSlot += slot => _mainViewModel?.ApplyProfileSlot(slot);
+        hotkeys.StatusChanged += () => _tray?.SetShortcuts(
+            hotkeys.StatusOf(Core.Hotkeys.HotkeyAction.ToggleOverlay),
+            hotkeys.StatusOf(Core.Hotkeys.HotkeyAction.PanicReset));
+        hotkeys.Attach(window, Services.Settings.Hotkeys);
+        Services.SettingsChanged += settings => hotkeys.Apply(settings.Hotkeys);
 
         if (_mainViewModel is not null)
         {
@@ -260,6 +263,10 @@ public partial class App : Application
             {
                 _tray?.UpdateTooltip(_mainViewModel.BuildTrayTooltip());
             }
+
+            // A keyboard layout added while Afterglow runs can make a shortcut
+            // type a character; Windows sends no message for that, so look here.
+            _services?.Hotkeys.RefreshIfLayoutsChanged();
         };
         _tooltipTimer.Start();
 
@@ -440,7 +447,7 @@ public partial class App : Application
 
         _exitRequested = true;
         _tooltipTimer?.Stop();
-        _hotkeys?.Dispose();
+        _services.Hotkeys.Dispose();
         _tray?.Dispose();
 
         // Before the clean-shutdown mark and before the GPU services go away: a

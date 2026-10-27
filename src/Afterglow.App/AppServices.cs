@@ -35,6 +35,9 @@ public sealed class AppServices : IDisposable
 
     public CsvLogger? ActiveCsvLogger { get; set; }
 
+    /// <summary>Global shortcuts; the app attaches them to its window, Settings shows and edits them.</summary>
+    public Services.HotkeyService Hotkeys { get; } = new();
+
     public string DriverVersion { get; init; } = "—";
 
     public required GameWatcher GameWatcher { get; init; }

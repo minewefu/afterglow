@@ -63,7 +63,9 @@ with the settings you were running, so you can compare before and after.
 **Remembers and automates.** Save settings as named profiles, have a profile switch on when
 a game starts (and switch back when it closes), set a game's frame cap or vsync in the
 NVIDIA driver, or write rules like "if the memory gets to 94 °C for 30 seconds, run the fans
-at 90 %". `Ctrl+Alt+R` puts everything back to stock from anywhere.
+at 90 %". `Ctrl+Alt+R` puts everything back to stock from anywhere (`Ctrl+Alt+F11` where
+your keyboard layout types a character with `Ctrl+Alt+R`; every shortcut can be changed in
+Settings).
 
 **Works from scripts and AI agents too.** Everything is also in `afterglow-cli`, and
 `afterglow-cli mcp` lets an AI agent monitor, tune and stability-test the card through the

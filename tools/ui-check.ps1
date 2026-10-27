@@ -9,7 +9,11 @@
     graph; the FPS tile with no game leads to the FPS page; moving a Tuning slider shows
     "Unapplied changes" and Apply clears it; the Fans mode switch reveals the duty slider;
     saving a profile lists it and enables the list actions; settings switches carry
-    accessible names and toggle. Captures a PNG of each state into -Out.
+    accessible names and toggle; with the Spanish layout installed, the default shortcuts
+    leave its AltGr digits alone, and recording a shortcut saves and registers it while
+    refusing one that types a character or takes an everyday app shortcut (this part
+    presses keys, so leave the keyboard alone while it runs). Captures a PNG of each
+    state into -Out.
     Exit code = number of failed checks.
 #>
 param([Parameter(Mandatory)] [string]$Exe,
@@ -145,6 +149,79 @@ try {
     Check ($before -ne $after) "switch toggles ($before -> $after)"
     Shot $p 'settings-toggled.png'
 } finally { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+
+# Keyboard shortcuts (issue #6). Spanish is installed for the session first —
+# without activating it — because its AltGr row is what the shortcuts must not
+# take; it is unloaded again afterwards if this script loaded it.
+"Settings: keyboard shortcuts"
+function Press([byte[]]$keys) {
+    foreach ($k in $keys) { [UiTest.K]::keybd_event($k, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 30 }
+    [array]::Reverse($keys)
+    foreach ($k in $keys) { [UiTest.K]::keybd_event($k, 0, 2, [UIntPtr]::Zero); Start-Sleep -Milliseconds 30 }
+    Start-Sleep -Milliseconds 700
+}
+function Free([uint32]$mods, [uint32]$vk) {
+    # Whether another process (the app) holds this hotkey right now.
+    if ([UiTest.K]::RegisterHotKey([IntPtr]::Zero, 0x7F00, $mods, $vk)) { [void][UiTest.K]::UnregisterHotKey([IntPtr]::Zero, 0x7F00); return $true }
+    return $false
+}
+function Saved([string]$data) { (Get-Content (Join-Path $data 'settings.json') -Raw | ConvertFrom-Json).hotkeys }
+Add-Type -Namespace UiTest -Name K -MemberDefinition @'
+[DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, System.UIntPtr extra);
+[DllImport("user32.dll")] public static extern bool RegisterHotKey(System.IntPtr h, int id, uint mods, uint vk);
+[DllImport("user32.dll")] public static extern bool UnregisterHotKey(System.IntPtr h, int id);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern System.IntPtr LoadKeyboardLayoutW(string klid, uint flags);
+[DllImport("user32.dll")] public static extern bool UnloadKeyboardLayout(System.IntPtr hkl);
+[DllImport("user32.dll")] public static extern int GetKeyboardLayoutList(int n, System.IntPtr[] list);
+'@
+$layoutsBefore = New-Object IntPtr[] 64
+$layoutsBefore = $layoutsBefore[0..([UiTest.K]::GetKeyboardLayoutList(64, $layoutsBefore) - 1)]
+$spanish = [UiTest.K]::LoadKeyboardLayoutW('0000040A', 0x80)
+$p = Start-App 'settings' $data
+try {
+    $r = Root $p
+    $ctrlAlt = 3; $ctrlShift = 6
+    Check (Has $r 'Ctrl+Alt+1 types "|" on your Spanish keyboard layout — using Ctrl+Alt+F1 instead') 'Spanish digits are left to typing; slot 1 explains its F-key stand-in'
+    Check (Free $ctrlAlt 0x32) 'Ctrl+Alt+2 is not registered by the app (it is "@")'
+    Check (-not (Free $ctrlAlt 0x71)) 'Ctrl+Alt+F2 is registered instead'
+
+    $change = Find $r 'Change shortcut: Show or hide the overlay'
+    $change.SetFocus(); $change.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    Start-Sleep -Milliseconds 700
+    Check (Has $r ('Press the new shortcut {0} Esc cancels' -f [char]0xB7)) 'Change starts recording'
+    Check (Free $ctrlAlt 0x52) 'shortcuts are paused while recording (Ctrl+Alt+R is free)'
+    Press @(0x11, 0x10, 0x78)                      # Ctrl+Shift+F9
+    Check ((Saved $data).toggleOverlay -eq 'Ctrl+Shift+F9') "the pressed shortcut is saved ($((Saved $data).toggleOverlay))"
+    Check (-not (Free $ctrlShift 0x78)) 'and registered'
+    Check (-not (Free $ctrlAlt 0x52)) 'recording over: Ctrl+Alt+R is registered again'
+    Check (Has $r 'Toggle it with Ctrl+Shift+F9 or from the tray menu.') 'the overlay card names the new shortcut'
+    Shot $p 'settings-shortcut-recorded.png'
+
+    $change = Find $r 'Change shortcut: Panic: reset the GPU to driver defaults'
+    $change.SetFocus(); $change.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    Start-Sleep -Milliseconds 500
+    Press @(0x11, 0x12, 0x32)                      # Ctrl+Alt+2: "@" on Spanish
+    Check (Has $r 'Ctrl+Alt+2 types "@" on your Spanish keyboard layout. The shortcut wasn''t changed.') 'a chord that types is refused, with the character and layout'
+    Check ($null -eq (Saved $data).panicReset) 'and the panic key keeps its default'
+    $change.SetFocus(); $change.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    Start-Sleep -Milliseconds 500
+    Press @(0x11, 0x43)                            # Ctrl+C
+    Check (Has $r 'Ctrl+C would take an everyday app shortcut; use two modifiers (Ctrl+Alt, Ctrl+Shift, Alt+Shift) or an F key. The shortcut wasn''t changed.') 'an everyday app shortcut is refused'
+    Shot $p 'settings-shortcut-refused.png'
+    $change = Find $r 'Change shortcut: Show or hide the overlay'
+    $change.SetFocus(); $change.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    Start-Sleep -Milliseconds 500
+    Press @(0x11, 0x12, 0x52)                      # Ctrl+Alt+R: the panic key's
+    Check (Has $r 'Ctrl+Alt+R is already set for "Panic: reset the GPU to driver defaults". The shortcut wasn''t changed.') 'another action''s shortcut is refused'
+    Check ((Saved $data).toggleOverlay -eq 'Ctrl+Shift+F9') 'and the overlay keeps its own'
+
+    Invoke $r 'Restore default shortcuts'
+    Check ($null -eq (Saved $data).toggleOverlay) 'Restore default shortcuts clears the chosen one'
+    Check (-not (Free $ctrlAlt 0x4F)) 'and Ctrl+Alt+O is registered again'
+} finally {
+    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+    if ($layoutsBefore -notcontains $spanish) { [void][UiTest.K]::UnloadKeyboardLayout($spanish) }
+}
 
 "failures: $script:fail"
 exit $script:fail

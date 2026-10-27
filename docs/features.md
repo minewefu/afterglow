@@ -107,7 +107,10 @@ feature, with the method behind it and where it has been verified.
 - **Session history**: every FPS capture is recorded with the offsets that were applied —
   before/after comparisons per game, exportable as Markdown
 - Global hotkeys: overlay toggle, profile slots, and a **panic key** (Ctrl+Alt+R) that resets
-  everything to driver defaults
+  everything to driver defaults. All can be changed or turned off in Settings, and none is
+  ever registered while it would type a character on one of your keyboard layouts (AltGr
+  is Ctrl+Alt to Windows); a default that would falls back to Ctrl+Alt+F10/F11/F1–F5
+  ([why](research/keyboard-layouts.md))
 - **TDR watchdog**: if Windows logs a display-driver reset while your tuning is applied,
   Afterglow resets to defaults and tells you the overclock is suspect
 - Crash recovery: an unclean shutdown with tuning applied is detected at the next start

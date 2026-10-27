@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased
+
+### Keyboard shortcuts no longer take characters from typing ([#6](https://github.com/minewefu/afterglow/issues/6))
+
+- **The defect:** AltGr is Ctrl+Alt to Windows, so the fixed Ctrl+Alt shortcuts
+  fired whenever someone typed AltGr+key, and the character never reached any
+  app. On Spanish, `|`, `@`, `#`, `~` and `€` (AltGr+1–5) couldn't be typed while
+  Afterglow ran, and each one applied the saved profile in that slot to the GPU
+  instead. On
+  UK, US-International and Polish (Programmers) keyboards, typing `ó` toggled
+  the overlay; on US-International, Greek and Dutch, `®` or `¶` was the panic
+  reset. Reproduced on 1.5.0 as released.
+- **Afterglow now never registers a shortcut that types a character, or starts
+  a dead key, on any keyboard layout installed for you.** It asks each layout
+  with `ToUnicodeEx` before registering, and checks again when a layout is
+  added while it runs.
+- **The defaults stay where they're harmless.** On a US keyboard nothing
+  changes. Where a default would type, it falls back to Ctrl+Alt+F10 for the
+  overlay, Ctrl+Alt+F11 for the panic reset and Ctrl+Alt+F1–F5 for the profile
+  slots. The five slots move together, so they stay one row of keys. Across the
+  218 layouts Windows ships, no Ctrl+Alt+F key types anything, while every
+  Ctrl+Alt letter and digit types on at least 31
+  ([docs/research/keyboard-layouts.md](docs/research/keyboard-layouts.md)).
+  The stand-in also takes over when another app already holds the default.
+- **Settings › Keyboard shortcuts** now lists every shortcut with the keys in
+  use, and explains any stand-in. You can:
+  - change a shortcut by pressing the new keys;
+  - remove one, or restore the defaults;
+  - turn all global shortcuts off.
+
+  Settings refuses, and says why:
+  - a chord that types on one of your layouts;
+  - a chord without Ctrl or Alt;
+  - one-modifier letters, digits and navigation keys, which every app uses
+    (Ctrl+C, Alt+F);
+  - Alt+F4, Ctrl+F4, Ctrl+Alt+Delete and F12 (which Windows keeps for
+    debuggers).
+
+  Registered shortcuts are paused while you record one, so pressing Ctrl+Alt+R
+  to pick it doesn't reset the GPU.
+- The tray menu and the profile notification name the shortcut actually in
+  use. Holding a shortcut down fires it once (`MOD_NOREPEAT`) instead of
+  toggling the overlay at key-repeat rate.
+- `tools/ui-check.ps1` drives the new Settings section, with the Spanish layout
+  installed. `tools/keyboard-layout-survey.cs` reproduces the layout survey.
+
 ## 1.5.0 — 2026-10-12
 
 The first stable release since 1.1.0. It brings together everything from the 1.2.0 betas
