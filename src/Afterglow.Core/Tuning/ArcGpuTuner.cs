@@ -81,6 +81,16 @@ public sealed class ArcGpuTuner : IGpuTuner
     /// tuner sees it before the pre-sweep release empties the tracking; while
     /// it is set, <see cref="AppliedLockMHz"/> answers with it, so a failed pin
     /// release does not make the user's lock vanish until the next restart.
+    /// <para>
+    /// It names a lock Afterglow applied that a sweep took off the card —
+    /// BeginProbe's release, or a pin landing over a range lock — and only
+    /// until a newer lock decision lands: a range lock written by an apply
+    /// (see <see cref="TrackWrittenRangeLock"/>), a verified release, or a
+    /// lock-less profile. A sweep stops on such a write (R-02), and its
+    /// EndProbe put this older lock back over it: a hotkey's 2000 MHz lock
+    /// ended as the 1800 the sweep began under, or, with no lock before the
+    /// sweep, was released as the probe's pin.
+    /// </para>
     /// </summary>
     private uint? _probeDisplacedLock;
 
@@ -98,6 +108,23 @@ public sealed class ArcGpuTuner : IGpuTuner
 
     /// <summary>A pin write of the current sweep landed with the driver, so EndProbe has something to release.</summary>
     private bool _probePinLanded;
+
+    /// <summary>
+    /// A range lock written by a lock decision — an apply, <see cref="RestoreTuningLock"/> —
+    /// landed with the driver: it is the lock Afterglow applied, on the card
+    /// now. It supersedes any lock a sweep displaced, and the write replaced
+    /// the sweep's pin, so EndProbe has neither an older lock to put back nor a
+    /// pin to release; either one undid the newer lock. A pin landing over it
+    /// afterwards displaces it in turn (see <see cref="WriteClampVerified"/>).
+    /// Not EndProbe's own restore: the displaced lock is forgotten only once
+    /// that write is verified.
+    /// </summary>
+    private void TrackWrittenRangeLock(uint mhz)
+    {
+        _clamp = new TrackedClamp(mhz, mhz);
+        _probeDisplacedLock = null;
+        _probePinLanded = false;
+    }
 
     /// <summary>The highest clock a sweep may pin: the verified released ceiling, or the domain maximum until one is known.</summary>
     public uint MaxLockableClockMHz =>
@@ -566,7 +593,7 @@ public sealed class ArcGpuTuner : IGpuTuner
                 // would hold full clocks at idle). The verified write resolves
                 // the probe's pin record; the displaced lock is forgotten only
                 // once it is back on the card.
-                var rc = WriteClampVerified(_hwMinMhz, restore, restore); // the notify-free write; EndProbe notifies once
+                var rc = WriteClampVerified(_hwMinMhz, restore, restore, restoresDisplaced: true); // the notify-free write; EndProbe notifies once
                 if (rc != NvmlReturn.Success)
                 {
                     return KnobResult.Fail("clock lock", $"the previous {restore} MHz clock lock could not be restored ({rc})");
@@ -581,8 +608,12 @@ public sealed class ArcGpuTuner : IGpuTuner
                 // Nothing was ever pinned (step 0 refused, or the sweep never
                 // started), so there is nothing to release — and a refused
                 // release here used to be reported as "the GPU may still be
-                // pinned" over a session that changed nothing.
-                return KnobResult.Ok("clock lock", "nothing was pinned");
+                // pinned" over a session that changed nothing. Or a range lock
+                // written mid-sweep replaced the pin: that lock is the newer
+                // decision, and releasing "the probe's pin" here released it.
+                return KnobResult.Ok("clock lock", _clamp?.AppliedLock is uint kept
+                    ? $"left the {kept} MHz lock applied during the sweep in place"
+                    : "nothing was pinned");
             }
 
             var release = ReleaseClampCore();
@@ -607,7 +638,12 @@ public sealed class ArcGpuTuner : IGpuTuner
     /// ceiling settles at the ceiling (measured), and tracking the request
     /// left a shadow above anything the card ever showed.
     /// </summary>
-    private NvmlReturn WriteClampVerified(double min, double max, uint shadow)
+    /// <param name="restoresDisplaced">
+    /// EndProbe putting back the lock the sweep displaced, which stays
+    /// displaced until EndProbe has verified it. Any other range write is a new
+    /// lock decision and supersedes it (<see cref="TrackWrittenRangeLock"/>).
+    /// </param>
+    private NvmlReturn WriteClampVerified(double min, double max, uint shadow, bool restoresDisplaced = false)
     {
         lock (_applyLock)
         {
@@ -634,10 +670,28 @@ public sealed class ArcGpuTuner : IGpuTuner
             // may now be present whether or not the readback confirms the value,
             // so a release is still attempted for it. A pin stands for no
             // applied lock — that is the displaced lock BeginProbe remembered.
-            _clamp = new TrackedClamp(shadow, isPin ? null : shadow);
             if (isPin)
             {
+                // A pin landing over a range lock this process applied displaces
+                // it, as BeginProbe's release does. The probe checks for a
+                // foreign write before each pin, but a profile's lock can land
+                // between that check and the pin, which then covers it; the
+                // newer lock stays the applied one and is what EndProbe puts back.
+                if (_clamp?.AppliedLock is uint covered)
+                {
+                    _probeDisplacedLock = covered;
+                }
+
+                _clamp = new TrackedClamp(shadow, null);
                 _probePinLanded = true;
+            }
+            else if (restoresDisplaced)
+            {
+                _clamp = new TrackedClamp(shadow, shadow);
+            }
+            else
+            {
+                TrackWrittenRangeLock(shadow);
             }
 
             if (_device.TryGetFrequencyRange(_gpuFreqDomain, out var readback) != CtlResult.Success)
@@ -728,7 +782,8 @@ public sealed class ArcGpuTuner : IGpuTuner
             // is exactly when the implicit release matters most. Setting it only
             // on the verified path left those clamps on the card, with a
             // lock-less apply reporting full success over a still-pinned GPU.
-            _clamp = new TrackedClamp((uint)Math.Round(clamped), (uint)Math.Round(clamped));
+            // Mid-sweep it also supersedes the lock the sweep displaced.
+            TrackWrittenRangeLock((uint)Math.Round(clamped));
             string detail = $"{_hwMinMhz:F0}..{clamped:F0} MHz{clampNote}";
             var readRc = _device.TryGetFrequencyRange(_gpuFreqDomain, out var readback);
             if (readRc != CtlResult.Success)
@@ -802,6 +857,19 @@ public sealed class ArcGpuTuner : IGpuTuner
                 // yields one verdict rather than a front-end's guess.
                 results.Add(ReleaseClampCore());
             }
+            else if (_probeDisplacedLock is uint displaced)
+            {
+                // Mid-sweep with no clamp on the card (before the first pin):
+                // the user's lock is off the card only because the sweep took
+                // it off. A profile without a lock releases the lock outside a
+                // sweep, so it removes this one too — otherwise it was recorded
+                // under this profile and EndProbe put it back afterwards, while
+                // the same profile applied over the first pin dropped it.
+                _probeDisplacedLock = null;
+                results.Add(KnobResult.Ok("clock lock",
+                    $"removed the {displaced} MHz lock (a V/F sweep had already taken it off the card; " +
+                    "it will not be put back)"));
+            }
 
             return;
         }
@@ -810,8 +878,15 @@ public sealed class ArcGpuTuner : IGpuTuner
         // described a pin, or a factory floor above that minimum (R-17), as a
         // range it never was.
         double wasMin = live is { Min: > 0 } shown ? shown.Min : _hwMinMhz;
+        uint? displacedLock = _probeDisplacedLock;
         var release = ReleaseClampCore();
-        results.Add(release with { Detail = $"was {wasMin:F0}..{previous} MHz — {release.Detail}" });
+
+        // Over a sweep's pin, "was" names only the pin; the verified release
+        // also ends the lock the pin displaced, so say that it goes too.
+        string displacedNote = release.Applied && displacedLock is uint removed
+            ? $"; the {removed} MHz lock the V/F sweep displaced is removed too and will not be put back"
+            : string.Empty;
+        results.Add(release with { Detail = $"was {wasMin:F0}..{previous} MHz — {release.Detail}{displacedNote}" });
     }
 
     /// <summary>

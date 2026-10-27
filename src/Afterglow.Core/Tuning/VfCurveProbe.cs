@@ -426,8 +426,9 @@ public sealed class VfCurveProbe
                 // under the tuner's lock, this pin lands, and only then does its
                 // notification arrive. Every wait, sample and pin below checks
                 // first, so the sweep stops at the next check and the finally
-                // block releases the pin. Refusing the pin itself would need the
-                // tuner to own the check (it holds the lock both writes take).
+                // block undoes the pin: back to the lock that write applied, or
+                // released when it applied none. Refusing the pin itself would
+                // need the tuner to own the check (it holds the lock both writes take).
                 Sleep(SettleSeconds);
                 if (Stopping)
                 {
@@ -505,8 +506,9 @@ public sealed class VfCurveProbe
             // closing verification left the card exact-pinned until reboot
             // with the restore never reached.
             //
-            // The tuner puts back the lock BeginProbe remembered, or releases
-            // the pin when there was none. The result is checked: this is the
+            // The tuner puts back the lock BeginProbe remembered — or the one a
+            // write that interrupted the sweep applied, which supersedes it — or
+            // releases the pin when there is none. The result is checked: this is the
             // call that undoes an exact clock pin, and discarding its return
             // left the GPU pinned while the UI announced the previous state
             // was restored.

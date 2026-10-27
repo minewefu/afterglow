@@ -1184,6 +1184,11 @@ public sealed class GpuTuner : IGpuTuner
     {
         lock (_applyLock)
         {
+            // The applied lock as it stands NOW, not as BeginProbe saw it: a
+            // lock written mid-sweep (a hotkey's profile) replaced it and a
+            // release cleared it, so the write that stopped the sweep is what
+            // stays, even under a pin that raced in after it. The Arc tuner,
+            // which must keep the displaced lock apart, matches this.
             if (_appliedLockMHz is uint restore)
             {
                 var rc = RestoreTuningLockCore(restore);
