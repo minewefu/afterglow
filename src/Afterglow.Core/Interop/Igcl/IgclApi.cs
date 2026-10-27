@@ -650,25 +650,36 @@ public sealed class IgclDevice : IArcDevice
     public CtlResult TrySetGpuVoltageOffset(double offsetMv) =>
         Guard(() => IgclNative.ctlOverclockGpuVoltageOffsetSet(_handle, offsetMv));
 
+    /// <summary>
+    /// Reads the fixed V/F lock (0/0 = not locked). The header documents the
+    /// pointer as [out] but the struct's own Size and Version as [in], like
+    /// every IGCL struct: the pair used to go out as a C# <c>out</c> default
+    /// with Size 0, which a contract-validating driver refuses, and selftest
+    /// then reported the getter as unavailable (R-45).
+    /// </summary>
     public CtlResult TryGetGpuLock(out CtlOcVfPair pair)
     {
-        CtlOcVfPair value = default;
-        var rc = Guard(() => IgclNative.ctlOverclockGpuLockGet(_handle, out value));
+        var value = VfPair();
+        var rc = Guard(() => IgclNative.ctlOverclockGpuLockGet(_handle, ref value));
         pair = value;
         return rc;
     }
 
     /// <summary>Locks the GPU to a fixed V/F point; 0/0 returns to dynamic management.</summary>
-    public CtlResult TrySetGpuLock(double voltageMv, double frequencyMhz)
+    public CtlResult TrySetGpuLock(double voltageMv, double frequencyMhz) =>
+        Guard(() => IgclNative.ctlOverclockGpuLockSet(_handle, VfPair(voltageMv, frequencyMhz)));
+
+    /// <summary>
+    /// A ctl_oc_vf_pair_t as the driver expects to receive it: Size filled in
+    /// (the header marks it "[in]"), Version 0. The lock getter and setter
+    /// both send this one shape.
+    /// </summary>
+    internal static CtlOcVfPair VfPair(double voltageMv = 0, double frequencyMhz = 0) => new()
     {
-        var pair = new CtlOcVfPair
-        {
-            Size = (uint)Unsafe.SizeOf<CtlOcVfPair>(),
-            Voltage = voltageMv,
-            Frequency = frequencyMhz,
-        };
-        return Guard(() => IgclNative.ctlOverclockGpuLockSet(_handle, pair));
-    }
+        Size = (uint)Unsafe.SizeOf<CtlOcVfPair>(),
+        Voltage = voltageMv,
+        Frequency = frequencyMhz,
+    };
 
     public CtlResult TryGetOcPowerLimitV2(out double limit)
     {

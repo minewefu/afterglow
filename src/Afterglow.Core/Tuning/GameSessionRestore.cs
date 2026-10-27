@@ -72,6 +72,40 @@ public sealed record PreGameSnapshot
 public sealed record GameRestorePlan(TuningProfile Profile, FanRestoreState? Fans, IReadOnlyList<string> NotRestored);
 
 /// <summary>
+/// How the app hands a game session from the game whose profile was active,
+/// which exited, to a configured game still running (GameWatcher.GameHandedOff).
+/// </summary>
+public enum GameHandoff
+{
+    /// <summary>
+    /// No pre-game snapshot: nothing of the session is on any card (the first
+    /// game's profile was missing or refused). The remaining game starts as if
+    /// it had started alone, capture included — there is no earlier state to keep.
+    /// </summary>
+    StartFresh,
+
+    /// <summary>
+    /// The remaining game's profile lands on the snapshot's card: put the
+    /// pre-game state back without consuming the snapshot, apply the new
+    /// profile on top, and keep the snapshot (<see cref="GameSessionRestore.HandedOff"/>)
+    /// as the restore target. Applied straight over the exited game's profile,
+    /// it would leave that profile's temperature limit, curve or fans on the
+    /// card wherever the new one has no value of its own.
+    /// </summary>
+    Swap,
+
+    /// <summary>
+    /// The remaining game's profile cannot take over on that card: there is
+    /// none, it is invalid, stamped for another GPU, or meant for another card.
+    /// The exited game's part ends as its own exit would (its RevertOnExit
+    /// decides), then the remaining game starts as if it had started alone —
+    /// on another card that includes capturing that card's state, which is the
+    /// only restore target that card has.
+    /// </summary>
+    EndThenStart,
+}
+
+/// <summary>
 /// Pre-game capture and post-game restore for game rules. The restore used to
 /// rebuild only what ReadCurrent can see (core/mem/power/boost/lock), so a game
 /// profile's temperature limit and per-point V/F curve stayed applied after the
@@ -245,6 +279,82 @@ public static class GameSessionRestore
         }
 
         return new GameRestorePlan(profile, fans, notRestored);
+    }
+
+    /// <summary>
+    /// Decides a hand-off (R1). <paramref name="next"/> is the remaining game's
+    /// profile (null when it could not be loaded), <paramref name="nextGpuIndex"/>
+    /// and <paramref name="nextGpuUuid"/> the card it would land on. A swap needs
+    /// the snapshot's own card — the same identity test as the exit restore — and
+    /// a profile that card's tuner would accept, so the pre-game state is never
+    /// put back for a profile that then gets refused.
+    /// </summary>
+    public static GameHandoff PlanHandoff(
+        PreGameSnapshot? pre, TuningProfile? next, uint? nextGpuIndex, string? nextGpuUuid)
+    {
+        if (pre is null)
+        {
+            return GameHandoff.StartFresh;
+        }
+
+        bool sameCard = nextGpuIndex == pre.GpuIndex &&
+            (pre.GpuUuid is null || string.Equals(nextGpuUuid, pre.GpuUuid, StringComparison.OrdinalIgnoreCase));
+        return next is not null && sameCard && next.AppliesToGpu(nextGpuUuid) &&
+               next.Validate(pre.LockFloorMHz, pre.PowerFloorW) is null
+            ? GameHandoff.Swap
+            : GameHandoff.EndThenStart;
+    }
+
+    /// <summary>
+    /// The session's snapshot after a swap: the state it captured stays exactly
+    /// as read before the first game (no new capture, R1); only the game, and the
+    /// profile that decides what the final restore covers, become the new one's.
+    /// What the exited game's profile changed was put back by the swap itself.
+    /// </summary>
+    public static PreGameSnapshot HandedOff(PreGameSnapshot pre, string executable, TuningProfile next)
+    {
+        ArgumentNullException.ThrowIfNull(pre);
+        ArgumentNullException.ThrowIfNull(next);
+        return pre with { Executable = executable, GameProfile = next };
+    }
+
+    /// <summary>
+    /// The tray message after a swap, from what happened: the restore half and
+    /// the apply half are both reported when either fell short.
+    /// </summary>
+    /// <param name="fansRestored">Null when the fans were not part of the restore half.</param>
+    public static string DescribeHandoff(
+        string exitedExecutable, GameRule next, ApplyResult restore, bool? fansRestored,
+        IReadOnlyList<string> notRestored, ApplyResult applied)
+    {
+        ArgumentNullException.ThrowIfNull(next);
+        ArgumentNullException.ThrowIfNull(restore);
+        ArgumentNullException.ThrowIfNull(notRestored);
+        ArgumentNullException.ThrowIfNull(applied);
+        string head = $"{exitedExecutable} exited — '{next.ProfileName}' for {next.ExecutableName}, still running, took over";
+        var failedRestore = restore.Results.Where(r => !r.Applied).Select(r => r.Knob).ToList();
+        if (fansRestored == false)
+        {
+            failedRestore.Add("fans");
+        }
+
+        var parts = new List<string>();
+        if (failedRestore.Count > 0)
+        {
+            parts.Add($"putting back the pre-game {string.Join(", ", failedRestore)} failed");
+        }
+
+        if (notRestored.Count > 0)
+        {
+            parts.Add($"not put back: {string.Join("; ", notRestored)}");
+        }
+
+        if (!applied.AllSucceeded)
+        {
+            parts.Add("some of its knobs failed");
+        }
+
+        return parts.Count == 0 ? head + "." : $"{head}, but {string.Join("; ", parts)}.";
     }
 
     /// <summary>

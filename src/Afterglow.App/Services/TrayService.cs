@@ -46,6 +46,8 @@ public sealed partial class TrayService : IDisposable
     private readonly HwndSource _window;
     private readonly nint _icon;
     private readonly ContextMenu _menu;
+    private MenuItem? _overlayItem;
+    private MenuItem? _resetItem;
     private readonly Dictionary<string, DateTime> _lastAlertByTitle = [];
     private string _tooltip = "Afterglow";
     private bool _disposed;
@@ -114,12 +116,24 @@ public sealed partial class TrayService : IDisposable
 
         var menu = new ContextMenu { Placement = PlacementMode.MousePoint };
         menu.Items.Add(Item("Open Afterglow", () => OpenRequested?.Invoke(), isDefault: true));
-        menu.Items.Add(Item("Toggle overlay (Ctrl+Alt+O)", () => OverlayToggleRequested?.Invoke()));
+        _overlayItem = Item("Toggle overlay", () => OverlayToggleRequested?.Invoke());
+        menu.Items.Add(_overlayItem);
         menu.Items.Add(new Separator());
-        menu.Items.Add(Item("Reset GPU to defaults (Ctrl+Alt+R)", () => ResetRequested?.Invoke()));
+        _resetItem = Item("Reset GPU to defaults", () => ResetRequested?.Invoke());
+        menu.Items.Add(_resetItem);
         menu.Items.Add(new Separator());
         menu.Items.Add(Item("Exit", () => ExitRequested?.Invoke()));
         return menu;
+    }
+
+    /// <summary>Shows each item's shortcut while one is registered (it moves with Settings and keyboard layouts).</summary>
+    public void SetShortcuts(HotkeyStatus? overlay, HotkeyStatus? reset)
+    {
+        static string Header(string text, HotkeyStatus? status) =>
+            status is { IsActive: true, Chord: { } chord } ? $"{text} ({chord})" : text;
+
+        _overlayItem!.Header = Header("Toggle overlay", overlay);
+        _resetItem!.Header = Header("Reset GPU to defaults", reset);
     }
 
     private nint WndProc(nint hwnd, int msg, nint wParam, nint lParam, ref bool handled)

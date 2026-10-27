@@ -45,13 +45,6 @@ public partial class ProfilesViewModel : ObservableObject
         }
     }
 
-    private static Core.Interop.Nvapi.GameDriverSettings ToDriverSettings(GameRule rule) => new()
-    {
-        FrameCapFps = rule.FrameCapFps,
-        Vsync = rule.DriverVsync,
-        LowLatency = rule.LowLatency,
-    };
-
     [ObservableProperty]
     public partial GameRule? SelectedRule { get; set; }
 
@@ -73,7 +66,8 @@ public partial class ProfilesViewModel : ObservableObject
     [ObservableProperty] public partial bool CertifyRunning { get; set; }
     [ObservableProperty] public partial string CertifyPhaseText { get; set; } = string.Empty;
     [ObservableProperty] public partial double CertifyProgress { get; set; }
-    [ObservableProperty] public partial string CertifyLog { get; set; } = string.Empty;
+    /// <summary>The run's whole log, shown by a LogView that appends only new lines (#7).</summary>
+    [ObservableProperty] public partial IReadOnlyList<string> CertifyLog { get; set; } = Core.Stress.RunLogLines.Empty;
 
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(CertifySecondsLabel))]
@@ -87,14 +81,11 @@ public partial class ProfilesViewModel : ObservableObject
 
     public string CertifySecondsLabel => $"{CertifySeconds:F0} s per mode";
 
-    public string SelectedCertificationText => Selected is not { } p
-        ? string.Empty
-        : string.Join("   ", CertificationModes.All.Select(mode =>
-            p.ValidCertification(mode) is { } cert
-                ? $"{mode} ✓ {cert.PassedAt:MM-dd}"
-                : p.OffsetMatchedCertification(mode) is not null
-                    ? $"{mode} ⚠ driver changed"
-                    : $"{mode} —"));
+    /// <summary>
+    /// Each mode's mark, then why any stored pass no longer counts — a driver
+    /// change, or a burn from before R-01's fix (Core, so it is tested).
+    /// </summary>
+    public string SelectedCertificationText => Selected?.StatusSummary() ?? string.Empty;
 
     partial void OnSelectedChanged(TuningProfile? value) =>
         OnPropertyChanged(nameof(SelectedCertificationText));
@@ -115,13 +106,23 @@ public partial class ProfilesViewModel : ObservableObject
         }
 
         var profile = Selected;
-        _certifier = new ProfileCertifier(gpu.Tuner, _services.Profiles, gpu.PciBusId, gpu.PciVendorId);
+
+        // The run happens under the profile's own fan policy, through this
+        // card's fan service, and puts back what that service was doing (R-11).
+        var fans = _services.FanControl.TryGetValue(gpu.Index, out var fanService)
+            ? new CertificationFans(fanService, () => Core.Tuning.GameSessionRestore.CaptureFans(
+                fanService.Mode, fanService.CommandedDuty, _services.FanSettingsFor(gpu)))
+            : null;
+        _certifier = new ProfileCertifier(gpu.Tuner, _services.Profiles, gpu.PciBusId, gpu.PciVendorId, fans);
         _certifier.StatusChanged += status =>
             System.Windows.Application.Current?.Dispatcher.BeginInvoke(() => OnCertifierStatus(status));
         CertifyRunning = true;
         _services.Flight?.Marker($"certify-start profile={profile.Name}");
         _certifier.Start(profile, new CertifierOptions { SecondsPerMode = (int)CertifySeconds });
     }
+
+    [RelayCommand]
+    private void CopyCertifyLog() => ClipboardSafe.Copy(string.Join(Environment.NewLine, CertifyLog));
 
     private void OnCertifierStatus(CertifierStatus status)
     {
@@ -130,6 +131,12 @@ public partial class ProfilesViewModel : ObservableObject
             ? $"[{status.ModeIndex + 1}/{status.ModeCount}] {status.Phase} — {status.ModeElapsed:mm\\:ss} / {status.ModeDuration:mm\\:ss}"
             : status.Passed == true
                 ? "Certified across all four modes — marked stable."
+                : status.Phase == "interrupted"
+                    ? "Interrupted — the configuration under test, or the saved profile, changed during the run. " +
+                      "Nothing more was stamped or written to the GPU. See the log."
+                : status.FailedMode == "fans"
+                    ? "Failed before the run: the profile's fan policy could not be applied, so nothing else was. " +
+                      "See the log."
                 : status.FailedMode is { } failed
                     // Say what happened, not what was intended. This line
                     // asserted a reset for every failure — including the "apply"
@@ -151,7 +158,7 @@ public partial class ProfilesViewModel : ObservableObject
                 (status.ModeIndex + status.ModeElapsed.TotalSeconds / status.ModeDuration.TotalSeconds) /
                 status.ModeCount, 0, 1)
             : status.Passed == true ? 1 : 0;
-        CertifyLog = string.Join(Environment.NewLine, status.Log.TakeLast(10));
+        CertifyLog = status.Log;
 
         if (!status.Running)
         {
@@ -198,6 +205,13 @@ public partial class ProfilesViewModel : ObservableObject
 
         if (_services.Profiles.LastLoadErrors.Count > 0)
         {
+            // The status line points at the log, so the log has to say which
+            // files and why (R-24 made a corrupt profile one of them).
+            foreach (var (file, error) in _services.Profiles.LastLoadErrors)
+            {
+                Core.Diagnostics.Log.Warn($"Profile not loaded: {file}: {error}");
+            }
+
             StatusText = $"{_services.Profiles.LastLoadErrors.Count} profile file(s) could not be loaded (see logs).";
         }
     }
@@ -217,11 +231,16 @@ public partial class ProfilesViewModel : ObservableObject
             exe += ".exe";
         }
 
-        int capFps = int.TryParse(NewRuleCapFps.Trim(),
-            System.Globalization.NumberStyles.Integer,
-            System.Globalization.CultureInfo.InvariantCulture, out int cap)
-            ? Math.Clamp(cap, 0, 1000)
-            : 0;
+        // Empty, 0 / off, or 1–1000 (R1). Text that is none of those used to be
+        // saved as 0 and an out-of-range number clamped, both silently; empty
+        // was saved as 0 too, so "leave the cap to the driver" and "off" could
+        // not be told apart.
+        if (GameRule.ParseFrameCap(NewRuleCapFps, out int? capFps) is string capError)
+        {
+            StatusText = $"{capError} The rule was not added.";
+            return;
+        }
+
         var rule = new GameRule
         {
             ExecutableName = exe,
@@ -230,6 +249,19 @@ public partial class ProfilesViewModel : ObservableObject
             DriverVsync = NewRuleVsyncIndex switch { 1 => "on", 2 => "off", _ => "default" },
             LowLatency = NewRuleLowLatency,
         };
+
+        // One rule per game: the watcher keys rules by executable, so a second
+        // rule for the same exe silently overrode the first while both showed,
+        // and removing either cleared the driver settings of both. Adding a rule
+        // for a game that has one replaces it — the way a rule is edited.
+        var replaced = GameRules
+            .Where(r => string.Equals(r.ExecutableName, exe, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        foreach (var old in replaced)
+        {
+            GameRules.Remove(old);
+        }
+
         GameRules.Add(rule);
         PersistRules();
         NewRuleExe = string.Empty;
@@ -237,23 +269,37 @@ public partial class ProfilesViewModel : ObservableObject
         NewRuleVsyncIndex = 0;
         NewRuleLowLatency = false;
 
-        string drsNote = string.Empty;
-        if (ToDriverSettings(rule).AnythingSet)
+        // What the replaced rule wrote, so an emptied cap takes back the cap it
+        // wrote (DrsApi.ReleaseCap). The last one is the one the watcher used.
+        var before = replaced.LastOrDefault()?.ToDriverSettings();
+        if (before is { AnythingSet: false })
         {
-            drsNote = ApplyRuleDriverSettings(rule);
+            before = null;
         }
 
-        StatusText = $"When {exe} runs, '{rule.ProfileName}' will be applied automatically (reverted on exit).{drsNote}";
+        string drsNote = string.Empty;
+        if (rule.ToDriverSettings().AnythingSet)
+        {
+            drsNote = ApplyRuleDriverSettings(rule, before);
+        }
+        else if (before is not null)
+        {
+            // The new rule writes nothing; the old one's settings would outlive it.
+            drsNote = ClearRuleDriverSettings(replaced[^1]);
+        }
+
+        StatusText = $"{(replaced.Count > 0 ? "Rule replaced. " : string.Empty)}" +
+                     $"When {exe} runs, '{rule.ProfileName}' will be applied automatically (reverted on exit).{drsNote}";
     }
 
-    private string ApplyRuleDriverSettings(GameRule rule)
+    private string ApplyRuleDriverSettings(GameRule rule, Core.Interop.Nvapi.GameDriverSettings? replacing)
     {
         if (Drs is not { } drs)
         {
             return " Driver settings NOT applied — DRS unavailable on this system.";
         }
 
-        var rc = drs.ApplySettings(rule.ExecutableName, ToDriverSettings(rule), out string note);
+        var rc = drs.ApplySettings(rule.ExecutableName, rule.ToDriverSettings(), replacing, out string note);
         if (rc == Core.Interop.Nvapi.NvapiStatus.Ok)
         {
             return $" Driver settings applied and {note} (persist in the driver, active whenever the game runs).";
@@ -284,14 +330,30 @@ public partial class ProfilesViewModel : ObservableObject
 
         PersistRules();
         string drsNote = string.Empty;
-        if (ToDriverSettings(rule).AnythingSet && Drs is { } drs)
+        if (rule.ToDriverSettings().AnythingSet)
         {
-            drsNote = drs.ClearSettings(rule.ExecutableName) == Core.Interop.Nvapi.NvapiStatus.Ok
-                ? " Driver settings cleared."
-                : " Driver settings could not be cleared.";
+            drsNote = ClearRuleDriverSettings(rule);
         }
 
         StatusText = $"Rule removed.{drsNote}";
+    }
+
+    /// <summary>
+    /// Takes back what one rule wrote to the driver store. Scoped to that rule
+    /// (R1): a rule whose cap was empty never removes a cap, and a cap changed
+    /// since Afterglow wrote it (in NVIDIA Control Panel, say) is kept and named.
+    /// </summary>
+    private string ClearRuleDriverSettings(GameRule rule)
+    {
+        if (Drs is not { } drs)
+        {
+            return string.Empty;
+        }
+
+        return drs.ClearSettings(rule.ExecutableName, rule.ToDriverSettings(), out string note) ==
+               Core.Interop.Nvapi.NvapiStatus.Ok
+            ? $" Driver settings cleared ({note})."
+            : $" Driver settings could not be cleared ({note}).";
     }
 
     private void PersistRules()
@@ -318,34 +380,16 @@ public partial class ProfilesViewModel : ObservableObject
             var gpu = _services.SelectedGpu;
 
             // Per-point curve offsets are part of the picture too, on any GPU
-            // whose driver answered the live probe: capture whatever is applied
-            // right now — the whole table, explicit zeros included, whenever it
-            // holds more than the global core offset (F-02/F-07: dropping the
-            // zeros a flatten writes let re-apply resurrect what was under them).
-            IReadOnlyDictionary<int, int>? vfPoints = null;
-            bool capturedVfPoints = false;
-            if (gpu is { Tuner.Capabilities.SupportsVfPoints: true } &&
-                gpu.Tuner.TryReadVfPoints(out var tablePoints) == Core.Interop.Nvapi.NvapiStatus.Ok)
-            {
-                vfPoints = Core.Tuning.VfPointPlanner.CaptureForProfile(
-                    tablePoints, gpu.Tuner.ReadCurrent().CoreOffsetMHz);
-
-                // The table was read, so "none" here is a fact about this card
-                // and applying the profile may remove a curve. A profile that
-                // never read it says nothing about the curve either way.
-                capturedVfPoints = true;
-            }
-
-            var profile = _tuning.ToProfile(name) with
+            // whose driver answered the live probe: the whole table, explicit
+            // zeros included (F-02/F-07), and CapturedVfPoints only when it was
+            // actually read. Shared with MCP's save_profile (R-35), which had
+            // its own copy of this save without the table.
+            var profile = (_tuning.ToProfile(name) with
             {
                 FanMode = fanMode,
                 FixedFanPct = fixedPct,
                 FanCurve = fanMode == FanMode.Curve ? curve : null,
-                GpuUuid = gpu?.Uuid,
-                GpuName = gpu?.Name,
-                VfPointOffsetsMHz = vfPoints,
-                CapturedVfPoints = capturedVfPoints,
-            };
+            }).CapturedFrom(gpu);
             _services.Profiles.Save(profile);
             StatusText = $"Saved '{name}' (tuning + {fanMode switch { FanMode.Curve => "fan curve", FanMode.Fixed => "fixed fans", _ => "auto fans" }}).";
             NewProfileName = string.Empty;
@@ -365,10 +409,9 @@ public partial class ProfilesViewModel : ObservableObject
             return;
         }
 
-        // Load first: a full apply reloads the sliders from the card when it lands, so
-        // they end on what the card is running (a clamp or a refused knob shows), and a
-        // refused apply leaves the profile loaded and marked as unapplied.
-        _tuning.LoadProfile(Selected);
+        // The apply callback loads the profile into the Tuning sliders first when it
+        // lands on the selected card, and leaves them alone when it lands on another
+        // GPU (MainViewModel.ApplyFromProfilesPage, R-49).
         var result = _applyFull(Selected);
         StatusText = $"Applied '{Selected.Name}': {result.Summary}";
     }

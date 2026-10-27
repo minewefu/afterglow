@@ -294,18 +294,15 @@ public sealed class GpuManager : IDisposable
 /// <summary>Fills the NVAPI-only sensor fields for each telemetry tick.</summary>
 internal sealed class NvapiEnricher
 {
-    private readonly NvmlDevice _nvml;
     private readonly NvapiGpu _nvapi;
-    private uint _fanCount;
+    private readonly FanRpmReader _fanRpms;
 
     public NvapiEnricher(NvmlDevice nvml, NvapiGpu nvapi)
     {
-        _nvml = nvml;
         _nvapi = nvapi;
-        if (_nvml.TryGetNumFans(out uint fans) == NvmlReturn.Success)
-        {
-            _fanCount = Math.Min(fans, 16);
-        }
+        _fanRpms = new FanRpmReader(
+            nvml.TryGetNumFans(out uint fans) == NvmlReturn.Success ? fans : 0,
+            nvml.TryGetFanRpm);
     }
 
     public NvapiEnrichment Read()
@@ -318,33 +315,74 @@ internal sealed class NvapiEnricher
             voltage = Math.Round(mv, 1);
         }
 
-        uint[]? rpms = null;
-        if (_fanCount > 0)
-        {
-            rpms = new uint[_fanCount];
-            bool any = false;
-            for (uint f = 0; f < _fanCount; f++)
-            {
-                if (_nvml.TryGetFanRpm(f, out uint rpm) == NvmlReturn.Success)
-                {
-                    rpms[f] = rpm;
-                    any = true;
-                }
-            }
-
-            if (!any)
-            {
-                rpms = null;
-                _fanCount = 0;
-            }
-        }
-
         return new NvapiEnrichment
         {
             HotSpotTempC = hotSpot,
             MemJunctionTempC = memJunction,
             CoreVoltageMv = voltage,
-            FanRpms = rpms,
+            FanRpms = _fanRpms.Read(),
         };
+    }
+}
+
+/// <summary>
+/// Per-fan NVML RPM reads for one NVIDIA GPU, split out of
+/// <see cref="NvapiEnricher"/> behind a delegate so the latch rule is testable
+/// without a driver.
+/// </summary>
+internal sealed class FanRpmReader
+{
+    internal delegate NvmlReturn RpmRead(uint fan, out uint rpm);
+
+    private readonly RpmRead _read;
+    private uint _fanCount;
+
+    public FanRpmReader(uint fanCount, RpmRead read)
+    {
+        _fanCount = Math.Min(fanCount, 16);
+        _read = read;
+    }
+
+    /// <summary>One RPM per fan (0 for a fan whose read failed), or null when no fan answered.</summary>
+    public uint[]? Read()
+    {
+        if (_fanCount == 0)
+        {
+            return null;
+        }
+
+        var rpms = new uint[_fanCount];
+        bool any = false;
+        bool allUnsupported = true;
+        for (uint f = 0; f < _fanCount; f++)
+        {
+            var rc = _read(f, out uint rpm);
+            if (rc == NvmlReturn.Success)
+            {
+                rpms[f] = rpm;
+                any = true;
+            }
+            else
+            {
+                allUnsupported &= rc is NvmlReturn.NotSupported or NvmlReturn.FunctionNotFound;
+            }
+        }
+
+        if (any)
+        {
+            return rpms;
+        }
+
+        // Stop asking only when the driver said the read is unsupported — the
+        // rule SensorPoller's fan-percentage path follows. Latching on any
+        // failure meant one GpuIsLost tick during a TDR disabled RPM reads for
+        // the rest of the process, so the RPM tile stayed blank after the
+        // driver recovered (R-36). A transient error retries next tick.
+        if (allUnsupported)
+        {
+            _fanCount = 0;
+        }
+
+        return null;
     }
 }

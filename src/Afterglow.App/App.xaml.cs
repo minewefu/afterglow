@@ -24,7 +24,6 @@ public partial class App : Application
     private bool _ephemeralRun;
     private MainViewModel? _mainViewModel;
     private TrayService? _tray;
-    private HotkeyService? _hotkeys;
     private DispatcherTimer? _tooltipTimer;
     private bool _exitRequested;
     private System.Threading.Mutex? _singleInstanceMutex;
@@ -65,7 +64,9 @@ public partial class App : Application
 
         // Installer hook: register the elevated no-UAC logon task and exit.
         // The installer's post-install step runs elevated, so this succeeds
-        // without any prompt of its own.
+        // without any prompt of its own. Setup may run as an administrator who
+        // only typed a password for the signed-in user, so the task is for the
+        // user signed in to this session, not for this process's account (R-41).
         if (args.Contains("--register-startup"))
         {
             string? failure = AppServices.CheckElevated()
@@ -73,9 +74,26 @@ public partial class App : Application
                 : "the post-install step did not run elevated.";
             if (failure is not null)
             {
-                // Inno runs this hidden and ignores the exit code, so the log is
-                // the only place a refusal can still be read afterwards.
+                // Setup runs this hidden and can only show a generic message
+                // from the exit code; the log keeps the actual reason.
                 Core.Diagnostics.Log.Error($"--register-startup did not register the task: {failure}");
+            }
+
+            Shutdown(failure is null ? 0 : 1);
+            return;
+        }
+
+        // Uninstaller hook (R-46): every Windows user has their own startup task,
+        // so no fixed name in [UninstallRun] can remove them all. Enumerate and
+        // delete every user's task plus the legacy machine-global one, and exit.
+        if (args.Contains("--unregister-startup-all-users"))
+        {
+            string? failure = AppServices.CheckElevated()
+                ? (StartupTaskService.RemoveAllUsersTasks() ? null : "not every startup task could be removed.")
+                : "the uninstall step did not run elevated.";
+            if (failure is not null)
+            {
+                Core.Diagnostics.Log.Error($"--unregister-startup-all-users: {failure}");
             }
 
             Shutdown(failure is null ? 0 : 1);
@@ -242,11 +260,15 @@ public partial class App : Application
             Shutdown();
         };
 
-        _hotkeys = new HotkeyService();
-        _hotkeys.OverlayToggle += () => _mainViewModel?.ToggleOverlay();
-        _hotkeys.PanicReset += () => _mainViewModel?.PanicReset();
-        _hotkeys.ApplyProfileSlot += slot => _mainViewModel?.ApplyProfileSlot(slot);
-        _hotkeys.Attach(window);
+        var hotkeys = Services.Hotkeys;
+        hotkeys.OverlayToggle += () => _mainViewModel?.ToggleOverlay();
+        hotkeys.PanicReset += () => _mainViewModel?.PanicReset();
+        hotkeys.ApplyProfileSlot += slot => _mainViewModel?.ApplyProfileSlot(slot);
+        hotkeys.StatusChanged += () => _tray?.SetShortcuts(
+            hotkeys.StatusOf(Core.Hotkeys.HotkeyAction.ToggleOverlay),
+            hotkeys.StatusOf(Core.Hotkeys.HotkeyAction.PanicReset));
+        hotkeys.Attach(window, Services.Settings.Hotkeys);
+        Services.SettingsChanged += settings => hotkeys.Apply(settings.Hotkeys);
 
         if (_mainViewModel is not null)
         {
@@ -260,6 +282,10 @@ public partial class App : Application
             {
                 _tray?.UpdateTooltip(_mainViewModel.BuildTrayTooltip());
             }
+
+            // A keyboard layout added while Afterglow runs can make a shortcut
+            // type a character; Windows sends no message for that, so look here.
+            _services?.Hotkeys.RefreshIfLayoutsChanged();
         };
         _tooltipTimer.Start();
 
@@ -439,9 +465,14 @@ public partial class App : Application
         }
 
         _exitRequested = true;
-        _tooltipTimer?.Stop();
-        _hotkeys?.Dispose();
-        _tray?.Dispose();
+
+        // Every step is independent (R-05): one that throws is logged and the
+        // rest still run — above all the services' hardware release, then the
+        // mutexes. A plain sequence let any early failure skip the fan release.
+        var steps = new Core.Services.ShutdownSteps();
+        steps.Run("tooltip timer", () => _tooltipTimer?.Stop());
+        steps.Run("hotkeys", () => _services.Hotkeys.Dispose());
+        steps.Run("tray icon", () => _tray?.Dispose());
 
         // Before the clean-shutdown mark and before the GPU services go away: a
         // stepper still in flight has an untested offset applied, and its cancel
@@ -454,26 +485,32 @@ public partial class App : Application
         // surviving with nothing to say so (F-27).
         // The V/F probe pins exact clocks the same way: cancel it first so its
         // unwind overlaps the stepper's, then require both to have landed.
-        _mainViewModel?.VfCurve.RequestProbeStop();
-        bool settled = _mainViewModel?.Stability.StopForShutdown() ?? true;
-        settled &= _mainViewModel?.VfCurve.StopForShutdown() ?? true;
+        steps.Run("V/F probe stop request", () => _mainViewModel?.VfCurve.RequestProbeStop());
+        steps.RunEssential("stability stepper", () => _mainViewModel?.Stability.StopForShutdown() ?? true);
+        steps.RunEssential("V/F probe", () => _mainViewModel?.VfCurve.StopForShutdown() ?? true);
+        steps.Run("stability page", () => _mainViewModel?.Stability.Dispose());
+
+        // The services hand the fans back BEFORE the clean-shutdown mark, and
+        // the mark waits on them (R-05). Marking first stamped the session clean
+        // even when the release never ran (a teardown step threw ahead of it)
+        // or the driver refused it, and the next launch showed no banner for a
+        // card left pinned — possibly stopped.
+        steps.RunEssential("services", _services.Shutdown);
 
         // Only the resident instance may vouch for a clean exit: a --demo or
         // --screenshot run starts services but applies nothing, and a second
         // launch that just signalled the first holds no instance mutex — either
         // would otherwise mark the RUNNING instance's records clean and erase
-        // its crash evidence.
-        if (settled && !_ephemeralRun && _singleInstanceMutex is not null)
+        // its crash evidence. The instance mutex is still held here.
+        if (steps.EssentialSucceeded && !_ephemeralRun && _singleInstanceMutex is not null)
         {
-            AppliedStateStore.MarkCleanShutdown();
+            steps.Run("clean-shutdown mark", () => AppliedStateStore.MarkCleanShutdown());
         }
 
-        _mainViewModel?.Stability.Dispose();
-        _services?.Dispose();
-        _activationWait?.Unregister(null);
-        _activationSignal?.Dispose();
-        _singleInstanceMutex?.Dispose();
-        _hardwareOwnerMutex?.Dispose();
+        steps.Run("activation wait", () => _activationWait?.Unregister(null));
+        steps.Run("activation signal", () => _activationSignal?.Dispose());
+        steps.Run("single-instance mutex", () => _singleInstanceMutex?.Dispose());
+        steps.Run("hardware-owner mutex", () => _hardwareOwnerMutex?.Dispose());
         base.OnExit(e);
     }
 }

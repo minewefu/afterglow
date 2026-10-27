@@ -6,8 +6,8 @@ namespace Afterglow.Core.Diagnostics;
 
 /// <summary>
 /// Always-on telemetry black box: appends one compact line per snapshot to a
-/// session file, plus event markers (applied offsets, stress runs, clean
-/// shutdown). After a hard crash the file ends mid-flight — the missing
+/// session file, plus event markers (applied tuning — see <see cref="FlightTuning"/> —
+/// stress runs, clean shutdown). After a hard crash the file ends mid-flight — the missing
 /// clean-shutdown marker plus the last recorded seconds are what
 /// <see cref="CrashForensics"/> reconstructs the death from.
 /// Costs ~50 bytes/second. The file is capped at <see cref="SegmentBytes"/>:
@@ -25,7 +25,15 @@ public sealed class FlightRecorder : IDisposable
     /// <summary>Lines buffered while the disk is stalled; beyond this the newest are dropped.</summary>
     private const int QueueCapacity = 4096;
 
-    private readonly BlockingCollection<string> _queue = new(QueueCapacity);
+    /// <summary>
+    /// One queued line. <paramref name="Flush"/> pushes it through to the disk
+    /// once written; <paramref name="Written"/>, when set, is completed after
+    /// that — true when the line reached the disk — for a caller waiting on it
+    /// (<see cref="MarkerDurable"/>).
+    /// </summary>
+    private readonly record struct Entry(string Line, bool Flush = false, TaskCompletionSource<bool>? Written = null);
+
+    private readonly BlockingCollection<Entry> _queue = new(QueueCapacity);
     private readonly Thread _writerThread;
     private readonly string _olderPath;
     private readonly long _segmentBytes;
@@ -38,8 +46,21 @@ public sealed class FlightRecorder : IDisposable
     // hours into a session would be analyzed as "at stock".
     private string? _offsetsMarker;
 
-    private int _lastCoreOffset = int.MinValue;
-    private int _lastMemOffset = int.MinValue;
+    // Write-start lines whose write-end has not been written (writer thread
+    // only), carried into a new segment for the same reason: a crash inside a
+    // write that straddled a roll must still read as inside it.
+    private readonly Dictionary<long, string> _openWrites = [];
+
+    // A durable marker that timed out and is still queued: the disk is
+    // behind, and waiting again would only stall every later write as well.
+    private Task? _stalledDurable;
+
+    // Tuning is recorded from every thread that writes the GPU (R-43), not only
+    // from the telemetry tick, so the dedup and the enqueue are one step under
+    // a lock: two writers must not both pass the check, nor enqueue in the
+    // opposite order to the one the check saw.
+    private readonly Lock _tuningLock = new();
+    private FlightTuning? _lastTuning;
     private int _disposed;
 
     public string CurrentPath { get; }
@@ -63,7 +84,7 @@ public sealed class FlightRecorder : IDisposable
         Rotate(_olderPath, Path.Combine(directory, "previous.older.log"), dropStale: true);
 
         _writer = Open(CurrentPath);
-        Enqueue($"#flight v1 started={DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}");
+        _ = TryEnqueue(new Entry($"#flight v1 started={DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}"));
 
         _writerThread = new Thread(WriteLoop)
         {
@@ -73,22 +94,81 @@ public sealed class FlightRecorder : IDisposable
         _writerThread.Start();
     }
 
-    public void Record(GpuSnapshot snapshot) => Enqueue(FormatLine(snapshot));
+    public void Record(GpuSnapshot snapshot) => TryEnqueue(new Entry(FormatLine(snapshot)));
 
-    /// <summary>Logs the currently applied offsets; deduplicated, so call freely.</summary>
-    public void RecordOffsets(int coreOffsetMHz, int memOffsetMHz)
+    /// <summary>Logs the currently applied offsets alone; deduplicated, so call freely.</summary>
+    public void RecordOffsets(int coreOffsetMHz, int memOffsetMHz) =>
+        RecordTuning(new FlightTuning { CoreOffsetMHz = coreOffsetMHz, MemOffsetMHz = memOffsetMHz });
+
+    /// <summary>
+    /// Logs the card's tuning state (offsets, clock lock, V/F-point edits, GPU
+    /// identity) when it differs from the last one logged; safe from any thread.
+    /// See <see cref="TuningFlightSampler"/> for who calls it and when.
+    /// </summary>
+    public void RecordTuning(FlightTuning tuning)
     {
-        if (coreOffsetMHz == _lastCoreOffset && memOffsetMHz == _lastMemOffset)
+        lock (_tuningLock)
         {
-            return;
-        }
+            if (tuning == _lastTuning)
+            {
+                return;
+            }
 
-        _lastCoreOffset = coreOffsetMHz;
-        _lastMemOffset = memOffsetMHz;
-        Marker($"offsets core={coreOffsetMHz} mem={memOffsetMHz}");
+            _lastTuning = tuning;
+            Marker(tuning.ToMarkerText());
+        }
     }
 
-    public void Marker(string text) => Enqueue(MarkerLine(text));
+    public void Marker(string text) => TryEnqueue(new Entry(MarkerLine(text)));
+
+    /// <summary>
+    /// A marker pushed through to the disk by the writer thread once written,
+    /// without the caller waiting for it: survives a hard reset a moment later.
+    /// </summary>
+    public void MarkerFlushed(string text) => TryEnqueue(new Entry(MarkerLine(text), Flush: true));
+
+    /// <summary>
+    /// A marker that must be on the disk before the caller goes on: a tuning
+    /// write announces itself this way, so a crash the write itself causes
+    /// finds it there (see <see cref="Tuning.IGpuTuner.WriteStarting"/>). The line is
+    /// written in order, after everything queued before it, and the caller
+    /// waits until the writer thread has flushed it — at most
+    /// <paramref name="timeout"/>. True when it is on disk.
+    /// <para>
+    /// The cost is one FlushFileBuffers of this file per tuning write, a
+    /// millisecond or so on an SSD. A disk that does not answer in time costs
+    /// one timeout: until that marker is written, later ones are queued
+    /// (still flushed when they are reached) and not waited for.
+    /// </para>
+    /// </summary>
+    public bool MarkerDurable(string text, TimeSpan timeout)
+    {
+        string line = MarkerLine(text);
+        if (Volatile.Read(ref _stalledDurable) is { IsCompleted: false })
+        {
+            _ = TryEnqueue(new Entry(line, Flush: true));
+            return false;
+        }
+
+        var written = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!TryEnqueue(new Entry(line, Flush: true, Written: written)))
+        {
+            return false;
+        }
+
+        if (written.Task.Wait(timeout))
+        {
+            return written.Task.Result;
+        }
+
+        Volatile.Write(ref _stalledDurable, written.Task);
+        Log.Warn($"Flight recorder: a tuning-write marker was not on disk within {timeout.TotalMilliseconds:F0} ms; " +
+                 "the write went ahead, and later ones won't wait until the disk catches up.");
+        return false;
+    }
+
+    /// <summary>Test seam: runs on the writer thread before each line, e.g. to stall it like a hung disk.</summary>
+    internal Action<string>? BeforeWrite { get; set; }
 
     internal static string FormatLine(GpuSnapshot s) => string.Create(
         CultureInfo.InvariantCulture,
@@ -98,7 +178,7 @@ public sealed class FlightRecorder : IDisposable
     private static string MarkerLine(string text) => string.Create(
         CultureInfo.InvariantCulture, $"#{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()} {text}");
 
-    private void Enqueue(string line)
+    private bool TryEnqueue(Entry entry)
     {
         // A full queue means the disk has been stalled for over an hour; drop
         // rather than block the caller (the telemetry thread).
@@ -106,25 +186,33 @@ public sealed class FlightRecorder : IDisposable
         {
             try
             {
-                _ = _queue.TryAdd(line);
+                return _queue.TryAdd(entry);
             }
             catch (InvalidOperationException)
             {
                 // Completed by a concurrent Dispose.
             }
         }
+
+        return false;
     }
 
     private void WriteLoop()
     {
         try
         {
-            foreach (string line in _queue.GetConsumingEnumerable())
+            foreach (var entry in _queue.GetConsumingEnumerable())
             {
+                bool landed = false;
                 if (!_failed)
                 {
-                    Write(line);
+                    BeforeWrite?.Invoke(entry.Line);
+                    landed = Write(entry.Line, entry.Flush);
                 }
+
+                // Released whether or not the disk took it: a waiter must never
+                // outlive the line it waits for.
+                entry.Written?.TrySetResult(landed);
             }
         }
         catch (Exception ex)
@@ -139,7 +227,8 @@ public sealed class FlightRecorder : IDisposable
     // Writer thread only: set when the session file can no longer be written.
     private bool _failed;
 
-    private void Write(string line)
+    /// <summary>Writes one line (flushed to disk when asked, or when it is a tuning line); false when the disk refused it.</summary>
+    private bool Write(string line, bool flush = false)
     {
         try
         {
@@ -151,11 +240,36 @@ public sealed class FlightRecorder : IDisposable
             _writer.WriteLine(line);
             _bytes += line.Length + Environment.NewLine.Length;
             if (line.Length > 1 && line[0] == '#' &&
-                line.IndexOf(' ', StringComparison.Ordinal) is int space and > 0 &&
-                line.AsSpan(space + 1).StartsWith("offsets ", StringComparison.Ordinal))
+                line.IndexOf(' ', StringComparison.Ordinal) is int space and > 0)
             {
-                _offsetsMarker = line[(space + 1)..];
+                string text = line[(space + 1)..];
+                if (text.StartsWith("offsets ", StringComparison.Ordinal))
+                {
+                    _offsetsMarker = text;
+
+                    // The tuning line is the one a crash report most needs, and
+                    // AutoFlush only hands it to the Windows file cache, which a
+                    // hard reset or bluescreen discards. Tuning changes are rare,
+                    // so they alone are pushed through to the disk — here, on the
+                    // writer thread, never on the thread that wrote the GPU (R-43).
+                    flush = true;
+                }
+                else if (FlightWrite.TryParseStart(text, out var started))
+                {
+                    _openWrites[started.Id] = line;
+                }
+                else if (FlightWrite.TryParseEnd(text, out long ended))
+                {
+                    _ = _openWrites.Remove(ended);
+                }
             }
+
+            if (flush && _writer.BaseStream is FileStream file)
+            {
+                file.Flush(flushToDisk: true);
+            }
+
+            return true;
         }
         catch (IOException)
         {
@@ -171,6 +285,8 @@ public sealed class FlightRecorder : IDisposable
             _failed = true;
             Log.Warn($"Flight recorder stopped: {ex.GetType().Name}: {ex.Message}");
         }
+
+        return false;
     }
 
     private void RollSegment()
@@ -183,6 +299,12 @@ public sealed class FlightRecorder : IDisposable
         if (_offsetsMarker is not null)
         {
             Write(MarkerLine(_offsetsMarker));
+        }
+
+        // Verbatim, with the time the write started: it is still in flight.
+        foreach (string open in _openWrites.Values.ToList())
+        {
+            Write(open, flush: true);
         }
     }
 

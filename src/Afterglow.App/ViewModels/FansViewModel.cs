@@ -155,34 +155,70 @@ public partial class FansViewModel : ObservableObject, ILivePage
         var (mode, fixedPct, curve) = CurrentConfig;
         var settings = new Core.Settings.FanSettings
         {
-            Mode = mode switch
-            {
-                Core.Profiles.FanMode.Fixed => "fixed",
-                Core.Profiles.FanMode.Curve => "curve",
-                _ => "auto",
-            },
+            Mode = Core.Settings.CardFanSettings.ModeName(mode),
             FixedDutyPct = fixedPct,
             Curve = curve,
         };
 
-        // The edit belongs to the selected card. The primary GPU also keeps
-        // the legacy single-GPU field in sync so a downgrade reads it.
+        // The edit belongs to the selected card.
         var gpu = _gpu;
-        _services.UpdateSettings(s =>
+        if (gpu is null)
         {
-            if (gpu is null)
-            {
-                return s with { Fans = settings };
-            }
+            _services.UpdateSettings(s => s with { Fans = settings });
+            return;
+        }
 
-            var byGpu = new Dictionary<string, Core.Settings.FanSettings>(
-                s.FansByGpu, StringComparer.Ordinal)
-            {
-                [AppServices.FanKeyFor(gpu)] = settings,
-            };
-            bool isPrimary = _services.Gpus.Count > 0 && gpu.Index == _services.Gpus[0].Index;
-            return s with { FansByGpu = byGpu, Fans = isPrimary ? settings : s.Fans };
-        });
+        PersistFor(gpu, settings);
+    }
+
+    /// <summary>Persists one card's fan configuration (the primary GPU also keeps the legacy field in sync).</summary>
+    private void PersistFor(GpuContext gpu, Core.Settings.FanSettings settings)
+    {
+        bool isPrimary = _services.Gpus.Count > 0 && gpu.Index == _services.Gpus[0].Index;
+        _services.UpdateSettings(s =>
+            Core.Settings.CardFanSettings.WithCard(s, AppServices.FanKeyFor(gpu), isPrimary, settings));
+    }
+
+    /// <summary>
+    /// Records a fan configuration just applied to <paramref name="gpu"/> by a
+    /// profile, game rule or game-exit restore. The selected card goes through
+    /// the editor, which persists it; any other card's own saved configuration
+    /// is updated directly, without touching the editor, which shows only the
+    /// selected card (R-23).
+    /// </summary>
+    public void RecordApplied(GpuContext gpu, Core.Profiles.FanMode mode, uint fixedPct, FanCurveConfig? curve)
+    {
+        ArgumentNullException.ThrowIfNull(gpu);
+        if (_gpu is not null && gpu.Index == _gpu.Index)
+        {
+            SyncFromApplied(mode, fixedPct, curve);
+            return;
+        }
+
+        PersistFor(gpu, Core.Settings.CardFanSettings.Applied(_services.FanSettingsFor(gpu), mode, fixedPct, curve));
+    }
+
+    /// <summary>
+    /// A reset (Tuning page, panic, driver crash, crash banner) switched this
+    /// card's fan service to Auto. The editor keeps the saved mode — resets are
+    /// not saved — so the status line says what the fans are actually doing;
+    /// "Curve active" stayed on screen over fans the firmware was driving.
+    /// </summary>
+    public void NoteReset(Core.Tuning.CardResetResult reset)
+    {
+        ArgumentNullException.ThrowIfNull(reset);
+        if (_gpu is null || reset.GpuIndex != _gpu.Index || reset.FansReturned is not bool returned)
+        {
+            return;
+        }
+
+        StatusText = !returned
+            ? "A reset could not return the fans to firmware control: the driver refused the release, so they " +
+              "may still be pinned."
+            : ModeIndex != 0
+                ? "A reset returned the fans to firmware (auto) control. The mode selected below is your saved " +
+                  "setting; press Apply to use it again."
+                : "A reset returned the fans to firmware (auto) control.";
     }
 
     /// <summary>Loads one GPU's persisted fan configuration into the editor.</summary>
@@ -286,7 +322,10 @@ public partial class FansViewModel : ObservableObject, ILivePage
                         (uint)FixedDuty, _gpu?.Tuner.Capabilities.FanMinDutyPct ?? 30);
                     bool pinned = _fanControl.SetFixed((uint)FixedDuty);
                     StatusText = !pinned
-                        ? $"The driver did not accept fixed {duty}% — the fans are unchanged."
+                        // A refusal can be partial (R-06): the per-fan fallback hands
+                        // any fan that took the duty back to firmware control, and
+                        // puts it on record when even that is refused.
+                        ? $"The driver did not accept fixed {duty}%. Any fan that took it was handed back to automatic control (or, if the driver refused that too, is released at exit)."
                         : duty == (uint)FixedDuty
                             ? $"Fixed {duty}% applied to all fans."
                             : $"Fixed {duty}% applied (requested {FixedDuty:F0}%, raised to the hardware minimum spin duty).";

@@ -52,9 +52,20 @@ public sealed record SessionReport
     // Nullable for the same reason as the averages above: a card with no
     // offset knob (Intel Arc) has no offset, and persisting 0 exported it as
     // "core 0 / mem 0 MHz" — a measured value for a knob that does not exist.
+    // These are the offsets in force while the measured frames were presented
+    // (R-28), not a read of the card when Stop was clicked: by then a game
+    // profile's exit restore had often already put the baseline back.
     public int? CoreOffsetMHz { get; init; }
 
     public int? MemOffsetMHz { get; init; }
+
+    /// <summary>
+    /// True when the tuning changed inside the measured window, so the FPS
+    /// numbers mix two configurations and the offsets above describe only the
+    /// later part. Null when no tuning was read (no supported GPU) and on
+    /// reports written before this field existed.
+    /// </summary>
+    public bool? TuningChangedDuringWindow { get; init; }
 }
 
 /// <summary>Append-only JSONL persistence, newest kept at the tail; capped.</summary>
@@ -167,12 +178,26 @@ public sealed class SessionReportStore
         sb.AppendLine("|---|---|---|---|---|---|---|---|---|---|");
         foreach (var r in reports)
         {
+            // A run whose tuning changed mid-window is marked, never passed off
+            // as a clean measurement of one configuration (R-28).
+            string mixed = r.TuningChangedDuringWindow == true ? "*" : string.Empty;
             sb.AppendLine(FormattableString.Invariant(
                 // "—" for a sensor that never reported: this table gets pasted
                 // into reports, where a printed 0 reads as a real measurement.
-                $"| {r.Application} | {r.StartedAt:MM-dd HH:mm} | {r.DurationSeconds / 60.0:F1} min | {r.AvgFps:F1} | {r.Low1Fps:F1} | {Cell(r.AvgPowerW, "F0")} | {Cell(r.AvgGpuTempC, "F0")} | {Cell(r.AvgMemJunctionC, "F0")} | {Off(r.CoreOffsetMHz)} | {Off(r.MemOffsetMHz)} |"));
+                $"| {r.Application} | {r.StartedAt:MM-dd HH:mm} | {r.DurationSeconds / 60.0:F1} min | {r.AvgFps:F1} | {r.Low1Fps:F1} | {Cell(r.AvgPowerW, "F0")} | {Cell(r.AvgGpuTempC, "F0")} | {Cell(r.AvgMemJunctionC, "F0")} | {Off(r.CoreOffsetMHz)}{mixed} | {Off(r.MemOffsetMHz)}{mixed} |"));
+        }
+
+        if (reports.Any(r => r.TuningChangedDuringWindow == true))
+        {
+            sb.AppendLine();
+            sb.AppendLine(MixedTuningNote);
         }
 
         return sb.ToString();
     }
+
+    /// <summary>The footnote for a run whose tuning changed inside its measured window.</summary>
+    internal const string MixedTuningNote =
+        "\\* The tuning changed during this run's measured window: its FPS numbers mix two configurations, " +
+        "and the offsets shown are the later configuration's.";
 }

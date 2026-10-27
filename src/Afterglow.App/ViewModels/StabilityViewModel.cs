@@ -60,13 +60,21 @@ public partial class StabilityViewModel : ObservableObject, IDisposable, ILivePa
             return;
         }
 
+        // No bound context (e.g. IGCL failed to init on an Arc machine):
+        // resolve the vendor the way an unbound CLI run would, refusal included.
+        var unbound = _gpu is null ? Core.Stress.StressAdapter.ResolveDefaultVendor() : default;
+        if (unbound.Refusal is { } refusal)
+        {
+            VramFailed = true;
+            VramStatusText = NoCardToPick(refusal);
+            return;
+        }
+
         _vram?.Dispose();
         _vram = new VramTest
         {
             TargetPciBusId = _gpu?.PciBusId,
-            // No bound context (e.g. IGCL failed to init on an Arc machine):
-            // resolve the vendor the way an unbound CLI run would.
-            TargetVendorId = _gpu?.PciVendorId ?? Core.Stress.StressAdapter.DetectDefaultVendor(),
+            TargetVendorId = _gpu?.PciVendorId ?? unbound.VendorId,
         };
         _vram.ProgressChanged += progress =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnVramProgress(progress));
@@ -121,7 +129,8 @@ public partial class StabilityViewModel : ObservableObject, IDisposable, ILivePa
     [ObservableProperty] public partial bool StepperRunning { get; set; }
     [ObservableProperty] public partial string StepperPhaseText { get; set; } = string.Empty;
     [ObservableProperty] public partial double StepperProgress { get; set; }
-    [ObservableProperty] public partial string StepperLog { get; set; } = string.Empty;
+    /// <summary>The run's whole log, shown by a LogView that appends only new lines (#7).</summary>
+    [ObservableProperty] public partial IReadOnlyList<string> StepperLog { get; set; } = RunLogLines.Empty;
     [ObservableProperty] public partial double StepMHz { get; set; } = 30;
     [ObservableProperty] public partial double SecondsPerStep { get; set; } = 60;
     [ObservableProperty] public partial double MaxOffset { get; set; } = 300;
@@ -189,7 +198,7 @@ public partial class StabilityViewModel : ObservableObject, IDisposable, ILivePa
             StressStatusText = string.Empty;
             VramStatusText = string.Empty;
             StepperPhaseText = string.Empty;
-            StepperLog = string.Empty;
+            StepperLog = RunLogLines.Empty;
         }
         else if (previous is not null && previous.Index != _gpu?.Index)
         {
@@ -198,7 +207,7 @@ public partial class StabilityViewModel : ObservableObject, IDisposable, ILivePa
             // is instead of leaving its readings to be read as the new card's.
             StressStatusText = string.Empty;
             VramStatusText = string.Empty;
-            StepperLog = string.Empty;
+            StepperLog = RunLogLines.Empty;
             StepperPhaseText = $"Still running on GPU {previous.Index} — {previous.Name}; " +
                                "its results stay on that card.";
         }
@@ -275,13 +284,21 @@ public partial class StabilityViewModel : ObservableObject, IDisposable, ILivePa
             return;
         }
 
+        var unbound = _gpu is null ? Core.Stress.StressAdapter.ResolveDefaultVendor() : default;
+        if (unbound.Refusal is { } refusal)
+        {
+            StressFailed = true;
+            StressStatusText = NoCardToPick(refusal);
+            return;
+        }
+
         _stress?.Dispose();
         _stress = new GpuStressTest
         {
             IterationsPerDispatch = (uint)Intensity,
             Pattern = SelectedPattern,
             TargetPciBusId = _gpu?.PciBusId,
-            TargetVendorId = _gpu?.PciVendorId ?? Core.Stress.StressAdapter.DetectDefaultVendor(),
+            TargetVendorId = _gpu?.PciVendorId ?? unbound.VendorId,
         };
         _stress.ProgressChanged += progress =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnStressProgress(progress));
@@ -291,6 +308,16 @@ public partial class StabilityViewModel : ObservableObject, IDisposable, ILivePa
         _services.Flight?.Marker($"stress-start pattern={SelectedPattern}");
         _stress.Start();
     }
+
+    /// <summary>
+    /// A refused unbound run (R2-D). This page binds to the GPU picked at the top
+    /// of the window, so it only runs unbound when Afterglow detected no GPU at
+    /// all — and then there is no card to pick here; say so instead of naming one.
+    /// </summary>
+    private static string NoCardToPick(string refusal) =>
+        $"{refusal} There is no card to pick on this page: Afterglow hasn't detected a GPU it can bind the test " +
+        "to. Once it does (check the GPU driver, then restart Afterglow), tests run on the card it shows at the " +
+        "top of the window.";
 
     /// <summary>How long a burn must run before the word "stable" is earned.</summary>
     private static readonly TimeSpan MinimumVerdictTime = TimeSpan.FromSeconds(60);
@@ -535,6 +562,17 @@ public partial class StabilityViewModel : ObservableObject, IDisposable, ILivePa
             { ResultOffsetMHz: int result } =>
                 $"Finished — stable core offset: {(result >= 0 ? "+" : string.Empty)}{result} MHz",
 
+            // Another tuning write reached the card mid-run (R-02). The stepper
+            // scored nothing and wrote nothing after it, so the headline says
+            // where the card was left — and whose offset that is.
+            { Phase: "interrupted", StartOffsetRestored: false } =>
+                "Interrupted by another tuning change — no result. This GPU still reads " +
+                $"{(status.CurrentOffsetMHz >= 0 ? "+" : string.Empty)}{status.CurrentOffsetMHz} MHz, the offset " +
+                "this run applied; reset it from the Tuning page if that is not what you want.",
+            { Phase: "interrupted" } =>
+                "Interrupted by another tuning change — no result; the card was left as that change set it " +
+                $"({(status.CurrentOffsetMHz >= 0 ? "+" : string.Empty)}{status.CurrentOffsetMHz} MHz core offset).",
+
             // A failed or cancelled run's headline is where the card was LEFT.
             // The MCP payload was fixed to carry this; the app's status line is
             // its twin, and "failed" alone hid a card still at the crashed offset.
@@ -552,8 +590,11 @@ public partial class StabilityViewModel : ObservableObject, IDisposable, ILivePa
         StepperProgress = status.StepDuration.TotalSeconds > 0
             ? Math.Clamp(status.StepElapsed.TotalSeconds / status.StepDuration.TotalSeconds, 0, 1)
             : 0;
-        StepperLog = string.Join(Environment.NewLine, status.Log.TakeLast(14));
+        StepperLog = status.Log;
     }
+
+    [RelayCommand]
+    private void CopyStepperLog() => ClipboardSafe.Copy(string.Join(Environment.NewLine, StepperLog));
 
     private static string Capitalize(string text) =>
         text.Length == 0 ? text : char.ToUpperInvariant(text[0]) + text[1..];

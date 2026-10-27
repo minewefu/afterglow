@@ -54,7 +54,7 @@
                                     IsEnabled="{Binding HasPlan}" />
                             <Button Style="{StaticResource GhostButton}" Margin="0,0,8,0"
                                     Command="{Binding ToggleProbeCommand}" IsEnabled="{Binding CanApply}"
-                                    ToolTip="Locks the core clock at each step under a compute load and records the voltage the driver picks, mapping the whole curve in about a minute, then puts your previous settings back.">
+                                    ToolTip="Locks the core clock at each step under a compute load and records the voltage the driver picks, mapping the whole curve in a minute or two, then puts your previous settings back.">
                                 <TextBlock>
                                     <TextBlock.Style>
                                         <Style TargetType="TextBlock" BasedOn="{StaticResource InheritingText}">

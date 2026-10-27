@@ -1,5 +1,284 @@
 # Changelog
 
+## Unreleased
+
+### Keyboard shortcuts no longer take characters from typing ([#6](https://github.com/minewefu/afterglow/issues/6))
+
+- **The defect:** AltGr is Ctrl+Alt to Windows, so the fixed Ctrl+Alt shortcuts
+  fired whenever someone typed AltGr+key, and the character never reached any
+  app. On Spanish, `|`, `@`, `#`, `~` and `€` (AltGr+1–5) couldn't be typed while
+  Afterglow ran, and each one applied the saved profile in that slot to the GPU
+  instead. On
+  UK, US-International and Polish (Programmers) keyboards, typing `ó` toggled
+  the overlay; on US-International, Greek and Dutch, `®` or `¶` was the panic
+  reset. Reproduced on 1.5.0 as released.
+- **Afterglow now never registers a shortcut that types a character, or starts
+  a dead key, on any keyboard layout installed for you.** It asks each layout
+  with `ToUnicodeEx` before registering, and checks again when a layout is
+  added while it runs.
+- **The defaults stay where they're harmless.** On a US keyboard nothing
+  changes. Where a default would type, it falls back to Ctrl+Alt+F10 for the
+  overlay, Ctrl+Alt+F11 for the panic reset and Ctrl+Alt+F1–F5 for the profile
+  slots. The five slots move together, so they stay one row of keys. Across the
+  218 layouts Windows ships, no Ctrl+Alt+F key types anything, while every
+  Ctrl+Alt letter and digit types on at least 31
+  ([docs/research/keyboard-layouts.md](docs/research/keyboard-layouts.md)).
+  The stand-in also takes over when another app already holds the default.
+- **Settings › Keyboard shortcuts** now lists every shortcut with the keys in
+  use, and explains any stand-in. You can:
+  - change a shortcut by pressing the new keys;
+  - remove one, or restore the defaults;
+  - turn all global shortcuts off.
+
+  Settings refuses, and says why:
+  - a chord that types on one of your layouts;
+  - a chord without Ctrl or Alt;
+  - one-modifier letters, digits and navigation keys, which every app uses
+    (Ctrl+C, Alt+F);
+  - Alt+F4, Ctrl+F4, Ctrl+Alt+Delete and F12 (which Windows keeps for
+    debuggers).
+
+  Registered shortcuts are paused while you record one, so pressing Ctrl+Alt+R
+  to pick it doesn't reset the GPU.
+- The tray menu and the profile notification name the shortcut actually in
+  use. Holding a shortcut down fires it once (`MOD_NOREPEAT`) instead of
+  toggling the overlay at key-repeat rate.
+- `tools/ui-check.ps1` drives the new Settings section, with the Spanish layout
+  installed. `tools/keyboard-layout-survey.cs` reproduces the layout survey.
+
+### The stepper and certification logs keep the whole run ([#7](https://github.com/minewefu/afterglow/issues/7))
+
+- **The whole run, scrollable.** "Find my stable overclock" and "Certify a
+  profile" used to show only the last 14 and 10 lines. Both now keep the whole
+  run in a box that grows to about 14 lines and then scrolls.
+- **It follows the newest line unless you've scrolled up.** At the bottom, new
+  lines come into view; scrolled up to read, you stay where you are.
+- **The text can be selected and copied**, and a **Copy log** button copies all
+  of it.
+- **A run keeps its newest 5,000 lines.** Real runs are far shorter: about 130
+  lines for a full stepper sweep, about 30 for a certification.
+- **A progress update no longer copies the whole log.** The box adds new lines
+  instead of laying everything out again.
+
+### Fixes from the 27 October full review
+
+A full-version review reported 49 defects; all 49 were confirmed in the code.
+- **How each fix was confirmed.** Most were reproduced by a regression test that
+  failed before the fix and passes after. The rest are in app-only code or new
+  APIs, and were confirmed with scratch harnesses driving the real view models.
+- **Test count.** The suite went from 619 to over 1,000 tests.
+- **No physical GPUs.** Nothing here was verified on real hardware. Driver
+  behaviour comes from vendor documentation, and from fake drivers built to that
+  documentation (NVIDIA, Intel IGCL, NVIDIA DRS). The burn shader ran on the
+  D3D WARP software device.
+
+#### Stability testing and certification
+- **The burn couldn't detect a miscalculation.** Its arithmetic overflowed to
+  infinity within the first few gathers. Corrupted inputs or wrong FMA results
+  therefore reproduced the reference exactly and passed.
+  - The burn now uses bounded chaotic arithmetic with a lossless integer digest.
+    Every output is finite, and a one-bit fault reaches the output.
+  - A run whose reference isn't finite ends without a verdict.
+  - The FP32/INT32 work per gather is unchanged.
+  - Sustained, transitions and excursions passes from earlier builds proved
+    little more than "no driver reset", so they no longer count toward
+    "Certified". Certificates now record which burn earned them.
+  - Old burn passes stay in the profile. The Profiles page, `certify` and MCP
+    `list_profiles` mark such a profile "Re-certify" and say why.
+  - VRAM-test passes are unaffected.
+  - Stable marks are left alone, so a profile you marked stable still applies
+    at startup. Certify it again to restore the "Certified" badge.
+  - Stepper results from earlier builds are worth re-running too.
+  - A stable startup profile carrying such passes says so, in the startup notice
+    and under the Settings picker.
+- **A certification or stepper run now owns the card's tuning while it runs.**
+  The Tuning page, a hotkey, a game rule, automation, a reset or another program
+  can all change the tuning. If any of them does, the run stops as
+  "interrupted": no pass, and no further writes over your change. Before, the
+  stepper could even re-apply its offset over a reset.
+- **Certification is tied to the exact configuration tested:** clocks, power,
+  lock, V/F curve, card and fans.
+  - Saving a different profile under the same name during a run no longer gets
+    that profile marked stable.
+  - Changing anything a profile applies makes its old certificates stop
+    counting.
+- **A run that catches an artifact or driver reset removes the profile's stable
+  mark** and that mode's certificate. Startup can no longer auto-apply settings
+  that just failed.
+- **Certification runs under the profile's own fan setting**, and puts yours
+  back afterwards. CLI `certify` refuses fan-curve profiles and hands the fans
+  back to automatic control when it finishes.
+
+#### Fans, resets and shutdown
+- **Handing the fans back at exit is guaranteed.** A full or disconnected log
+  drive used to stop it.
+  - Each shutdown step now runs on its own, and the fans are released before
+    any file is written.
+  - The session counts as a clean exit only after every card's fans were
+    actually released.
+- **Partly refused fan commands are released at exit.** On NVIDIA's per-fan
+  fallback, a command one fan refused could still have moved the others.
+  Afterglow now treats those fans as under its control: it releases them at
+  exit, and the curve writes every fan again.
+- **Closing during the first fan-curve command no longer leaves it landing late.**
+  That command could land after the release. Exit now waits for it, then
+  releases.
+- **The Tuning page's Reset also stops a running fan curve.** Before, the curve
+  took the fans back one tick later.
+- **Resets report what they couldn't undo.** This covers the panic reset, the
+  reset after a driver crash and the automation "reset" action. They no longer
+  announce "all tuning returned to driver defaults" over a write the driver
+  refused; they list what may still be applied, and the log has each card's
+  per-setting answer.
+- **A failed fan hand-back is reported as a failure.** If the GPU dropped off the
+  bus, Afterglow used to claim the fans were released.
+- **Exit can't hang on a driver that stops answering.** Releasing the fans waits
+  at most 8 seconds per card. After that the session isn't counted as clean, so
+  the next launch warns.
+- **A partly refused fan command no longer leaves a fan pinned or stopped.** The
+  fans that took it are handed back to firmware control. If the driver refuses
+  that too, it's recorded at once, so a crash still warns on the next launch.
+- **A fan command refused outright no longer causes a false "didn't shut down
+  cleanly" warning.**
+
+#### NVIDIA tuning and crash recovery
+- **A power- or fan-only change no longer wipes a per-point V/F curve.** This
+  covers `set --power-limit`, a fan-only MCP `apply_tuning`, and the Tuning page
+  with the offset unchanged. The core offset isn't re-written when it's already
+  in force, because that write levels the whole curve.
+- **V/F edits are recorded before they reach the driver.** This covers the V/F
+  Curve page and `vfpoints --set/--flatten`. A crash they cause now shows the
+  recovery banner and holds back the startup profile.
+- **After a restart, Afterglow no longer reports a clock lock the driver already
+  dropped**, and a later `set` won't quietly re-apply it.
+- **A lock applied before the PC slept or hibernated (Fast Startup included) is
+  no longer shown as applied after it wakes.** Whether the driver keeps it is
+  untested, so `get` and the Tuning page say it may or may not still be in
+  force. Crash records treat it as unknown.
+- **A CLI `set` on one GPU no longer clears another GPU's crash-recovery
+  record.** It also leaves its own GPU's record alone if that was unfinished.
+- **Crash reports know what was applied at the moment of the crash.** Every
+  tuning change is recorded as it happens, with the clock lock, per-point edits
+  and which card.
+  - Before, the recorder checked once a minute and only for two offsets. A crash
+    right after applying a profile could be reported as a stock-settings
+    failure.
+  - "Afterglow's tuning is not implicated" is only shown when the recording
+    covers every setting.
+- **A crash caused by a tuning change itself is attributed to that change.**
+  Afterglow writes each change to the crash recorder on disk before sending it to
+  the driver, waiting at most 250 ms for the disk. A reset, bluescreen or driver
+  reset during the change now names it and its values.
+- **No more invented hard resets.** When Windows' event log can't be read, the
+  report says the cause is unknown.
+
+#### V/F curve
+- **Undervolt plans no longer mix offsets.** The measured curve belongs to the
+  tuning it was measured under, and changing the core offset or per-point edits
+  starts it over. Planning twice can no longer stack the offset.
+- **A Reset during a V/F probe stops the probe.** Any outside change ends it with
+  "stopped: tuning changed elsewhere". Before, the probe locked the clock again.
+- **Each probe step samples until it has enough readings to plan from.** Probes
+  run somewhat longer; steps that still fall short are reported.
+- **NaN and Infinity are rejected everywhere a clock or voltage is entered.** A
+  NaN target used to clear the whole curve. `vfpoints --set "30=-2147483648"` is
+  now a validation error instead of a crash.
+
+#### Intel Arc
+- **Board power uses the whole-card energy counter where the driver has one.**
+  Otherwise it falls back to the chip and says so: the dashboard reads "GPU chip
+  power", and `--json`/MCP report `powerIsChipOnly`. Power rules on discrete
+  cards may fire sooner, because readings are no longer understated.
+- **A driver-reported VRAM temperature is no longer dropped.** It is labelled
+  VRAM, not memory junction.
+- **A V/F probe that failed to put your clock lock back no longer loses it on
+  the next try.**
+- **A clock lock applied while a V/F probe runs is the lock you end up with.**
+  A lock set mid-sweep by a hotkey, game rule or profile stops the probe.
+  - Before, the probe then put back the lock it started under, or released the
+    new lock entirely, while the saved state still named the new one.
+  - The new lock now stays, even when the probe's next pin lands just after it.
+  - A profile without a lock removes the lock the probe was holding aside, as it
+    does outside a sweep.
+  - NVIDIA wasn't affected; tests now hold both vendors to the same behaviour.
+- **Raised factory minimum clocks no longer block unlock, reset and probing.**
+  On cards whose factory minimum is above the hardware minimum, the raised floor
+  used to be read as a stuck pin. Tested against a simulated driver only.
+- **`selftest` sends the GPU-lock query with its Size filled in**, as Intel's
+  header requires.
+- **A factory minimum clock above the hardware minimum is remembered** for that
+  card and driver. A new launch no longer reports it as a clamp nobody applied.
+  Tested on a simulated driver only.
+
+#### FPS capture and session reports
+- **A new capture no longer blends in the previous run's frames.** A game that
+  switches swap chains no longer keeps showing the old chain's frame rate.
+- **Session reports take the offsets that were applied while the game was
+  presenting.** A game profile's exit restore no longer stamps a tuned run as
+  untuned, and a run whose tuning changed mid-window is marked.
+- **The GUI and CLI can capture together.** Each capture has its own ETW session.
+  The app no longer stays on "Capturing" after PresentMon exits, and switching
+  to Afterglow mid-game no longer makes Afterglow "the game".
+- **`afterglow-cli fps` lists every app that presented**, including one that
+  finished before the capture did.
+
+#### Games, driver profiles and profiles
+- **Back-to-back games each get their own profile.** Closing one and starting
+  another within a poll interval used to leave the second on the first one's
+  profile.
+- **A game's frame cap can now be left alone, turned off, or set.**
+  - **Empty:** the cap is left to the driver, so a global NVIDIA Control Panel
+    cap still applies.
+  - **0 or `off`:** the limiter is off for that game, even with a global cap.
+  - **1–1000:** caps the game at that rate.
+  - Rules saved by earlier versions read a 0 as empty, which is what they
+    actually did. An invalid cap is refused.
+  - Afterglow only takes back caps it wrote itself, and only while unchanged.
+  - `drs` without `--cap` no longer rewrites the cap.
+- **Overlapping games hand over.** Closing the game whose profile is applied,
+  while another configured game is still running, applies that game's profile.
+  When the last one closes, your tuning from before the first game comes back
+  if the active rule says to revert.
+- **Clearing a game's driver settings reports failures**, and a successful clear
+  is verified.
+- **The hidden `drs --probe-create` diagnostic no longer deletes an existing
+  profile.**
+- **Profile names are found whatever their case**, so `certify --profile quiet`
+  finds "Quiet".
+- **A damaged profile file no longer stops Afterglow from starting.** It is
+  skipped, counted and logged.
+- **Profile names that would share a file are refused** instead of overwriting
+  each other. Windows file names ignore case and drop characters such as `:`.
+- **Saving a profile through MCP keeps the per-point V/F curve**, using the same
+  capture as the Profiles page.
+- **A profile applied to a GPU that isn't selected now saves that card's fans**,
+  and no longer wipes unapplied slider changes on the selected card.
+
+#### Settings, automation and the fan-curve editor
+- **Bad automation thresholds are refused.** NaN, Infinity and 1e999 broke every
+  later settings save. Settings are now saved before they're kept.
+- **Changing an unrelated setting no longer resets automation rules'** timers and
+  cooldowns.
+- **"Add rule" works after leaving Settings and coming back.**
+- **The fan-curve editor no longer creates duplicate points or throws while
+  dragging.**
+
+#### CLI, MCP and system integration
+- **`mcp` refuses options it doesn't understand.** A typo such as `--gpuu 1` used
+  to bind the server to GPU 0.
+- **A removed NVIDIA card no longer blocks stress tests on Intel Arc.** NVIDIA
+  fan RPM also comes back after a driver reset.
+- **Stress and VRAM tests no longer guess the card.** If none is named and
+  Windows' device list can't be read, or it shows an NVIDIA card that DirectX
+  doesn't, the run is refused with a hint to use `--gpu N`.
+- **"Start with Windows" now belongs to whoever is signed in.**
+  - Each account gets its own logon task.
+  - The toggle reflects whether the task is actually enabled.
+  - Installing with another administrator's password creates the task for you.
+  - Uninstalling removes every user's task.
+  - On a standard account, Windows asks for an administrator's password at
+    every sign-in. Without it Afterglow only monitors, and Settings now says so.
+
 ## 1.5.0 — 2026-10-12
 
 The first stable release since 1.1.0. It brings together everything from the 1.2.0 betas

@@ -5,8 +5,18 @@ namespace Afterglow.Core.Interop.Nvapi;
 /// <summary>Per-game driver settings Afterglow manages through DRS.</summary>
 public sealed record GameDriverSettings
 {
-    /// <summary>Driver frame-rate limiter in FPS; 0 = off.</summary>
-    public int FrameCapFps { get; init; }
+    /// <summary>
+    /// Driver frame-rate limiter for this game. As a request to
+    /// <see cref="DrsApi.ApplySettings(string, GameDriverSettings, out string)"/>:
+    /// null = leave the cap alone (nothing is written), 0 = off for this game
+    /// (stored as the explicit "disabled" value, which overrides a cap in the
+    /// global profile), 1–1000 = a cap in fps. As read back by
+    /// <see cref="DrsApi.ReadSettings"/>: the cap the exe's own profile holds, or
+    /// null when it holds none, so the global setting applies.
+    /// <see cref="DrsApi.ClearSettings(string)"/> removes a stored cap so the game
+    /// inherits the global setting again.
+    /// </summary>
+    public int? FrameCapFps { get; init; }
 
     /// <summary>"default" (application-controlled), "on", or "off".</summary>
     public string Vsync { get; init; } = "default";
@@ -14,7 +24,12 @@ public sealed record GameDriverSettings
     /// <summary>Caps maximum pre-rendered frames at 1 (the classic latency reduction).</summary>
     public bool LowLatency { get; init; }
 
-    public bool AnythingSet => FrameCapFps > 0 || Vsync is "on" or "off" || LowLatency;
+    /// <summary>
+    /// Whether any knob asks for something; a cap of 0 does ("off" has to be
+    /// written to override a global cap). When none does, callers write nothing
+    /// at all, so the driver's own settings (a global cap included) stay in charge.
+    /// </summary>
+    public bool AnythingSet => FrameCapFps is not null || Vsync is "on" or "off" || LowLatency;
 }
 
 /// <summary>
@@ -68,13 +83,29 @@ public sealed unsafe class DrsApi
     private const uint IdEnumSettings = 0xAE3039DA;
 
     // Setting IDs (NvApiDriverSettings.h).
-    public const uint FrameRateLimiterId = 0x10835002;   // FRL_FPS_ID: fps, 0 = off
+    public const uint FrameRateLimiterId = 0x10835002;   // FRL_FPS_ID: fps, FRL_FPS_DISABLED = 0
     public const uint VsyncModeId = 0x00A879CF;          // VSYNCMODE_ID
     public const uint PreRenderedFramesId = 0x007BA09E;  // PRERENDERLIMIT_ID
 
     public const uint VsyncApplicationControlled = 0x60925292;
     public const uint VsyncForceOff = 0x08416747;
     public const uint VsyncForceOn = 0x47814940;
+
+    /// <summary>
+    /// FRL_FPS_DISABLED, the limiter's explicit "off" value. NvApiDriverSettings.h
+    /// (github.com/NVIDIA/nvapi): EValues_FRL_FPS { FRL_FPS_DISABLED = 0,
+    /// FRL_FPS_MIN = 0, FRL_FPS_MAX = 0x3ff, FRL_FPS_DEFAULT = FRL_FPS_DISABLED }.
+    /// </summary>
+    public const uint FrameRateLimiterDisabled = 0;
+
+    /// <summary>Largest cap Afterglow writes (the driver's own FRL_FPS_MAX is 1023).</summary>
+    public const int MaxFrameCapFps = 1000;
+
+    /// <summary>The settings Afterglow writes, and so the ones a clear removes.</summary>
+    private static readonly uint[] ManagedSettingIds = [FrameRateLimiterId, VsyncModeId, PreRenderedFramesId];
+
+    /// <summary>NVDRS_CURRENT_PROFILE_LOCATION (nvapi.h, first member of NVDRS_SETTING_LOCATION): the value is stored in the profile itself.</summary>
+    private const uint CurrentProfileLocation = 0;
 
     private const string ProfilePrefix = "Afterglow - ";
 
@@ -135,58 +166,58 @@ public sealed unsafe class DrsApi
     /// NvAPI_Initialize succeeded, because only <see cref="TryCreate"/> touches
     /// it and only past that point.
     /// </summary>
-    private sealed class Functions
+    private sealed class Functions(Func<uint, nint> resolve)
     {
         internal readonly delegate* unmanaged[Cdecl]<nint*, NvapiStatus> CreateSession =
-            (delegate* unmanaged[Cdecl]<nint*, NvapiStatus>)NvapiNative.Resolve(IdCreateSession);
+            (delegate* unmanaged[Cdecl]<nint*, NvapiStatus>)resolve(IdCreateSession);
 
         internal readonly delegate* unmanaged[Cdecl]<nint, NvapiStatus> DestroySession =
-            (delegate* unmanaged[Cdecl]<nint, NvapiStatus>)NvapiNative.Resolve(IdDestroySession);
+            (delegate* unmanaged[Cdecl]<nint, NvapiStatus>)resolve(IdDestroySession);
 
         internal readonly delegate* unmanaged[Cdecl]<nint, NvapiStatus> LoadSettings =
-            (delegate* unmanaged[Cdecl]<nint, NvapiStatus>)NvapiNative.Resolve(IdLoadSettings);
+            (delegate* unmanaged[Cdecl]<nint, NvapiStatus>)resolve(IdLoadSettings);
 
         internal readonly delegate* unmanaged[Cdecl]<nint, NvapiStatus> SaveSettings =
-            (delegate* unmanaged[Cdecl]<nint, NvapiStatus>)NvapiNative.Resolve(IdSaveSettings);
+            (delegate* unmanaged[Cdecl]<nint, NvapiStatus>)resolve(IdSaveSettings);
 
         internal readonly delegate* unmanaged[Cdecl]<nint, char*, nint*, NvapiStatus> FindProfileByName =
-            (delegate* unmanaged[Cdecl]<nint, char*, nint*, NvapiStatus>)NvapiNative.Resolve(IdFindProfileByName);
+            (delegate* unmanaged[Cdecl]<nint, char*, nint*, NvapiStatus>)resolve(IdFindProfileByName);
 
         internal readonly delegate* unmanaged[Cdecl]<nint, NvdrsProfile*, nint*, NvapiStatus> CreateProfile =
-            (delegate* unmanaged[Cdecl]<nint, NvdrsProfile*, nint*, NvapiStatus>)NvapiNative.Resolve(IdCreateProfile);
+            (delegate* unmanaged[Cdecl]<nint, NvdrsProfile*, nint*, NvapiStatus>)resolve(IdCreateProfile);
 
         internal readonly delegate* unmanaged[Cdecl]<nint, nint, NvapiStatus> DeleteProfile =
-            (delegate* unmanaged[Cdecl]<nint, nint, NvapiStatus>)NvapiNative.Resolve(IdDeleteProfile);
+            (delegate* unmanaged[Cdecl]<nint, nint, NvapiStatus>)resolve(IdDeleteProfile);
 
         internal readonly delegate* unmanaged[Cdecl]<nint, nint, NvdrsApplication*, NvapiStatus> CreateApplication =
-            (delegate* unmanaged[Cdecl]<nint, nint, NvdrsApplication*, NvapiStatus>)NvapiNative.Resolve(IdCreateApplication);
+            (delegate* unmanaged[Cdecl]<nint, nint, NvdrsApplication*, NvapiStatus>)resolve(IdCreateApplication);
 
         internal readonly delegate* unmanaged[Cdecl]<nint, char*, nint*, NvdrsApplication*, NvapiStatus> FindApplicationByName =
-            (delegate* unmanaged[Cdecl]<nint, char*, nint*, NvdrsApplication*, NvapiStatus>)NvapiNative.Resolve(IdFindApplicationByName);
+            (delegate* unmanaged[Cdecl]<nint, char*, nint*, NvdrsApplication*, NvapiStatus>)resolve(IdFindApplicationByName);
 
         internal readonly delegate* unmanaged[Cdecl]<nint, nint, NvdrsSetting*, NvapiStatus> SetSetting =
-            (delegate* unmanaged[Cdecl]<nint, nint, NvdrsSetting*, NvapiStatus>)NvapiNative.Resolve(IdSetSetting);
+            (delegate* unmanaged[Cdecl]<nint, nint, NvdrsSetting*, NvapiStatus>)resolve(IdSetSetting);
 
         internal readonly delegate* unmanaged[Cdecl]<nint, nint, uint, NvdrsSetting*, NvapiStatus> GetSetting =
-            (delegate* unmanaged[Cdecl]<nint, nint, uint, NvdrsSetting*, NvapiStatus>)NvapiNative.Resolve(IdGetSetting);
+            (delegate* unmanaged[Cdecl]<nint, nint, uint, NvdrsSetting*, NvapiStatus>)resolve(IdGetSetting);
 
         internal readonly delegate* unmanaged[Cdecl]<nint, nint, uint, NvapiStatus> DeleteProfileSetting =
-            (delegate* unmanaged[Cdecl]<nint, nint, uint, NvapiStatus>)NvapiNative.Resolve(IdDeleteProfileSetting);
+            (delegate* unmanaged[Cdecl]<nint, nint, uint, NvapiStatus>)resolve(IdDeleteProfileSetting);
 
         internal readonly delegate* unmanaged[Cdecl]<nint, nint, NvdrsProfile*, NvapiStatus> GetProfileInfo =
-            (delegate* unmanaged[Cdecl]<nint, nint, NvdrsProfile*, NvapiStatus>)NvapiNative.Resolve(IdGetProfileInfo);
+            (delegate* unmanaged[Cdecl]<nint, nint, NvdrsProfile*, NvapiStatus>)resolve(IdGetProfileInfo);
 
         /// <summary>Diagnostic only (<see cref="ProbeListProfiles"/>); not required by <see cref="TryCreate"/>.</summary>
         internal readonly delegate* unmanaged[Cdecl]<nint, uint, nint*, NvapiStatus> EnumProfiles =
-            (delegate* unmanaged[Cdecl]<nint, uint, nint*, NvapiStatus>)NvapiNative.Resolve(IdEnumProfiles);
+            (delegate* unmanaged[Cdecl]<nint, uint, nint*, NvapiStatus>)resolve(IdEnumProfiles);
 
         /// <summary>Profile inspection only; not required by <see cref="TryCreate"/>.</summary>
         internal readonly delegate* unmanaged[Cdecl]<nint, nint, uint, uint*, NvdrsApplication*, NvapiStatus> EnumApplications =
-            (delegate* unmanaged[Cdecl]<nint, nint, uint, uint*, NvdrsApplication*, NvapiStatus>)NvapiNative.Resolve(IdEnumApplications);
+            (delegate* unmanaged[Cdecl]<nint, nint, uint, uint*, NvdrsApplication*, NvapiStatus>)resolve(IdEnumApplications);
 
         /// <summary>Profile inspection only; not required by <see cref="TryCreate"/>.</summary>
         internal readonly delegate* unmanaged[Cdecl]<nint, nint, uint, uint*, NvdrsSetting*, NvapiStatus> EnumSettings =
-            (delegate* unmanaged[Cdecl]<nint, nint, uint, uint*, NvdrsSetting*, NvapiStatus>)NvapiNative.Resolve(IdEnumSettings);
+            (delegate* unmanaged[Cdecl]<nint, nint, uint, uint*, NvdrsSetting*, NvapiStatus>)resolve(IdEnumSettings);
 
         /// <summary>Everything <see cref="ReadProfileSnapshot"/> and <see cref="ScanProfiles"/> call.</summary>
         internal bool CanInspect => EnumProfiles != null && EnumApplications != null && EnumSettings != null;
@@ -199,7 +230,7 @@ public sealed unsafe class DrsApi
             GetSetting != null && DeleteProfileSetting != null && GetProfileInfo != null;
     }
 
-    private static readonly Lazy<Functions> ResolvedFunctions = new(() => new Functions());
+    private static readonly Lazy<Functions> ResolvedFunctions = new(() => new Functions(NvapiNative.Resolve));
 
     private readonly Functions _fn;
 
@@ -225,13 +256,26 @@ public sealed unsafe class DrsApi
             return null;
         }
 
-        var functions = ResolvedFunctions.Value;
+        return Bind(ResolvedFunctions.Value, out status);
+    }
+
+    /// <summary>
+    /// Test seam: a DrsApi over an interface table other than nvapi64.dll's — the
+    /// in-memory fake driver in the tests, so the workflow logic is exercised on
+    /// machines without an NVIDIA GPU. Skips NvAPI_Initialize; nothing else differs.
+    /// </summary>
+    internal static DrsApi? CreateForTesting(Func<uint, nint> resolve, out NvapiStatus status) =>
+        Bind(new Functions(resolve), out status);
+
+    private static DrsApi? Bind(Functions functions, out NvapiStatus status)
+    {
         if (!functions.HasRequired)
         {
             status = NvapiStatus.FunctionNotFound;
             return null;
         }
 
+        status = NvapiStatus.Ok;
         return new DrsApi(functions);
     }
 
@@ -239,10 +283,27 @@ public sealed unsafe class DrsApi
     /// Writes the given settings onto the DRS application profile for
     /// <paramref name="exeName"/> (creating an "Afterglow - exe" profile when
     /// the driver has none), then re-reads every value from a fresh session to
-    /// verify the store took it.
+    /// verify the store took it. A null cap is not written, and whatever cap the
+    /// profile holds stays.
     /// </summary>
-    public NvapiStatus ApplySettings(string exeName, GameDriverSettings settings, out string note)
+    public NvapiStatus ApplySettings(string exeName, GameDriverSettings settings, out string note) =>
+        ApplySettings(exeName, settings, replacing: null, out note);
+
+    /// <inheritdoc cref="ApplySettings(string, GameDriverSettings, out string)"/>
+    /// <param name="exeName">The executable.</param>
+    /// <param name="settings">What to write; a null cap leaves the cap alone.</param>
+    /// <param name="replacing">
+    /// What Afterglow wrote for this exe before — the game rule this one
+    /// replaces — or null. When that set a cap and <paramref name="settings"/>
+    /// leaves it empty, the cap Afterglow wrote is released (<see cref="ReleaseCap"/>):
+    /// "empty" hands the game back to the driver's own settings, and a cap
+    /// Afterglow left behind is not the driver's.
+    /// </param>
+    /// <param name="note">"verified", plus what happened to a released cap; or what failed.</param>
+    public NvapiStatus ApplySettings(
+        string exeName, GameDriverSettings settings, GameDriverSettings? replacing, out string note)
     {
+        ArgumentNullException.ThrowIfNull(settings);
         note = string.Empty;
 
         // A value outside the three legal ones used to mean "not enabled", which
@@ -255,6 +316,18 @@ public sealed unsafe class DrsApi
             note = $"'{settings.Vsync}' is not a vsync mode (expected default, on or off) — nothing was written";
             return NvapiStatus.InvalidArgument;
         }
+
+        // Same rule for the cap: it used to be clamped (−5 written as 0, 1001 as
+        // 1000) and then verified against the unclamped request.
+        if (settings.FrameCapFps is < 0 or > MaxFrameCapFps)
+        {
+            note = $"a frame cap of {settings.FrameCapFps} fps is outside 0–{MaxFrameCapFps} — nothing was written";
+            return NvapiStatus.InvalidArgument;
+        }
+
+        var release = CapRelease.None;
+        uint? capBefore = null;
+        string profileName = string.Empty;
         var status = WithSession((session) =>
         {
             var rc = FindOrCreateProfile(session, exeName, out nint profile, out bool created);
@@ -263,8 +336,35 @@ public sealed unsafe class DrsApi
                 return rc;
             }
 
-            rc = ApplyOne(session, profile, FrameRateLimiterId, settings.FrameCapFps > 0,
-                (uint)Math.Clamp(settings.FrameCapFps, 0, 1000));
+            if (settings.FrameCapFps is int cap)
+            {
+                // A requested cap is always written, 0 included (R-31). 0 means
+                // "off for this game", and deleting the setting does not say that:
+                // an application profile without the setting inherits the Current
+                // Global / Base profile's value (NVIDIA Driver Settings Programming
+                // Guide PG-12072-001_v01, p.2 "Profile Hierarchy"), so a global
+                // 60 fps cap capped a game whose rule said no cap. FRL_FPS_DISABLED
+                // stored in the application profile overrides it.
+                rc = SetDword(session, profile, FrameRateLimiterId,
+                    cap == 0 ? FrameRateLimiterDisabled : (uint)cap);
+            }
+            else
+            {
+                // Empty: the cap is left to the driver (R1). Only a cap Afterglow
+                // wrote for the rule this one replaces is taken back, and only
+                // where the store shows it is still Afterglow's; whose profile
+                // this is matters only then. An unreadable name counts as someone
+                // else's, which is the stricter test.
+                bool owned = created;
+                if (!owned && replacing?.FrameCapFps is not null &&
+                    GetProfileName(session, profile, out profileName) == NvapiStatus.Ok)
+                {
+                    owned = profileName.StartsWith(ProfilePrefix, StringComparison.Ordinal);
+                }
+
+                rc = ReleaseCap(session, profile, owned, replacing?.FrameCapFps, out release, out capBefore);
+            }
+
             if (rc != NvapiStatus.Ok)
             {
                 return rc;
@@ -297,7 +397,7 @@ public sealed unsafe class DrsApi
         }
 
         // Verification round-trip from a fresh session.
-        var readBack = ReadSettings(exeName, out var actual);
+        var readBack = ReadSettings(exeName, out var actual, out bool capIsOverride);
         if (readBack != NvapiStatus.Ok)
         {
             note = "write succeeded but readback failed";
@@ -306,18 +406,61 @@ public sealed unsafe class DrsApi
 
         // Compare against the REQUESTED value. Re-deriving the expected value
         // from the same predicate that decided whether to write made the check
-        // self-confirming for every input the predicate rejected.
-        bool ok = actual.FrameCapFps == (settings.FrameCapFps > 0 ? settings.FrameCapFps : 0) &&
+        // self-confirming for every input the predicate rejected. An empty cap
+        // must be exactly what the profile held before, or — released — no
+        // longer a user value of its own (a predefined profile gets the driver's
+        // shipped value back, which is not Afterglow's to know in advance).
+        bool capOk = settings.FrameCapFps is not null
+            ? actual.FrameCapFps == settings.FrameCapFps
+            : release == CapRelease.Removed
+                ? !capIsOverride
+                : actual.FrameCapFps == (int?)capBefore;
+        bool ok = capOk &&
                   actual.Vsync == settings.Vsync &&
                   actual.LowLatency == settings.LowLatency;
-        note = ok ? "verified" : $"readback mismatch (got cap={actual.FrameCapFps}, vsync={actual.Vsync}, lowlat={actual.LowLatency})";
-        return ok ? NvapiStatus.Ok : NvapiStatus.Error;
+        if (!ok)
+        {
+            note = $"readback mismatch (got cap={CapText(actual.FrameCapFps)}, vsync={actual.Vsync}, lowlat={actual.LowLatency})";
+            return NvapiStatus.Error;
+        }
+
+        note = release switch
+        {
+            CapRelease.Removed => $"verified; the frame cap Afterglow wrote before ({CapText(replacing?.FrameCapFps)}) " +
+                                  "was removed, so the driver's own setting applies",
+            CapRelease.Kept => $"verified; the frame cap in {ProfileLabel(profileName, exeName)} ({CapText((int?)capBefore)}) was kept: " +
+                               $"it is no longer the {CapText(replacing?.FrameCapFps)} Afterglow wrote, so it may be " +
+                               "yours (NVIDIA Control Panel can remove it)",
+            _ => "verified",
+        };
+        return NvapiStatus.Ok;
     }
 
-    /// <summary>Reads the three Afterglow-managed settings for an executable.</summary>
-    public NvapiStatus ReadSettings(string exeName, out GameDriverSettings settings)
+    /// <summary>
+    /// Reads the three Afterglow-managed settings for an executable. Vsync and
+    /// low latency are what the game gets, inherited values included; the cap is
+    /// the one the exe's own profile holds, null when it holds none and the
+    /// global setting applies.
+    /// </summary>
+    public NvapiStatus ReadSettings(string exeName, out GameDriverSettings settings) =>
+        ReadSettings(exeName, out settings, out _);
+
+    /// <summary>"off", "N fps", or "not set" for a cap.</summary>
+    public static string CapText(int? cap) => cap switch
     {
-        int cap = 0;
+        null => "not set",
+        0 => "off",
+        _ => $"{cap} fps",
+    };
+
+    /// <inheritdoc cref="ReadSettings(string, out GameDriverSettings)"/>
+    /// <param name="exeName">The executable.</param>
+    /// <param name="settings">The values read.</param>
+    /// <param name="capIsOverride">The profile's own cap is a user value, not the driver's predefined one.</param>
+    private NvapiStatus ReadSettings(string exeName, out GameDriverSettings settings, out bool capIsOverride)
+    {
+        int? cap = null;
+        bool capOverride = false;
         string vsync = "default";
         bool lowLatency = false;
 
@@ -329,10 +472,17 @@ public sealed unsafe class DrsApi
                 return rc;   // ExecutableNotFound and friends -> no profile
             }
 
-            if (TryGetDword(session, profile, FrameRateLimiterId, out uint frl))
+            // The profile's own cap only. Reading the inherited global value as
+            // this game's made "empty" (leave it to the driver) and "pinned to the
+            // global value" look alike, and the CLI, starting from what it read,
+            // wrote the global cap into the game's profile (R1).
+            rc = ReadOwnCap(session, profile, out uint? frl, out capOverride);
+            if (rc != NvapiStatus.Ok)
             {
-                cap = (int)frl;
+                return rc;
             }
+
+            cap = (int?)frl;
 
             if (TryGetDword(session, profile, VsyncModeId, out uint v))
             {
@@ -353,37 +503,171 @@ public sealed unsafe class DrsApi
         });
 
         settings = new GameDriverSettings { FrameCapFps = cap, Vsync = vsync, LowLatency = lowLatency };
+        capIsOverride = capOverride;
         return status;
     }
 
     /// <summary>
-    /// Removes Afterglow's settings for an executable: a profile Afterglow
-    /// created is deleted outright; on a pre-existing (driver-predefined or
-    /// user) profile only the three managed settings are removed.
+    /// Removes Afterglow's settings for an executable, so the game inherits the
+    /// global settings again: a profile Afterglow created is deleted outright; on
+    /// a pre-existing (driver-predefined or user) profile only the three managed
+    /// settings are removed. Ok means a fresh session found none of the three
+    /// still overridden on the exe's profile.
     /// </summary>
-    public NvapiStatus ClearSettings(string exeName)
+    public NvapiStatus ClearSettings(string exeName) => ClearSettings(exeName, out _);
+
+    /// <inheritdoc cref="ClearSettings(string)"/>
+    /// <param name="exeName">The executable, as for <see cref="ApplySettings(string, GameDriverSettings, out string)"/>.</param>
+    /// <param name="note">What was cleared, or which step failed.</param>
+    public NvapiStatus ClearSettings(string exeName, out string note) => Clear(exeName, written: null, out note);
+
+    /// <summary>
+    /// Removes what one game rule wrote, when the rule is removed or replaced by
+    /// one that sets no driver option. A profile Afterglow created is deleted
+    /// outright, as by <see cref="ClearSettings(string)"/>. On any other profile
+    /// vsync and pre-rendered frames are removed as there, but the frame cap only
+    /// when the rule wrote one and the profile still holds exactly that value
+    /// (<see cref="ReleaseCap"/>): a rule whose cap was empty left the cap to the
+    /// driver and takes nothing away, and a cap changed since — in NVIDIA Control
+    /// Panel, say — is kept and named in the note. `drs --clear`, the user's
+    /// explicit request, still removes all three.
+    /// </summary>
+    /// <param name="exeName">The executable.</param>
+    /// <param name="written">What the rule wrote (<see cref="Settings.GameRule.ToDriverSettings"/>).</param>
+    /// <param name="note">What was cleared or kept, or which step failed.</param>
+    public NvapiStatus ClearSettings(string exeName, GameDriverSettings written, out string note)
     {
-        return WithSession((session) =>
+        ArgumentNullException.ThrowIfNull(written);
+        return Clear(exeName, written, out note);
+    }
+
+    /// <param name="written">Null: remove every managed setting (an explicit clear).</param>
+    private NvapiStatus Clear(string exeName, GameDriverSettings? written, out string note)
+    {
+        // Every status but the save's used to be discarded (R-32): a refused
+        // DeleteProfile returned Ok with the override still in place, any lookup
+        // failure read as "nothing to clear", and an unreadable profile name was
+        // treated as someone else's profile. Each failure now returns before
+        // SaveSettings, so the session is destroyed unsaved and nothing changes.
+        string done = string.Empty;
+        bool absent = false;
+        var checkIds = new List<uint>(ManagedSettingIds);
+        var status = WithSession((session) =>
         {
-            if (FindApplication(session, exeName, out nint profile) != NvapiStatus.Ok)
+            var rc = FindApplication(session, exeName, out nint profile);
+            if (rc == NvapiStatus.ExecutableNotFound)
             {
-                return NvapiStatus.Ok;   // nothing to clear
+                absent = true;   // no profile holds the exe: nothing to clear
+                return NvapiStatus.Ok;
             }
 
-            string profileName = GetProfileNameFromApp(session, profile);
+            if (rc != NvapiStatus.Ok)
+            {
+                done = $"looking {exeName} up failed";
+                return rc;
+            }
+
+            rc = GetProfileName(session, profile, out string profileName);
+            if (rc != NvapiStatus.Ok)
+            {
+                // Whose profile it is decides between deleting it and stripping
+                // three settings; that is not decided on a guess.
+                done = $"reading the profile {exeName} belongs to failed";
+                return rc;
+            }
+
             if (profileName.StartsWith(ProfilePrefix, StringComparison.Ordinal))
             {
-                _ = _fn.DeleteProfile(session, profile);
+                rc = _fn.DeleteProfile(session, profile);
+                if (rc != NvapiStatus.Ok)
+                {
+                    done = $"deleting profile \"{profileName}\" failed";
+                    return rc;
+                }
+
+                done = $"deleted profile \"{profileName}\"";
             }
             else
             {
-                _ = _fn.DeleteProfileSetting(session, profile, FrameRateLimiterId);
-                _ = _fn.DeleteProfileSetting(session, profile, VsyncModeId);
-                _ = _fn.DeleteProfileSetting(session, profile, PreRenderedFramesId);
+                string kept = string.Empty;
+                foreach (uint settingId in ManagedSettingIds)
+                {
+                    if (settingId == FrameRateLimiterId && written is not null)
+                    {
+                        // A rule's own clear takes back only the cap it wrote (R1).
+                        rc = ReleaseCap(session, profile, owned: false, written.FrameCapFps, out var release, out uint? stored);
+                        if (rc != NvapiStatus.Ok)
+                        {
+                            done = $"taking back the frame-rate limiter in \"{profileName}\" failed";
+                            return rc;
+                        }
+
+                        if (release != CapRelease.Removed)
+                        {
+                            checkIds.Remove(FrameRateLimiterId);
+                        }
+
+                        if (release == CapRelease.Kept)
+                        {
+                            kept = $"; kept its frame cap ({CapText((int?)stored)}): it is no longer the " +
+                                   $"{CapText(written.FrameCapFps)} Afterglow wrote, so it may be yours";
+                        }
+
+                        continue;
+                    }
+
+                    // SETTING_NOT_FOUND: this knob was never set on the profile.
+                    rc = _fn.DeleteProfileSetting(session, profile, settingId);
+                    if (rc is not (NvapiStatus.Ok or NvapiStatus.SettingNotFound))
+                    {
+                        done = $"removing {SettingName(settingId)} from \"{profileName}\" failed";
+                        return rc;
+                    }
+                }
+
+                done = $"removed Afterglow's settings from \"{profileName}\"{kept}";
             }
 
-            return _fn.SaveSettings(session);
+            rc = _fn.SaveSettings(session);
+            if (rc != NvapiStatus.Ok)
+            {
+                done += ", but saving the store failed";
+            }
+
+            return rc;
         });
+
+        if (status != NvapiStatus.Ok)
+        {
+            note = $"{(done.Length > 0 ? done : "opening a driver settings session failed")}; nothing was changed";
+            return status;
+        }
+
+        if (absent)
+        {
+            note = $"no driver profile holds {exeName}; nothing to clear";
+            return NvapiStatus.Ok;
+        }
+
+        // Verify from a fresh session: the result is what the store holds, not
+        // what the calls returned. A cap this clear deliberately kept is not
+        // checked; it was meant to stay.
+        var check = FindManagedOverrides(exeName, checkIds, out var left);
+        if (check != NvapiStatus.Ok)
+        {
+            note = $"{done} and saved, but reading it back failed";
+            return check;
+        }
+
+        if (left.Count > 0)
+        {
+            note = $"{done} and saved, but {string.Join(", ", left.Select(SettingName))} " +
+                   $"{(left.Count == 1 ? "is" : "are")} still set for {exeName}";
+            return NvapiStatus.Error;
+        }
+
+        note = $"{done}, saved and verified";
+        return NvapiStatus.Ok;
     }
 
     /// <summary>Diagnostic: every profile name in the store that contains the filter.</summary>
@@ -432,13 +716,17 @@ public sealed unsafe class DrsApi
         return names;
     }
 
-    /// <summary>Diagnostic: create a bare profile, save, re-find from a fresh session, delete.</summary>
+    /// <summary>
+    /// Diagnostic: create a bare profile, save, re-find from a fresh session, and
+    /// delete it again — only if this call created and saved it. Pass a name
+    /// nothing else uses (the CLI adds a random suffix).
+    /// </summary>
     public string ProbeCreate(string profileName)
     {
         var createRc = NvapiStatus.Ok;
         var saveRc = NvapiStatus.Ok;
         string writtenBack = string.Empty;
-        _ = WithSession((session) =>
+        var sessionRc = WithSession((session) =>
         {
             var newProfile = default(NvdrsProfile);
             newProfile.Version = MakeVersion(sizeof(NvdrsProfile), 1);
@@ -453,22 +741,58 @@ public sealed unsafe class DrsApi
 
         var findRc = ProbeFindProfile(profileName);
 
+        // The cleanup used to re-find the name and delete whatever held it, even
+        // after CreateProfile failed with PROFILE_NAME_IN_USE (R-33): a profile
+        // that already had the name — a user's, or a previous run's — was deleted
+        // and the deletion saved. Only a create that succeeded AND was saved means
+        // the profile under this name is the one this call made; otherwise the
+        // session was destroyed unsaved and there is nothing of ours to remove.
+        if (sessionRc != NvapiStatus.Ok || createRc != NvapiStatus.Ok || saveRc != NvapiStatus.Ok)
+        {
+            return $"nameInStruct='{writtenBack}' session={sessionRc} create={createRc} save={saveRc} refind={findRc} " +
+                   "delete=skipped (this probe persisted no profile, so it deletes none)";
+        }
+
+        bool notOurs = false;
         var deleteRc = WithSession((session) =>
         {
             nint handle = 0;
+            NvapiStatus rc;
             fixed (char* name = profileName)
             {
-                if (_fn.FindProfileByName(session, name, &handle) != NvapiStatus.Ok)
-                {
-                    return NvapiStatus.ProfileNotFound;
-                }
+                rc = _fn.FindProfileByName(session, name, &handle);
             }
 
-            var rc = _fn.DeleteProfile(session, handle);
+            if (rc != NvapiStatus.Ok)
+            {
+                return rc;
+            }
+
+            // Still the bare user profile this call made: exact name, not
+            // predefined, no applications attached. Anything else is left alone.
+            var info = default(NvdrsProfile);
+            info.Version = MakeVersion(sizeof(NvdrsProfile), 1);
+            rc = _fn.GetProfileInfo(session, handle, &info);
+            if (rc != NvapiStatus.Ok)
+            {
+                return rc;
+            }
+
+            if (!string.Equals(ReadFixedString(info.ProfileName, 2048), profileName, StringComparison.Ordinal) ||
+                info.IsPredefined != 0 || info.NumOfApps != 0)
+            {
+                notOurs = true;
+                return NvapiStatus.Error;
+            }
+
+            rc = _fn.DeleteProfile(session, handle);
             return rc != NvapiStatus.Ok ? rc : _fn.SaveSettings(session);
         });
 
-        return $"nameInStruct='{writtenBack}' create={createRc} save={saveRc} refind={findRc} delete+save={deleteRc}";
+        return $"nameInStruct='{writtenBack}' create={createRc} save={saveRc} refind={findRc} " +
+               (notOurs
+                   ? "delete=refused (the profile now under this name is not the bare one this probe made; left untouched)"
+                   : $"delete+save={deleteRc}");
     }
 
     /// <summary>Diagnostic: raw FindProfileByName status for an exact profile name.</summary>
@@ -807,6 +1131,11 @@ public sealed unsafe class DrsApi
             return NvapiStatus.Ok;
         }
 
+        return SetDword(session, profile, settingId, value);
+    }
+
+    private NvapiStatus SetDword(nint session, nint profile, uint settingId, uint value)
+    {
         var setting = default(NvdrsSetting);
         setting.Version = MakeVersion(sizeof(NvdrsSetting), 1);
         setting.SettingId = settingId;
@@ -814,6 +1143,100 @@ public sealed unsafe class DrsApi
         setting.CurrentValue = value;
         return _fn.SetSetting(session, profile, &setting);
     }
+
+    /// <summary>What <see cref="ReleaseCap"/> did with a cap the request left empty.</summary>
+    private enum CapRelease
+    {
+        /// <summary>Nothing to take back: Afterglow wrote no cap, or the profile holds no user cap of its own.</summary>
+        None,
+
+        /// <summary>The cap Afterglow wrote was removed.</summary>
+        Removed,
+
+        /// <summary>Afterglow wrote a cap, but the profile now holds a different one, which stays.</summary>
+        Kept,
+    }
+
+    /// <summary>
+    /// Takes back the frame cap Afterglow wrote (<paramref name="wrote"/>; null
+    /// when it wrote none) now that the rule leaves the cap empty (R1). A cap is
+    /// removed only where the store itself shows it is Afterglow's:
+    /// <list type="bullet">
+    /// <item>in a profile Afterglow created ("Afterglow - exe", the test
+    /// ClearSettings uses to delete such a profile outright), whatever it holds —
+    /// the profile exists only because of Afterglow;</item>
+    /// <item>in any other profile — the driver's predefined one for the game, or
+    /// one made in NVIDIA Control Panel — only while it still holds exactly the
+    /// user value Afterglow wrote. A different value was set by someone else
+    /// since, and the driver's own predefined value was never Afterglow's; both
+    /// stay.</item>
+    /// </list>
+    /// With nothing written by Afterglow, nothing is removed: empty means "leave
+    /// the game's cap alone". The one case this cannot tell apart is a cap
+    /// someone re-set to the very value Afterglow had written. Always reports the
+    /// profile's own cap as it was (<paramref name="stored"/>), for verification.
+    /// </summary>
+    private NvapiStatus ReleaseCap(
+        nint session, nint profile, bool owned, int? wrote, out CapRelease outcome, out uint? stored)
+    {
+        outcome = CapRelease.None;
+        var rc = ReadOwnCap(session, profile, out stored, out bool isOverride);
+        if (rc != NvapiStatus.Ok || wrote is not int written || stored is not uint value || !isOverride)
+        {
+            return rc;
+        }
+
+        if (!owned && value != (written == 0 ? FrameRateLimiterDisabled : (uint)written))
+        {
+            outcome = CapRelease.Kept;
+            return NvapiStatus.Ok;
+        }
+
+        rc = _fn.DeleteProfileSetting(session, profile, FrameRateLimiterId);
+        if (rc is not (NvapiStatus.Ok or NvapiStatus.SettingNotFound))
+        {
+            return rc;
+        }
+
+        outcome = CapRelease.Removed;
+        return NvapiStatus.Ok;
+    }
+
+    /// <summary>
+    /// The frame cap stored in the profile itself: <paramref name="value"/> is
+    /// null when the profile holds none (absent, or inherited from the global or
+    /// base profile — settingLocation ≠ NVDRS_CURRENT_PROFILE_LOCATION);
+    /// <paramref name="isOverride"/> when it is a user value rather than the
+    /// driver's predefined one (isCurrentPredefined, nvapi.h NVDRS_SETTING_V1).
+    /// </summary>
+    private NvapiStatus ReadOwnCap(nint session, nint profile, out uint? value, out bool isOverride)
+    {
+        value = null;
+        isOverride = false;
+        var setting = default(NvdrsSetting);
+        setting.Version = MakeVersion(sizeof(NvdrsSetting), 1);
+        var rc = _fn.GetSetting(session, profile, FrameRateLimiterId, &setting);
+        if (rc == NvapiStatus.SettingNotFound)
+        {
+            return NvapiStatus.Ok;
+        }
+
+        if (rc != NvapiStatus.Ok)
+        {
+            return rc;
+        }
+
+        if (setting.SettingLocation == CurrentProfileLocation)
+        {
+            value = setting.CurrentValue;
+            isOverride = setting.IsCurrentPredefined == 0;
+        }
+
+        return NvapiStatus.Ok;
+    }
+
+    private static string ProfileLabel(string profileName, string exeName) =>
+        profileName.Length > 0 ? $"\"{profileName}\"" : $"{exeName}'s driver profile";
 
     private bool TryGetDword(nint session, nint profile, uint settingId, out uint value)
     {
@@ -829,16 +1252,74 @@ public sealed unsafe class DrsApi
         return false;
     }
 
-    private string GetProfileNameFromApp(nint session, nint profile)
+    private static string SettingName(uint settingId) => settingId switch
+    {
+        FrameRateLimiterId => "the frame-rate limiter",
+        VsyncModeId => "vsync",
+        PreRenderedFramesId => "max pre-rendered frames",
+        _ => $"setting 0x{settingId:X8}",
+    };
+
+    private NvapiStatus GetProfileName(nint session, nint profile, out string name)
     {
         var info = default(NvdrsProfile);
         info.Version = MakeVersion(sizeof(NvdrsProfile), 1);
-        if (_fn.GetProfileInfo(session, profile, &info) != NvapiStatus.Ok)
-        {
-            return string.Empty;
-        }
+        var rc = _fn.GetProfileInfo(session, profile, &info);
+        name = rc == NvapiStatus.Ok ? ReadFixedString(info.ProfileName, 2048) : string.Empty;
+        return rc;
+    }
 
-        return ReadFixedString(info.ProfileName, 2048);
+    /// <summary>
+    /// Read-only, from a fresh session: which of the three managed settings are
+    /// still overridden for the exe — stored in its own profile as a user value.
+    /// Absent (SETTING_NOT_FOUND), inherited from the global or base profile
+    /// (settingLocation ≠ NVDRS_CURRENT_PROFILE_LOCATION), or back at the
+    /// driver's predefined value (isCurrentPredefined ≠ 0) are not overrides
+    /// (nvapi.h, NVDRS_SETTING_V1; guide PG-12072-001_v01 p.8–10). An exe no
+    /// profile holds has none.
+    /// </summary>
+    private NvapiStatus FindManagedOverrides(string exeName, IReadOnlyList<uint> settingIds, out IReadOnlyList<uint> overridden)
+    {
+        var found = new List<uint>();
+        var status = WithSession((session) =>
+        {
+            var rc = FindApplication(session, exeName, out nint profile);
+            if (rc == NvapiStatus.ExecutableNotFound)
+            {
+                return NvapiStatus.Ok;
+            }
+
+            if (rc != NvapiStatus.Ok)
+            {
+                return rc;
+            }
+
+            foreach (uint settingId in settingIds)
+            {
+                var setting = default(NvdrsSetting);
+                setting.Version = MakeVersion(sizeof(NvdrsSetting), 1);
+                rc = _fn.GetSetting(session, profile, settingId, &setting);
+                if (rc == NvapiStatus.SettingNotFound)
+                {
+                    continue;
+                }
+
+                if (rc != NvapiStatus.Ok)
+                {
+                    return rc;
+                }
+
+                if (setting.SettingLocation == CurrentProfileLocation && setting.IsCurrentPredefined == 0)
+                {
+                    found.Add(settingId);
+                }
+            }
+
+            return NvapiStatus.Ok;
+        });
+
+        overridden = found;
+        return status;
     }
 
     private static string ReadFixedString(char* source, int capacity)

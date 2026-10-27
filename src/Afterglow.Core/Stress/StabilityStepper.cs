@@ -26,6 +26,12 @@ public sealed record StepperStatus(
     int? LastGoodOffsetMHz,
     TimeSpan StepElapsed,
     TimeSpan StepDuration,
+
+    /// <summary>
+    /// The run's log so far, capped at <see cref="RunLog.DefaultCapacity"/>
+    /// lines plus a marker for any dropped. From a run this is a
+    /// <see cref="RunLogLines"/>, numbered so a viewer can add only new lines.
+    /// </summary>
     IReadOnlyList<string> Log,
     int? ResultOffsetMHz,
 
@@ -37,6 +43,9 @@ public sealed record StepperStatus(
     /// and this instead reports whether the closing re-write of that result was
     /// confirmed by the driver — false means the result stands but could not
     /// be re-confirmed as applied; MCP exposes it as result_offset_confirmed.
+    /// When another writer interrupted the run (phase "interrupted"), the
+    /// stepper writes nothing more: false means the card still reads the offset
+    /// this run last applied, null that the other writer moved it.
     /// <para>
     /// Callers used to infer this from "a terminal status arrived", which only
     /// says the thread unwound. ApplyOffset gives up after three tries in about
@@ -52,15 +61,34 @@ public sealed record StepperStatus(
 /// the error-checking stress test, back off on the first artifact/TDR, then run
 /// a longer confirmation burn. Produces a defensible "stable offset" — the
 /// open-source answer to NVIDIA's closed OC Scanner, with a visible method.
+/// <para>
+/// A step is scored only against the configuration it applied. When another
+/// writer touches the card mid-run (the Tuning page, a profile hotkey, a game
+/// rule, automation, a panic reset), or the readback shows the offset moved,
+/// the run ends as "interrupted" without scoring the step and without writing
+/// anything more (R-02): it used to score a step the device had been reset
+/// under, walk on, and re-apply its offset over the user's reset.
+/// </para>
 /// </summary>
 public sealed class StabilityStepper
 {
+    private const string ForeignWrite =
+        "another tuning write reached this GPU during the run — the Tuning page, a profile hotkey, a game rule, " +
+        "automation or a reset";
+
     private readonly IGpuTuner _tuner;
     private readonly Lock _lock = new();
-    private readonly List<string> _log = [];
+    // The whole run's log, capped (#7): the app now shows all of it, not the last 14 lines.
+    private readonly RunLog _log = new();
     private Thread? _thread;
     private volatile bool _cancel;
-    private StepperStatus _status = new(false, "idle", 0, null, TimeSpan.Zero, TimeSpan.Zero, [], null);
+    private StepperStatus _status = new(false, "idle", 0, null, TimeSpan.Zero, TimeSpan.Zero, RunLogLines.Empty, null);
+
+    /// <summary>The current run's ownership of the tuning; set and used on the run thread only.</summary>
+    private TuningRunGuard? _guard;
+
+    /// <summary>The core offset this run last wrote successfully (null before the first write).</summary>
+    private int? _lastWritten;
 
     public event Action<StepperStatus>? StatusChanged;
 
@@ -74,6 +102,13 @@ public sealed class StabilityStepper
 
     /// <summary>PCI vendor of the card being tuned (defaults to NVIDIA).</summary>
     public uint TargetVendorId { get; set; } = StressAdapter.NvidiaVendorId;
+
+    /// <summary>
+    /// The burn engine for each step. Null means the real burn
+    /// (<see cref="GpuStressTest"/>); tests supply a load that runs nothing, so
+    /// the sweep's write/score choreography runs without a D3D device.
+    /// </summary>
+    internal Func<IProbeLoad>? LoadFactory { get; set; }
 
     public StepperStatus Status
     {
@@ -178,12 +213,19 @@ public sealed class StabilityStepper
         StepperStatus status;
         lock (_lock)
         {
-            status = new StepperStatus(running, phase, offset, lastGood, stepElapsed, stepDuration, _log.ToArray(), result, restored);
+            // A cached snapshot: a progress tick that added no line copies nothing.
+            status = new StepperStatus(running, phase, offset, lastGood, stepElapsed, stepDuration, _log.Snapshot(), result, restored);
             _status = status;
         }
 
         StatusChanged?.Invoke(status);
     }
+
+    /// <summary>True once a write this run did not make has reached the card.</summary>
+    private bool Interrupted => _guard?.Interrupted == true;
+
+    /// <summary>The interruption reason when a write from elsewhere has reached the card, else null.</summary>
+    private string? ForeignWriteIfAny => Interrupted ? ForeignWrite : null;
 
     private void Run(StepperOptions options)
     {
@@ -199,6 +241,21 @@ public sealed class StabilityStepper
             return;
         }
 
+        _lastWritten = null;
+        using var guard = new TuningRunGuard(_tuner);
+        _guard = guard;
+        try
+        {
+            Sweep(options);
+        }
+        finally
+        {
+            _guard = null;
+        }
+    }
+
+    private void Sweep(StepperOptions options)
+    {
         int step = Math.Max(5, options.StepMHz);
         int maxOffset = Math.Min(options.MaxOffsetMHz, _tuner.Capabilities.CoreOffsetMaxMHz);
         int startOffset = _tuner.ReadCurrent().CoreOffsetMHz;
@@ -210,7 +267,13 @@ public sealed class StabilityStepper
 
         while (!_cancel)
         {
-            if (!ApplyOffset(current))
+            bool applied = ApplyOffset(current);
+            if (EndIfInterrupted(ForeignWriteIfAny, lastGood, startOffset))
+            {
+                return;
+            }
+
+            if (!applied)
             {
                 if (lastGood is null && current == startOffset)
                 {
@@ -231,6 +294,11 @@ public sealed class StabilityStepper
                 // it "may still be" if the restore fails too.
                 int cardMayBeAt = lastGood ?? startOffset;
                 bool backAtStart = RestoreStart(startOffset, cardMayBeAt);
+                if (EndIfInterrupted(ForeignWriteIfAny, lastGood, startOffset))
+                {
+                    return;
+                }
+
                 Publish(false, "failed", backAtStart ? startOffset : cardMayBeAt, lastGood,
                     TimeSpan.Zero, TimeSpan.Zero, restored: backAtStart);
                 return;
@@ -238,6 +306,11 @@ public sealed class StabilityStepper
 
             Log($"Testing {Fmt(current)} for {options.SecondsPerStep} s…");
             var verdict = Burn(TimeSpan.FromSeconds(options.SecondsPerStep), current, lastGood);
+            if (EndIfInterrupted(InterruptionAfterBurn(verdict), lastGood, startOffset))
+            {
+                return;
+            }
+
             if (_cancel)
             {
                 break;
@@ -250,7 +323,7 @@ public sealed class StabilityStepper
                 if (current + step > maxOffset)
                 {
                     Log($"Reached the configured ceiling (+{maxOffset} MHz).");
-                    Finish(lastGood, options);
+                    Finish(lastGood, startOffset);
                     return;
                 }
 
@@ -275,7 +348,13 @@ public sealed class StabilityStepper
                 int failedAt = current;
                 current = backoff;
                 Log($"Backing off to {Fmt(current)} for a {options.ConfirmSeconds} s confirmation burn…");
-                if (!ApplyOffset(current))
+                bool backedOff = ApplyOffset(current);
+                if (EndIfInterrupted(ForeignWriteIfAny, lastGood, startOffset))
+                {
+                    return;
+                }
+
+                if (!backedOff)
                 {
                     // Retract the line above: the backoff did NOT happen. The
                     // card is still at the offset that just failed — and right
@@ -285,12 +364,22 @@ public sealed class StabilityStepper
                     // a log both the app and MCP agents read.
                     Log($"Could not apply the backoff {Fmt(current)} — this GPU is still at {Fmt(failedAt)}.");
                     bool backAtStart = RestoreStart(startOffset, failedAt);
+                    if (EndIfInterrupted(ForeignWriteIfAny, lastGood, startOffset))
+                    {
+                        return;
+                    }
+
                     Publish(false, "failed", backAtStart ? startOffset : failedAt, lastGood,
                         TimeSpan.Zero, TimeSpan.Zero, restored: backAtStart);
                     return;
                 }
 
                 var confirm = Burn(TimeSpan.FromSeconds(options.ConfirmSeconds), current, lastGood);
+                if (EndIfInterrupted(InterruptionAfterBurn(confirm), lastGood, startOffset))
+                {
+                    return;
+                }
+
                 if (_cancel)
                 {
                     break;
@@ -299,7 +388,7 @@ public sealed class StabilityStepper
                 if (confirm == StressState.Stopped)
                 {
                     Log($"{Fmt(current)} confirmed stable.");
-                    Finish(current, options);
+                    Finish(current, startOffset);
                 }
                 else
                 {
@@ -313,6 +402,11 @@ public sealed class StabilityStepper
             {
                 Log($"Stress test could not run ({verdict}). Stopping.");
                 bool restoredAfterFailure = RestoreStart(startOffset, current);
+                if (EndIfInterrupted(ForeignWriteIfAny, lastGood, startOffset))
+                {
+                    return;
+                }
+
                 Publish(false, "failed", restoredAfterFailure ? startOffset : current, lastGood,
                     TimeSpan.Zero, TimeSpan.Zero, restored: restoredAfterFailure);
                 return;
@@ -325,9 +419,62 @@ public sealed class StabilityStepper
         // it to be: reporting startOffset after a failed restore is a fabricated
         // reading of the very state the caller needs to act on.
         bool restored = RestoreStart(startOffset, current);
+        if (EndIfInterrupted(ForeignWriteIfAny, lastGood, startOffset))
+        {
+            return;
+        }
+
         Publish(false, "cancelled", restored ? startOffset : current, lastGood,
             TimeSpan.Zero, TimeSpan.Zero, restored: restored);
 
+    }
+
+    /// <summary>
+    /// Why the step that just burned cannot be scored, or null when it can: a
+    /// write from elsewhere reached the card during it, or — for changes no
+    /// in-process event reports, such as another process — the card no longer
+    /// reads the configuration this step applied. A driver reset is exempt from
+    /// the readback: recovering from one may itself move the offsets, and that
+    /// step is being scored as a failure in any case. So is a cancel, whose
+    /// restore of the starting offset is what the user asked for.
+    /// </summary>
+    private string? InterruptionAfterBurn(StressState verdict) =>
+        ForeignWriteIfAny ?? (_cancel || verdict == StressState.DeviceLost ? null : _guard?.Drift());
+
+    /// <summary>
+    /// Ends the run as "interrupted" when <paramref name="why"/> says it was, and
+    /// returns whether it did. Nothing is written from here on — no next step, no
+    /// closing re-write, no restore: whoever wrote last owns the card, and
+    /// overwriting a deliberate act (a reset, a hotkey, a game profile) is worse
+    /// than leaving an offset the user can see and reset. Where the card is left
+    /// is read back and published, and said out loud when it is still the
+    /// offset this run applied.
+    /// </summary>
+    private bool EndIfInterrupted(string? why, int? lastGood, int startOffset)
+    {
+        if (why is null)
+        {
+            return false;
+        }
+
+        Log($"Interrupted: {why}.");
+        Log("The step is not scored and nothing more is written to the GPU's tuning — it stays as that change left it.");
+
+        int live = _tuner.ReadCurrent().CoreOffsetMHz;
+        bool ourOffsetLeft = _lastWritten is int written && live == written && written != startOffset;
+        Log(ourOffsetLeft
+            ? $"The card still reads {Fmt(live)}, the offset this run applied — the other change did not move it. " +
+              "Reset it from the Tuning page or with `afterglow-cli reset` if that is not what you want."
+            : $"The card now reads {Fmt(live)} core offset.");
+        if (_guard?.InterruptedDuringOwnWrite == true)
+        {
+            Log("That change landed while the stepper was writing an offset, so either write may be the one in " +
+                "force — check the Tuning page.");
+        }
+
+        Publish(false, "interrupted", live, lastGood, TimeSpan.Zero, TimeSpan.Zero,
+            restored: ourOffsetLeft ? false : null);
+        return true;
     }
 
     /// <summary>
@@ -348,6 +495,11 @@ public sealed class StabilityStepper
     private void PublishEndOfSweep(int failedAt, int? lastGood, int startOffset)
     {
         bool restored = RestoreStart(startOffset, failedAt);
+        if (EndIfInterrupted(ForeignWriteIfAny, lastGood, startOffset))
+        {
+            return;
+        }
+
         bool completed = lastGood is not null && restored;
 
         Publish(
@@ -370,6 +522,10 @@ public sealed class StabilityStepper
     /// entirely — the paths that follow a detected hardware fault, which are
     /// exactly the ones where the driver is most likely to refuse the write.
     /// </para>
+    /// <para>
+    /// After an interruption nothing is written, so nothing is claimed either:
+    /// the caller ends the run as interrupted instead.
+    /// </para>
     /// </summary>
     /// <param name="cardMayBeAt">Where the card is left if the restore fails.</param>
     private bool RestoreStart(int startOffset, int cardMayBeAt)
@@ -379,19 +535,34 @@ public sealed class StabilityStepper
             return true;
         }
 
+        if (Interrupted)
+        {
+            return false;
+        }
+
         Log($"The starting offset ({Fmt(startOffset)}) could NOT be restored — this GPU may still be at " +
             $"{Fmt(cardMayBeAt)}, the offset that just failed. Reset it from the Tuning page or with " +
             "`afterglow-cli reset`.");
         return false;
     }
 
-    private void Finish(int? stable, StepperOptions options)
+    private void Finish(int? stable, int startOffset)
     {
         int result = stable ?? 0;
 
         // The sweep's finding stands either way, but "applied" is a separate
         // claim from "stable" and this one used to be made without checking.
         bool applied = ApplyOffset(result);
+        if (EndIfInterrupted(
+                Interrupted
+                    ? $"{ForeignWrite}, just as the sweep finished. It had found {Fmt(result)} stable, but that is not " +
+                      "applied over the other change and not reported as a result"
+                    : null,
+                stable, startOffset))
+        {
+            return;
+        }
+
         if (!applied)
         {
             // The last burn ran AT this offset, so the card most likely still
@@ -406,21 +577,35 @@ public sealed class StabilityStepper
         Publish(false, "done", result, stable, TimeSpan.Zero, TimeSpan.Zero, result, restored: applied);
     }
 
+    /// <summary>
+    /// Writes one core offset, keeping every other knob as it reads now. Never
+    /// writes once another writer has acted (R-02) — that returns false with
+    /// nothing written, and the caller ends the run as interrupted. A write that
+    /// lands is read back as the configuration the next burn is scored against.
+    /// </summary>
     private bool ApplyOffset(int offsetMHz)
     {
         for (int attempt = 0; attempt < 3; attempt++)
         {
+            if (Interrupted || _guard is not { } guard)
+            {
+                return false;
+            }
+
             // Preserve everything except the core offset under test.
             var current = _tuner.ReadCurrent();
-            if (_tuner.Apply(new Profiles.TuningProfile
+            var result = guard.Own(() => _tuner.Apply(new Profiles.TuningProfile
             {
                 Name = "stepper",
                 CoreOffsetMHz = offsetMHz,
                 MemOffsetMHz = current.MemOffsetMHz,
                 LockedCoreClockMHz = _tuner.AppliedLockMHz, // applied, never the observed ceiling
                 VoltageBoostPct = current.VoltageBoostPct,
-            }, reconcileVfPoints: false).AllSucceeded)
+            }, reconcileVfPoints: false));
+            if (result.AllSucceeded)
             {
+                _lastWritten = offsetMHz;
+                guard.CaptureApplied();
                 return true;
             }
 
@@ -433,7 +618,7 @@ public sealed class StabilityStepper
 
     private StressState Burn(TimeSpan duration, int offset, int? lastGood)
     {
-        using var stress = new GpuStressTest
+        using IProbeLoad stress = LoadFactory?.Invoke() ?? new GpuStressTest
         {
             TargetPciBusId = TargetPciBusId,
             TargetVendorId = TargetVendorId,
@@ -472,9 +657,12 @@ public sealed class StabilityStepper
         }
 
         stress.Start();
-        bool terminal = WaitForBurn(done, duration, () => _cancel);
+
+        // Another writer ends the step within a tick too: whatever the burn
+        // goes on to measure is no longer about this offset.
+        bool terminal = WaitForBurn(done, duration, () => _cancel || Interrupted);
         Volatile.Write(ref stepOver, true);
-        if (_cancel)
+        if (_cancel && !Interrupted)
         {
             // Say the stop registered — ending the burn and putting the starting
             // offset back takes seconds more, and until then the last thing
@@ -505,7 +693,7 @@ public sealed class StabilityStepper
         // the closing verification on such a run compares the reference buffer
         // against itself. Passing it would mark the offset good and raise the
         // sweep, and find_stable_offset hands that number to an agent.
-        if (final == StressState.Stopped && !_cancel && !stress.Progress.IsCleanPass)
+        if (final == StressState.Stopped && !_cancel && !Interrupted && !stress.Progress.IsCleanPass)
         {
             Log($"This step earned no verdict: {stress.Progress.VerdictGap ?? "the burn did not end in a clean stop"} " +
                 "— nothing was proven at this offset.");

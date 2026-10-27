@@ -58,7 +58,39 @@ public sealed class ArcGpuTuner : IGpuTuner
     /// </summary>
     private double? _observedReleasedMaxMhz;
 
-    private double ReleasedMaxMhz => _observedReleasedMaxMhz ?? _hwMaxMhz;
+    private double ReleasedMaxMhz => _observedReleasedMaxMhz ?? _recordedReleasedMaxMhz ?? _hwMaxMhz;
+
+    /// <summary>
+    /// The released ceiling and floor an earlier process verified for this
+    /// card under this driver (<see cref="ReleasedRangeStore"/>), loaded at
+    /// construction and rewritten by every verified release. They let a new
+    /// process read the factory range as released before its own first
+    /// release (R-17 follow-up) — but they are a measurement from another
+    /// process, so they never make a release FAIL: only a value verified in
+    /// this process does. A release that contradicts the record is adopted
+    /// and said so, and the record is rewritten.
+    /// </summary>
+    private double? _recordedReleasedMaxMhz;
+
+    private double? _recordedReleasedMinMhz;
+
+    /// <summary>The driver version the recorded range is keyed on; null when the driver reports none, and then nothing is recorded.</summary>
+    private readonly string? _driverVersion;
+
+    /// <summary>
+    /// The released floor, once a release in this process has verified it;
+    /// null until then — the floor's twin of <see cref="_observedReleasedMaxMhz"/>. Intel's
+    /// contract for ctl_freq_range_t says the -1 restore returns the minimum
+    /// to the factory value, which "can be larger than the hardware min", so
+    /// the hardware minimum is only the floor clamp detection measures from
+    /// until a release has shown the real one (see <see cref="ReleasedMinMhz"/>).
+    /// Measuring from the hardware minimum alone read a factory floor above it
+    /// as a pin that never released: unlock, reset and lock-less applies all
+    /// failed and the probe refused to start (R-17).
+    /// </summary>
+    private double? _observedReleasedMinMhz;
+
+    private double ReleasedMinMhz => _observedReleasedMinMhz ?? _recordedReleasedMinMhz ?? _hwMinMhz;
 
     /// <summary>
     /// Between <see cref="BeginProbe"/> and a successful <see cref="EndProbe"/>:
@@ -66,28 +98,81 @@ public sealed class ArcGpuTuner : IGpuTuner
     /// tuner sees it before the pre-sweep release empties the tracking; while
     /// it is set, <see cref="AppliedLockMHz"/> answers with it, so a failed pin
     /// release does not make the user's lock vanish until the next restart.
+    /// <para>
+    /// It names a lock Afterglow applied that a sweep took off the card —
+    /// BeginProbe's release, or a pin landing over a range lock — and only
+    /// until a newer lock decision lands: a range lock written by an apply
+    /// (see <see cref="TrackWrittenRangeLock"/>), a verified release, or a
+    /// lock-less profile. A sweep stops on such a write (R-02), and its
+    /// EndProbe put this older lock back over it: a hotkey's 2000 MHz lock
+    /// ended as the 1800 the sweep began under, or, with no lock before the
+    /// sweep, was released as the probe's pin.
+    /// </para>
     /// </summary>
     private uint? _probeDisplacedLock;
+
+    /// <summary>
+    /// The lock Afterglow applied, under the apply lock: a range lock this
+    /// process wrote or inherited when one is on the card, otherwise the one a
+    /// sweep displaced and has not yet put back. In that order — a lock the
+    /// user applied after a failed restore replaced the displaced one, and
+    /// answering with the displaced one persisted the older lock over the
+    /// newer and made the next sweep restore it. <see cref="BeginProbe"/>
+    /// captures exactly this value, so a retried sweep carries forward a lock
+    /// an earlier sweep could not put back (R-16).
+    /// </summary>
+    private uint? AppliedLockCore => _clamp?.AppliedLock ?? _probeDisplacedLock;
 
     /// <summary>A pin write of the current sweep landed with the driver, so EndProbe has something to release.</summary>
     private bool _probePinLanded;
 
+    /// <summary>
+    /// A range lock written by a lock decision — an apply, <see cref="RestoreTuningLock"/> —
+    /// landed with the driver: it is the lock Afterglow applied, on the card
+    /// now. It supersedes any lock a sweep displaced, and the write replaced
+    /// the sweep's pin, so EndProbe has neither an older lock to put back nor a
+    /// pin to release; either one undid the newer lock. A pin landing over it
+    /// afterwards displaces it in turn (see <see cref="WriteClampVerified"/>).
+    /// Not EndProbe's own restore: the displaced lock is forgotten only once
+    /// that write is verified.
+    /// </summary>
+    private void TrackWrittenRangeLock(uint mhz)
+    {
+        _clamp = new TrackedClamp(mhz, mhz);
+        _probeDisplacedLock = null;
+        _probePinLanded = false;
+    }
+
     /// <summary>The highest clock a sweep may pin: the verified released ceiling, or the domain maximum until one is known.</summary>
     public uint MaxLockableClockMHz =>
-        _observedReleasedMaxMhz is double known && known > 0 ? (uint)Math.Round(known) : Capabilities.MaxCoreClockMHz;
+        (_observedReleasedMaxMhz ?? _recordedReleasedMaxMhz) is double known && known > 0
+            ? (uint)Math.Round(known)
+            : Capabilities.MaxCoreClockMHz;
 
     /// <summary>
-    /// A release landed: the readback ceiling becomes the released baseline,
-    /// the tracked clamp (and any displaced lock a sweep remembered) is
-    /// cleared, and any V/F probe record for this card is resolved — the floor
-    /// gate before every call here proves no pin survives.
+    /// A release landed: the readback floor and ceiling become the released
+    /// baseline, the tracked clamp (and any displaced lock a sweep remembered)
+    /// is cleared, and any V/F probe record for this card is resolved — the
+    /// floor gate before every call here proves no pin survives. The baseline
+    /// is recorded for the next process when it differs from the record.
     /// </summary>
-    private void AdoptReleasedBaseline(double max)
+    private void AdoptReleasedBaseline(double min, double max)
     {
         _clamp = null;
         _probeDisplacedLock = null;
+        _observedReleasedMinMhz = min;
         _observedReleasedMaxMhz = max;
         ResolveProbeRecord();
+
+        bool onRecord = _recordedReleasedMinMhz is double recordedMin && Math.Abs(recordedMin - min) < 0.5
+            && _recordedReleasedMaxMhz is double recordedMax && Math.Abs(recordedMax - max) < 0.5;
+        if (_driverVersion is not null && !onRecord)
+        {
+            ReleasedRangeStore.Save(new ReleasedRangeStore.ReleasedRange(
+                RecordKey, _driverVersion, _hwMinMhz, _hwMaxMhz, min, max, DateTimeOffset.UtcNow));
+            _recordedReleasedMinMhz = min;
+            _recordedReleasedMaxMhz = max;
+        }
     }
 
     /// <summary>See <see cref="IGpuTuner.RecordKey"/>.</summary>
@@ -155,6 +240,19 @@ public sealed class ArcGpuTuner : IGpuTuner
         {
             _clamp = new TrackedClamp(tracked, tracked); // Afterglow wrote it: never a factory value
         }
+
+        // The factory range an earlier process verified on this card, under
+        // this driver and these domain limits — so a raised factory floor
+        // reads as released from the first read, not as a limit nobody can
+        // explain until this process releases once (R-17 follow-up). A zero
+        // version is the shape of a driver that did not fill the field.
+        _driverVersion = device.DriverVersion is { Length: > 0 } version && version != "0.0.0.0" ? version : null;
+        if (supportsClamp
+            && ReleasedRangeStore.Load(RecordKey, _driverVersion, _hwMinMhz, _hwMaxMhz) is { } recorded)
+        {
+            _recordedReleasedMinMhz = recorded.MinMhz;
+            _recordedReleasedMaxMhz = recorded.MaxMhz;
+        }
     }
 
     public TuningCapabilities Capabilities { get; }
@@ -181,7 +279,7 @@ public sealed class ArcGpuTuner : IGpuTuner
                 // the probe's, never the lock Afterglow applied: reporting it
                 // here made the next sweep restore a failed-release pin as a
                 // range lock the user never set, on every stepper step too.
-                return _probeDisplacedLock ?? _clamp?.AppliedLock;
+                return AppliedLockCore;
             }
         }
     }
@@ -197,6 +295,16 @@ public sealed class ArcGpuTuner : IGpuTuner
 
     /// <inheritdoc />
     public event Action<IGpuTuner>? StateWritten;
+
+    /// <inheritdoc />
+    public event Action<IGpuTuner, TuningWrite>? WriteStarting;
+
+    /// <inheritdoc />
+    public event Action<IGpuTuner, TuningWrite>? WriteFinished;
+
+    /// <summary>See <see cref="IGpuTuner.WriteStarting"/>; under the apply lock, right before the driver call.</summary>
+    private TuningWriteScope BeginWrite(TuningWriteKind kind, string what) =>
+        TuningWriteScope.Begin(this, WriteStarting, WriteFinished, kind, what);
 
     /// <summary>
     /// Schema-validation floors from this device: Intel frequency domains clamp
@@ -252,19 +360,32 @@ public sealed class ArcGpuTuner : IGpuTuner
     /// cleared must not pin its "inherited" flag onto the factory ceiling the
     /// driver reports now, or that ceiling could never be adopted.
     /// </para>
+    /// <para>
+    /// A raised floor is measured from the released floor, not the hardware
+    /// minimum (R-17): a factory floor above the hardware minimum is a valid
+    /// released state. Until a release has verified it — in this process, or
+    /// in an earlier one on this card under this driver — it reads as a limit
+    /// this process cannot yet explain — the same rule as a factory ceiling
+    /// below the domain maximum — and the next release adopts it.
+    /// </para>
     /// </summary>
-    private uint? RefreshTrackedClampFromDriver()
+    private uint? RefreshTrackedClampFromDriver() => RefreshTrackedClampFromDriver(out _);
+
+    /// <param name="live">The range the driver reported, or null when the getter did not answer.</param>
+    private uint? RefreshTrackedClampFromDriver(out CtlFreqRange? live)
     {
         lock (_applyLock)
         {
+            live = null;
             if (_gpuFreqDomain == 0
                 || _device.TryGetFrequencyRange(_gpuFreqDomain, out var range) != CtlResult.Success)
             {
                 return _clamp?.Mhz;
             }
 
+            live = range;
             bool maxClamped = range.Max > 0 && range.Max < ReleasedMaxMhz - 0.5;
-            bool minRaised = range.Min > 0 && range.Min > _hwMinMhz + 0.5;
+            bool minRaised = range.Min > 0 && range.Min > ReleasedMinMhz + 0.5;
             uint? lockMHz = maxClamped ? (uint)Math.Round(range.Max)
                 : minRaised ? (uint)Math.Round(range.Max > 0 ? range.Max : _hwMaxMhz) // leftover exact pin
                 : null;
@@ -324,6 +445,7 @@ public sealed class ArcGpuTuner : IGpuTuner
                 return new ApplyResult(false, results);
             }
 
+            using var write = BeginWrite(TuningWriteKind.Apply, TuningWrite.DescribeApply(profile));
             AppliedStateStore.RecordPending(profile.Name, RecordKey);
 
             ApplyPowerLimit(profile, results);
@@ -364,6 +486,7 @@ public sealed class ArcGpuTuner : IGpuTuner
         lock (_applyLock)
         {
             var results = new List<KnobResult>();
+            using var write = BeginWrite(TuningWriteKind.Reset, "resetting the card to driver defaults");
 
             if (Capabilities.SupportsLockedCoreClock)
             {
@@ -442,6 +565,7 @@ public sealed class ArcGpuTuner : IGpuTuner
                 return KnobResult.Fail("clock lock", "the frequency clamp isn't available on this GPU");
             }
 
+            using var write = BeginWrite(TuningWriteKind.Lock, "releasing the clock clamp");
             return ReleaseClampCore();
         }
     }
@@ -466,17 +590,41 @@ public sealed class ArcGpuTuner : IGpuTuner
 
             // Capture the displaced lock BEFORE the release empties the
             // tracking — the one ordering the probe could not get from outside.
-            uint? observed = RefreshTrackedClampFromDriver();
-            uint? displaced = _clamp?.AppliedLock;
+            // A lock an earlier sweep displaced and could not put back is
+            // carried forward: on a retry the card holds that sweep's pin,
+            // which stands for no applied lock, and capturing the clamp's
+            // lock alone dropped the user's lock in the release below (R-16).
+            uint? observed = RefreshTrackedClampFromDriver(out var live);
+            uint? displaced = AppliedLockCore;
             string? note = null;
             if (observed is uint clamp && clamp > 0)
             {
+                // Name what the driver showed before the release rewrites the
+                // baseline: a raised floor under an unclamped ceiling is no
+                // ceiling, and on a card whose factory floor sits above the
+                // hardware minimum it is the factory floor itself (R-17).
+                string seen = live switch
+                {
+                    { } r when r.Max > 0 && Math.Abs(r.Max - r.Min) < 1.0 =>
+                        $"an exact {clamp} MHz clock pin (left by a sweep whose release failed, or by another tool)",
+                    { } r when !(r.Max > 0 && r.Max < ReleasedMaxMhz - 0.5) =>
+                        $"a {r.Min:F0} MHz clock floor this process had not applied " +
+                        "(another tool's clamp, or the factory floor)",
+                    _ => $"a {clamp} MHz clock ceiling this process had not applied " +
+                        "(another tool's clamp, or the factory ceiling)",
+                };
+
                 // Release whatever clamp is on the card so the sweep runs
                 // against the true ceiling: a leftover pin from a dead session
                 // read as the ceiling and produced a two-point "complete" curve,
                 // and a tuning lock hid the factory ceiling so the last target
                 // was refused every time.
-                var release = ReleaseClampCore();
+                KnobResult release;
+                using (BeginWrite(TuningWriteKind.Lock, "releasing the clock clamp before the V/F probe"))
+                {
+                    release = ReleaseClampCore();
+                }
+
                 if (!release.Applied)
                 {
                     return new ProbeStart(0, null, null, release.Detail);
@@ -484,8 +632,7 @@ public sealed class ArcGpuTuner : IGpuTuner
 
                 if (displaced is null)
                 {
-                    note = $"the driver reported a {clamp} MHz clock ceiling this process had not applied " +
-                        "(another tool's clamp, or the factory ceiling); it was released before the sweep, " +
+                    note = $"the driver reported {seen}; it was released before the sweep, " +
                         "and the card is at its factory range";
                 }
             }
@@ -508,7 +655,7 @@ public sealed class ArcGpuTuner : IGpuTuner
                 // would hold full clocks at idle). The verified write resolves
                 // the probe's pin record; the displaced lock is forgotten only
                 // once it is back on the card.
-                var rc = WriteClampVerified(_hwMinMhz, restore, restore); // the notify-free write; EndProbe notifies once
+                var rc = WriteClampVerified(_hwMinMhz, restore, restore, restoresDisplaced: true); // the notify-free write; EndProbe notifies once
                 if (rc != NvmlReturn.Success)
                 {
                     return KnobResult.Fail("clock lock", $"the previous {restore} MHz clock lock could not be restored ({rc})");
@@ -523,10 +670,15 @@ public sealed class ArcGpuTuner : IGpuTuner
                 // Nothing was ever pinned (step 0 refused, or the sweep never
                 // started), so there is nothing to release — and a refused
                 // release here used to be reported as "the GPU may still be
-                // pinned" over a session that changed nothing.
-                return KnobResult.Ok("clock lock", "nothing was pinned");
+                // pinned" over a session that changed nothing. Or a range lock
+                // written mid-sweep replaced the pin: that lock is the newer
+                // decision, and releasing "the probe's pin" here released it.
+                return KnobResult.Ok("clock lock", _clamp?.AppliedLock is uint kept
+                    ? $"left the {kept} MHz lock applied during the sweep in place"
+                    : "nothing was pinned");
             }
 
+            using var write = BeginWrite(TuningWriteKind.Lock, "releasing the V/F probe's clock pin");
             var release = ReleaseClampCore();
             if (!release.Applied)
             {
@@ -549,7 +701,12 @@ public sealed class ArcGpuTuner : IGpuTuner
     /// ceiling settles at the ceiling (measured), and tracking the request
     /// left a shadow above anything the card ever showed.
     /// </summary>
-    private NvmlReturn WriteClampVerified(double min, double max, uint shadow)
+    /// <param name="restoresDisplaced">
+    /// EndProbe putting back the lock the sweep displaced, which stays
+    /// displaced until EndProbe has verified it. Any other range write is a new
+    /// lock decision and supersedes it (<see cref="TrackWrittenRangeLock"/>).
+    /// </param>
+    private NvmlReturn WriteClampVerified(double min, double max, uint shadow, bool restoresDisplaced = false)
     {
         lock (_applyLock)
         {
@@ -559,6 +716,11 @@ public sealed class ArcGpuTuner : IGpuTuner
             }
 
             bool isPin = Math.Abs(max - min) < 0.5;
+            using var write = isPin
+                ? BeginWrite(TuningWriteKind.ProbePin, $"pinning the core clock at {max:F0} MHz for the V/F probe")
+                : BeginWrite(TuningWriteKind.Lock, restoresDisplaced
+                    ? $"restoring the {min:F0}..{max:F0} MHz clock clamp after the V/F probe"
+                    : $"setting a {min:F0}..{max:F0} MHz clock clamp");
             bool alreadyPending = isPin && AppliedStateStore.RecordProbeLockPending(RecordKey);
 
             var rc = _device.TrySetFrequencyRange(_gpuFreqDomain, min, max);
@@ -576,10 +738,28 @@ public sealed class ArcGpuTuner : IGpuTuner
             // may now be present whether or not the readback confirms the value,
             // so a release is still attempted for it. A pin stands for no
             // applied lock — that is the displaced lock BeginProbe remembered.
-            _clamp = new TrackedClamp(shadow, isPin ? null : shadow);
             if (isPin)
             {
+                // A pin landing over a range lock this process applied displaces
+                // it, as BeginProbe's release does. The probe checks for a
+                // foreign write before each pin, but a profile's lock can land
+                // between that check and the pin, which then covers it; the
+                // newer lock stays the applied one and is what EndProbe puts back.
+                if (_clamp?.AppliedLock is uint covered)
+                {
+                    _probeDisplacedLock = covered;
+                }
+
+                _clamp = new TrackedClamp(shadow, null);
                 _probePinLanded = true;
+            }
+            else if (restoresDisplaced)
+            {
+                _clamp = new TrackedClamp(shadow, shadow);
+            }
+            else
+            {
+                TrackWrittenRangeLock(shadow);
             }
 
             if (_device.TryGetFrequencyRange(_gpuFreqDomain, out var readback) != CtlResult.Success)
@@ -670,7 +850,8 @@ public sealed class ArcGpuTuner : IGpuTuner
             // is exactly when the implicit release matters most. Setting it only
             // on the verified path left those clamps on the card, with a
             // lock-less apply reporting full success over a still-pinned GPU.
-            _clamp = new TrackedClamp((uint)Math.Round(clamped), (uint)Math.Round(clamped));
+            // Mid-sweep it also supersedes the lock the sweep displaced.
+            TrackWrittenRangeLock((uint)Math.Round(clamped));
             string detail = $"{_hwMinMhz:F0}..{clamped:F0} MHz{clampNote}";
             var readRc = _device.TryGetFrequencyRange(_gpuFreqDomain, out var readback);
             if (readRc != CtlResult.Success)
@@ -735,7 +916,7 @@ public sealed class ArcGpuTuner : IGpuTuner
         // — and it clears a shadow the driver no longer confirms (a clamp
         // released by another process, or by a reboot since the applied state
         // was persisted). The shadow alone stated hardware facts nobody had read.
-        if (RefreshTrackedClampFromDriver() is not uint previous)
+        if (RefreshTrackedClampFromDriver(out var live) is not uint previous)
         {
             if (releaseLock)
             {
@@ -744,12 +925,36 @@ public sealed class ArcGpuTuner : IGpuTuner
                 // yields one verdict rather than a front-end's guess.
                 results.Add(ReleaseClampCore());
             }
+            else if (_probeDisplacedLock is uint displaced)
+            {
+                // Mid-sweep with no clamp on the card (before the first pin):
+                // the user's lock is off the card only because the sweep took
+                // it off. A profile without a lock releases the lock outside a
+                // sweep, so it removes this one too — otherwise it was recorded
+                // under this profile and EndProbe put it back afterwards, while
+                // the same profile applied over the first pin dropped it.
+                _probeDisplacedLock = null;
+                results.Add(KnobResult.Ok("clock lock",
+                    $"removed the {displaced} MHz lock (a V/F sweep had already taken it off the card; " +
+                    "it will not be put back)"));
+            }
 
             return;
         }
 
+        // The floor as the driver showed it: quoting the hardware minimum
+        // described a pin, or a factory floor above that minimum (R-17), as a
+        // range it never was.
+        double wasMin = live is { Min: > 0 } shown ? shown.Min : _hwMinMhz;
+        uint? displacedLock = _probeDisplacedLock;
         var release = ReleaseClampCore();
-        results.Add(release with { Detail = $"was {_hwMinMhz:F0}..{previous} MHz — {release.Detail}" });
+
+        // Over a sweep's pin, "was" names only the pin; the verified release
+        // also ends the lock the pin displaced, so say that it goes too.
+        string displacedNote = release.Applied && displacedLock is uint removed
+            ? $"; the {removed} MHz lock the V/F sweep displaced is removed too and will not be put back"
+            : string.Empty;
+        results.Add(release with { Detail = $"was {wasMin:F0}..{previous} MHz — {release.Detail}{displacedNote}" });
     }
 
     /// <summary>
@@ -766,6 +971,24 @@ public sealed class ArcGpuTuner : IGpuTuner
     /// cannot tell a cap the driver kept from a factory ceiling in a process
     /// that has never seen higher — no rule can; no driver has been measured
     /// keeping a cap, and the fake device does not model one.
+    /// <para>
+    /// The floor follows the same rule (R-17). Intel's contract lets the
+    /// factory floor sit above the hardware minimum, so a raised floor after
+    /// the restore is a failure only when it is still an exact pin (floor
+    /// meeting ceiling) or when it sits above a floor this process has
+    /// verified released before; otherwise it is adopted as the factory floor
+    /// and said so. The same blind spot applies: a raised floor the driver
+    /// kept is indistinguishable from a factory floor in a process that has
+    /// never seen lower — the B390's factory floor is its hardware minimum,
+    /// so no driver has been measured taking this branch.
+    /// </para>
+    /// <para>
+    /// A range an earlier process recorded for this card under this driver
+    /// (<see cref="ReleasedRangeStore"/>) narrows that blind spot: a release
+    /// landing on it is verified. It is not allowed to fail a release, though:
+    /// an undetected firmware change would otherwise refuse every release
+    /// from then on, the R-17 failure in persistent form.
+    /// </para>
     /// </summary>
     private KnobResult ReleaseClampCore()
     {
@@ -786,35 +1009,63 @@ public sealed class ArcGpuTuner : IGpuTuner
         string stillShows =
             $"release accepted but readback still shows {readback.Min:F0}..{readback.Max:F0} MHz";
 
-        // An exact pin raises the floor; a release that leaves it raised is not
-        // a release.
-        if (readback.Min > 0 && readback.Min > _hwMinMhz + 1.0)
+        // An exact pin raises the floor to the ceiling; a release that leaves
+        // the range pinned (no factory range is a single clock), or leaves the
+        // floor above one a release has verified, is not a release. A zero or
+        // negative floor is the header's "no external minimum".
+        bool floorRaised = readback.Min > 0 && readback.Min > ReleasedMinMhz + 1.0;
+        bool stillPinned = readback.Min > 0 && readback.Max > 0 && Math.Abs(readback.Max - readback.Min) < 1.0;
+        if (stillPinned || (floorRaised && _observedReleasedMinMhz is not null))
         {
             return KnobResult.Fail("clock lock", stillShows);
-        }
-
-        // The driver reports no limit at all — unambiguously released.
-        if (readback.Max <= 0)
-        {
-            AdoptReleasedBaseline(_hwMaxMhz);
-            return KnobResult.Ok("clock lock", "released (driver reports no frequency limit) (verified)");
         }
 
         const double Epsilon = 0.5;
-        if (_observedReleasedMaxMhz is double known && readback.Max + Epsilon < known)
+        if (readback.Max > 0 && _observedReleasedMaxMhz is double known && readback.Max + Epsilon < known)
         {
             return KnobResult.Fail("clock lock", stillShows);
         }
 
-        bool proven = readback.Max >= _hwMaxMhz - Epsilon
+        // Max <= 0 is the header's "no external maximum": unambiguously released.
+        // A range recorded by an earlier process proves a matching release as
+        // well as one verified here. It never fails one: a release that lands
+        // outside it is adopted like a first release and said so below.
+        bool ceilingProven = readback.Max <= 0
+            || readback.Max >= _hwMaxMhz - Epsilon
             || (_observedReleasedMaxMhz is double verifiedCeiling && readback.Max + Epsilon >= verifiedCeiling)
+            || (_recordedReleasedMaxMhz is double recordedCeiling && readback.Max + Epsilon >= recordedCeiling)
             || (previous is { } tracked && readback.Max > tracked.Mhz + Epsilon);
-        AdoptReleasedBaseline(readback.Max);
-        return proven
-            ? KnobResult.Ok("clock lock", $"released to {readback.Min:F0}..{readback.Max:F0} MHz (verified)")
-            : KnobResult.Ok("clock lock",
-                $"released; the factory restore left the ceiling at {readback.Min:F0}..{readback.Max:F0} MHz, " +
-                "taken as this GPU's factory ceiling (nothing higher has been verified in this process)");
+        bool floorProven = !floorRaised; // at the hardware minimum, or at a floor verified here or on record
+
+        // Said before the adoption below rewrites the record it contradicts.
+        string recordNote = _observedReleasedMinMhz is null && _recordedReleasedMinMhz is double recordedFloor && floorRaised
+            ? $"; the {recordedFloor:F0} MHz floor recorded for this card under this driver no longer holds"
+            : _observedReleasedMaxMhz is null && _recordedReleasedMaxMhz is double recordedTop && !ceilingProven
+                ? $"; the {recordedTop:F0} MHz ceiling recorded for this card under this driver no longer holds"
+                : string.Empty;
+        AdoptReleasedBaseline(
+            readback.Min > 0 ? readback.Min : _hwMinMhz,
+            readback.Max > 0 ? readback.Max : _hwMaxMhz);
+
+        string range = readback.Max > 0
+            ? $"{readback.Min:F0}..{readback.Max:F0} MHz"
+            : $"{readback.Min:F0} MHz with no ceiling limit";
+        return (floorProven, ceilingProven) switch
+        {
+            (true, true) when readback.Max <= 0 =>
+                KnobResult.Ok("clock lock", "released (driver reports no frequency limit) (verified)"),
+            (true, true) => KnobResult.Ok("clock lock", $"released to {range} (verified)"),
+            (true, false) => KnobResult.Ok("clock lock",
+                $"released; the factory restore left the ceiling at {range}, " +
+                $"taken as this GPU's factory ceiling (nothing higher has been verified in this process){recordNote}"),
+            (false, true) => KnobResult.Ok("clock lock",
+                $"released; the factory restore left the floor at {range}, taken as this GPU's factory " +
+                $"floor, which Intel allows above the {_hwMinMhz:F0} MHz hardware minimum " +
+                $"(nothing lower has been verified in this process){recordNote}"),
+            (false, false) => KnobResult.Ok("clock lock",
+                $"released; the factory restore left {range}, taken as this GPU's factory floor and " +
+                $"ceiling (nothing wider has been verified in this process){recordNote}"),
+        };
     }
 
     /// <summary>

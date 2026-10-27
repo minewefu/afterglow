@@ -75,6 +75,33 @@ public class CliArgumentTests
         Assert.Equal("Slot 30 appears more than once in --set.", duplicate);
     }
 
+    [Theory]
+    [InlineData("mcp", "--gpuu", "1")]          // the finding: served GPU 0 to the agent
+    [InlineData("mcp", "--GPU", "1")]           // options are case-sensitive, as everywhere else
+    [InlineData("mcp", "1")]                    // index without its option
+    [InlineData("mcp", "--gpu", "1", "--json")] // an option mcp does not take
+    [InlineData("mcp", "--gpu", "1x")]
+    [InlineData("mcp", "--gpu")]
+    [InlineData("mcp", "--gpu", "0", "--gpu", "1")]
+    public void Mcp_refuses_an_unknown_or_malformed_startup_option_before_binding_a_gpu(params string[] args)
+    {
+        // R-34: the server checked only a literal --gpu, so anything else fell
+        // through to "no card named" and bound every write and stability verdict
+        // of the session to GPU 0. ParseStartup runs before GpuManager exists.
+        Assert.NotNull(McpCommand.ParseStartup(args, out uint? index));
+        Assert.Null(index);
+    }
+
+    [Fact]
+    public void Mcp_still_starts_with_no_options_or_a_valid_gpu()
+    {
+        Assert.Null(McpCommand.ParseStartup(["mcp"], out uint? none));
+        Assert.Null(none);
+
+        Assert.Null(McpCommand.ParseStartup(["mcp", "--gpu", "1"], out uint? one));
+        Assert.Equal(1u, one);
+    }
+
     [Fact]
     public void Well_formed_requests_parse_to_exactly_what_was_asked()
     {

@@ -24,6 +24,17 @@ public sealed record GpuSnapshot
     public double? HotSpotTempC { get; init; }
     public double? MemJunctionTempC { get; init; }
 
+    /// <summary>
+    /// True when <see cref="MemJunctionTempC"/> is the hottest VRAM sensor the
+    /// driver reports (Intel IGCL: the memory temperature sensor, or the bulk
+    /// block's VRAM temperature where none is enumerated) rather than a
+    /// memory-junction reading — label it "VRAM", not "junction" (R-19). Null
+    /// for NVAPI's memory junction and when nothing was read. Omitted from
+    /// JSON when null, like <see cref="MemoryIsShared"/>.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public bool? MemTempIsVramSensor { get; init; }
+
     // Utilization (%)
     public uint? GpuUtilPct { get; init; }
     public uint? MemCtrlUtilPct { get; init; }
@@ -45,7 +56,10 @@ public sealed record GpuSnapshot
     public bool? MemoryIsShared { get; init; }
 
     // Power
-    /// <summary>Board power, instantaneous where the driver exposes it (falls back to the averaged counter).</summary>
+    /// <summary>
+    /// Board power, instantaneous where the driver exposes it (falls back to the averaged counter).
+    /// <see cref="PowerIsChipOnly"/> says when a source could only measure the GPU chip.
+    /// </summary>
     public double? PowerW { get; init; }
 
     /// <summary>The driver's ~1-second averaged board power (always available).</summary>
@@ -55,6 +69,17 @@ public sealed record GpuSnapshot
 
     /// <summary>Cumulative board energy since driver load.</summary>
     public double? EnergyWh { get; init; }
+
+    /// <summary>
+    /// What <see cref="PowerW"/>, <see cref="PowerAvgW"/> and <see cref="EnergyWh"/>
+    /// measured on a source that says: true = the GPU chip alone (Intel's
+    /// gpuEnergyCounter fallback — no VRAM, VRMs, fans or board losses), false =
+    /// the whole card (Intel's totalCardEnergyCounter). Null when the source
+    /// states no scope (NVML's board power) or read no power (R-18). Omitted
+    /// from JSON when null, like <see cref="MemoryIsShared"/>.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public bool? PowerIsChipOnly { get; init; }
 
     // Voltage (NVAPI)
     public double? CoreVoltageMv { get; init; }

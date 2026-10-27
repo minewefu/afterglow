@@ -2,6 +2,7 @@ using System.IO;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Afterglow.Core;
+using Afterglow.Core.Hotkeys;
 using Afterglow.Core.Settings;
 using Afterglow.Core.Telemetry;
 
@@ -34,9 +35,146 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
             if (value)
             {
                 RefreshStartupProfileOptions();
+                RefreshHotkeys();
+            }
+            else
+            {
+                CancelRecording();
             }
         }
     }
+
+    // Keyboard shortcuts
+    public System.Collections.ObjectModel.ObservableCollection<HotkeyRowViewModel> HotkeyRows { get; } = [];
+
+    [ObservableProperty] public partial bool HotkeysEnabled { get; set; }
+
+    /// <summary>The overlay card's line about toggling it, naming the shortcut actually registered.</summary>
+    [ObservableProperty] public partial string OverlayShortcutHint { get; set; } = string.Empty;
+
+    private HotkeyRowViewModel? _recording;
+    private bool _slotDetailsShown;
+
+    /// <summary>A row is waiting for its new shortcut; the view sends it the next key press.</summary>
+    public bool IsRecordingShortcut => _recording is not null;
+
+    partial void OnHotkeysEnabledChanged(bool value)
+    {
+        if (_loading)
+        {
+            return;
+        }
+
+        CancelRecording();
+        _services.UpdateSettings(s => s with { Hotkeys = s.Hotkeys with { Enabled = value } });
+    }
+
+    internal void BeginRecording(HotkeyRowViewModel row)
+    {
+        if (_recording == row)
+        {
+            CancelRecording();
+            return;
+        }
+
+        CancelRecording();
+        row.Warning = string.Empty;
+        _recording = row;
+        row.IsRecording = true;
+        OnPropertyChanged(nameof(IsRecordingShortcut));
+
+        // Registered shortcuts would fire instead of reaching the page — pressing
+        // Ctrl+Alt+R to pick it again would reset the GPU.
+        _services.Hotkeys.Suspend();
+    }
+
+    public void CancelRecording()
+    {
+        if (_recording is not { } row)
+        {
+            return;
+        }
+
+        _recording = null;
+        row.IsRecording = false;
+        OnPropertyChanged(nameof(IsRecordingShortcut));
+        _services.Hotkeys.Resume();
+    }
+
+    /// <summary>The key press the recording row was waiting for.</summary>
+    public void CompleteRecording(HotkeyChord chord, bool withWindowsKey)
+    {
+        if (_recording is not { } row)
+        {
+            return;
+        }
+
+        string? problem = withWindowsKey
+            ? "Windows keeps shortcuts with the Windows key for itself"
+            : HotkeyChord.KeyName(chord.VirtualKey) is null
+                ? "Afterglow can't use that key; pick a letter, a digit, F1–F24, the number pad, Insert, Delete, Home, End, Page Up or Page Down"
+                : Services.HotkeyService.Check(chord);
+
+        // Resume first: while recording nothing is registered, so only now does
+        // the status say which shortcut another action really holds. Stricter
+        // than the planner, which lets a chosen shortcut push a default to its
+        // stand-in: here that would move, say, the panic key without a word.
+        CancelRecording();
+        if (problem is null &&
+            _services.Hotkeys.Status.FirstOrDefault(s => s.Action != row.Action && s.IsActive && s.Chord == chord) is { } owner)
+        {
+            problem = $"{chord} is already set for \"{HotkeyActions.Describe(owner.Action)}\"";
+        }
+
+        if (problem is not null)
+        {
+            // Shown until the next status refresh, which then says what's current.
+            row.Warning = problem + ". The shortcut wasn't changed.";
+            return;
+        }
+
+        // Pressing the default's own keys keeps the default, so it can still move
+        // to its stand-in if a layout or another app later takes those keys.
+        SetShortcut(row, chord == HotkeyDefaults.Primary(row.Action) ? null : chord.ToString());
+    }
+
+    /// <param name="text">The new shortcut; empty for none, null for the default.</param>
+    internal void SetShortcut(HotkeyRowViewModel row, string? text)
+    {
+        CancelRecording();
+        _services.UpdateSettings(s => s with { Hotkeys = s.Hotkeys.With(row.Action, text) });
+    }
+
+    [RelayCommand]
+    private void RestoreDefaultShortcuts()
+    {
+        CancelRecording();
+        _services.UpdateSettings(s => s with { Hotkeys = new HotkeySettings { Enabled = s.Hotkeys.Enabled } });
+    }
+
+    private void RefreshHotkeys()
+    {
+        // Which profile each slot applies comes from disk: read it while the page
+        // is shown (and once to start with), not on every re-registration.
+        var profiles = _isLive || !_slotDetailsShown ? _services.Profiles.LoadAll() : null;
+        _slotDetailsShown = true;
+        foreach (var row in HotkeyRows)
+        {
+            row.Show(_services.Hotkeys.StatusOf(row.Action));
+            if (profiles is not null && HotkeyActions.SlotOf(row.Action) is int slot)
+            {
+                row.Detail = slot < profiles.Count
+                    ? $"Now \"{profiles[slot].Name}\", the {Ordinal(slot + 1)} saved profile in alphabetical order"
+                    : "No saved profile in this slot yet";
+            }
+        }
+
+        OverlayShortcutHint = _services.Hotkeys.StatusOf(HotkeyAction.ToggleOverlay) is { IsActive: true, Chord: { } chord }
+            ? $"Toggle it with {chord} or from the tray menu."
+            : "Toggle it from the tray menu, or give it a shortcut under General.";
+    }
+
+    private static string Ordinal(int n) => n switch { 1 => "1st", 2 => "2nd", 3 => "3rd", _ => $"{n}th" };
 
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(PollingLabel))]
@@ -54,6 +192,15 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
     [ObservableProperty] public partial bool StartWithWindows { get; set; }
     [ObservableProperty] public partial string StartWithWindowsNote { get; set; } = string.Empty;
 
+    /// <summary>
+    /// What the logon task means for the signed-in account (R2-A): on a standard
+    /// account it can only start Afterglow unelevated, so Windows asks for an
+    /// administrator's password at every sign-in. Shown whether the switch is on
+    /// or off, and kept apart from <see cref="StartWithWindowsNote"/>, which a
+    /// successful toggle clears.
+    /// </summary>
+    [ObservableProperty] public partial string StartWithWindowsAccountNote { get; set; } = string.Empty;
+
     public System.Collections.ObjectModel.ObservableCollection<AutomationRule> AutomationRules { get; } = [];
 
     [ObservableProperty] public partial int NewAutoMetricIndex { get; set; }
@@ -61,7 +208,12 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
     [ObservableProperty] public partial string NewAutoSeconds { get; set; } = "30";
     [ObservableProperty] public partial int NewAutoActionIndex { get; set; }
     [ObservableProperty] public partial string NewAutoFanPct { get; set; } = "85";
-    [ObservableProperty] public partial string NewAutoProfile { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Nullable because WPF writes null here whenever the picker's shared
+    /// options collection is rebuilt under it (R-39).
+    /// </summary>
+    [ObservableProperty] public partial string? NewAutoProfile { get; set; } = string.Empty;
 
     /// <summary>The fan-% box only applies to the fan action; the profile picker only to the profile action.</summary>
     public bool NewAutoActionIsFans => NewAutoActionIndex == 0;
@@ -77,8 +229,8 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
     [RelayCommand]
     private void AddAutomationRule()
     {
-        if (!double.TryParse(NewAutoThreshold, System.Globalization.NumberStyles.Float,
-                System.Globalization.CultureInfo.InvariantCulture, out double threshold) ||
+        // Finite thresholds only: "NaN", "Infinity" and "1e999" all parse (R-37).
+        if (!AutomationRuleInput.TryParseThreshold(NewAutoThreshold, out double threshold) ||
             !int.TryParse(NewAutoSeconds, System.Globalization.NumberStyles.Integer,
                 System.Globalization.CultureInfo.InvariantCulture, out int seconds))
         {
@@ -86,7 +238,8 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
         }
 
         string action = NewAutoActionIndex switch { 1 => "profile", 2 => "reset", _ => "fans" };
-        if (action == "profile" && (NewAutoProfile.Length == 0 || NewAutoProfile == "(none)"))
+        string? profile = NewAutoProfile;
+        if (action == "profile" && (string.IsNullOrEmpty(profile) || profile == "(none)"))
         {
             return;
         }
@@ -96,32 +249,40 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
             ? Math.Clamp(pct, 30u, 100u)
             : 85u;
 
-        AutomationRules.Add(new AutomationRule
+        var rule = new AutomationRule
         {
             Metric = NewAutoMetricIndex switch { 1 => "memjunction", 2 => "power", _ => "gpu" },
             Threshold = threshold,
             ForSeconds = Math.Clamp(seconds, 5, 3600),
             Action = action,
-            ActionProfile = action == "profile" ? NewAutoProfile : null,
+            ActionProfile = action == "profile" ? profile : null,
             ActionFanPct = fanPct,
-        });
-        PersistAutomationRules();
+        };
+
+        // Saved first, listed second: a rule that can't be saved never shows up
+        // as if it were (R-37).
+        PersistAutomationRules([.. AutomationRules, rule]);
+        AutomationRules.Add(rule);
     }
 
     [RelayCommand]
     private void RemoveAutomationRule(AutomationRule? rule)
     {
-        if (rule is not null && AutomationRules.Remove(rule))
+        if (rule is null)
         {
-            PersistAutomationRules();
+            return;
+        }
+
+        var remaining = AutomationRules.ToList();
+        if (remaining.Remove(rule))
+        {
+            PersistAutomationRules([.. remaining]);
+            AutomationRules.Remove(rule);
         }
     }
 
-    private void PersistAutomationRules()
-    {
-        var rules = AutomationRules.ToArray();
+    private void PersistAutomationRules(AutomationRule[] rules) =>
         _services.UpdateSettings(s => s with { AutomationRules = rules });
-    }
 
     [ObservableProperty] public partial double AlertGpuTemp { get; set; }
     [ObservableProperty] public partial double AlertMemTemp { get; set; }
@@ -165,6 +326,21 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
         _services = services;
         RefreshStartupProfileOptions();
         LoadFrom(services.Settings);
+
+        foreach (var action in HotkeyActions.All)
+        {
+            HotkeyRows.Add(new HotkeyRowViewModel(this, action));
+        }
+
+        // Before the window exists nothing is registered yet; planning shows what
+        // will be (and is all a --screenshot run ever does). Attach re-plans.
+        if (services.Hotkeys.Status.Count == 0)
+        {
+            services.Hotkeys.Apply(services.Settings.Hotkeys);
+        }
+
+        services.Hotkeys.StatusChanged += RefreshHotkeys;
+        RefreshHotkeys();
     }
 
     /// <summary>
@@ -180,6 +356,11 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
     {
         string previous = SelectedStartupProfile;
 
+        // Clear() takes the selected item away from both pickers, and WPF writes
+        // null back through each SelectedItem binding — the automation one too,
+        // which used to stay null and fail the next "Add rule" (R-39).
+        string? previousAutomation = NewAutoProfile;
+
         _loading = true;
         StartupProfileOptions.Clear();
         StartupProfileOptions.Add("(none)");
@@ -190,6 +371,9 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
 
         bool stillExists = StartupProfileOptions.Contains(previous);
         SelectedStartupProfile = stillExists ? previous : "(none)";
+        NewAutoProfile = previousAutomation is not null && StartupProfileOptions.Contains(previousAutomation)
+            ? previousAutomation
+            : string.Empty;
         _loading = false;
 
         if (!stillExists && previous != "(none)")
@@ -199,6 +383,12 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
             // "no longer exists" profile at the next launch.
             StartupProfileNote = string.Empty;
             _services.UpdateSettings(s => s with { ApplyProfileOnStart = null });
+        }
+        else
+        {
+            // Re-read on every visit: the profile may have been re-certified,
+            // marked stable or edited on the Profiles page since.
+            UpdateStartupProfileNote(SelectedStartupProfile);
         }
     }
 
@@ -257,19 +447,30 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
         }
 
         string? chosen = value == "(none)" ? null : value;
-        if (chosen is not null)
-        {
-            var profile = _services.Profiles.Load(chosen);
-            StartupProfileNote = profile is { MarkedStable: false }
-                ? "This profile isn't marked stable yet — it won't actually apply at startup until you validate it (Stability page) and press 'Mark stable' in Profiles."
-                : string.Empty;
-        }
-        else
-        {
-            StartupProfileNote = string.Empty;
-        }
-
+        UpdateStartupProfileNote(value);
         _services.UpdateSettings(s => s with { ApplyProfileOnStart = chosen });
+    }
+
+    /// <summary>
+    /// The note under the startup-profile picker. Computed when the page loads
+    /// and on every visit as well as on a change, so it describes the profile
+    /// startup will actually use — it used to appear only right after picking.
+    /// </summary>
+    private void UpdateStartupProfileNote(string? selection)
+    {
+        var profile = selection is null or "(none)" ? null : _services.Profiles.Load(selection);
+        StartupProfileNote = profile switch
+        {
+            null => string.Empty,
+            { MarkedStable: false } =>
+                "This profile isn't marked stable yet — it won't actually apply at startup until you validate it (Stability page) and press 'Mark stable' in Profiles.",
+
+            // R2-B: still applied (it is marked stable), and the tray says the
+            // same once per launch when it is.
+            _ => Core.Profiles.StartupProfileNotice.OlderStressTestNote(profile) is { } note
+                ? $"{note} It still applies at startup, because it's marked stable."
+                : string.Empty,
+        };
     }
 
     private void LoadFrom(AppSettings s)
@@ -287,6 +488,7 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
         StartMinimizedToTray = s.StartMinimizedToTray;
         ResetOnDriverCrash = s.ResetOnDriverCrash;
         UpdateCheckEnabled = s.UpdateCheckEnabled;
+        HotkeysEnabled = s.Hotkeys.Enabled;
         AlertGpuTemp = s.AlertGpuTempC == 0 ? 49 : s.AlertGpuTempC;
         AlertMemTemp = s.AlertMemJunctionTempC == 0 ? 49 : s.AlertMemJunctionTempC;
         OverlayCornerIndex = (int)s.Overlay.Corner;
@@ -298,10 +500,14 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
         OverlayShowClock = s.Overlay.ShowClock;
         OverlayShowVram = s.Overlay.ShowVram;
         OverlayShowFan = s.Overlay.ShowFan;
-        SelectedStartupProfile = s.ApplyProfileOnStart is { } startup && StartupProfileOptions.Contains(startup)
-            ? startup
+        // Matched the way startup resolves it (ProfileStore.Load ignores case),
+        // so the picker never shows "(none)" for a profile startup applies.
+        SelectedStartupProfile = s.ApplyProfileOnStart is { } startup
+            ? StartupProfileOptions.Skip(1).FirstOrDefault(
+                  name => string.Equals(name, startup, StringComparison.OrdinalIgnoreCase)) ?? "(none)"
             : "(none)";
         _loading = false;
+        UpdateStartupProfileNote(SelectedStartupProfile);
     }
 
     /// <summary>
@@ -315,8 +521,13 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
     private async Task LoadStartupTaskStateAsync()
     {
         _startupTaskQueryPending = true;
-        var (enabled, note) = await Task.Run(() =>
+        var (enabled, note, accountNote) = await Task.Run(() =>
         {
+            // R2-A: who the task would start Afterglow for decides whether it
+            // can start elevated at all. Off the UI thread: a domain account's
+            // group lookup can wait on a domain controller.
+            string? standardAccount = Core.Security.AdministratorMembership.StartWithWindowsNote(
+                Core.Security.AdministratorMembership.IsSignedInUserAdministrator());
             bool exists = Services.StartupTaskService.IsEnabled();
 
             // A task registered before the location check existed (or from a copy
@@ -331,8 +542,12 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
                   $"administrator-only: {untrusted.Reason}. Anything able to replace the exe would inherit those " +
                   "rights at logon. Turn this off, or reinstall into Program Files with the setup .exe."
                 : null;
-            return (exists, warning);
+            return (exists, warning, standardAccount);
         }).ConfigureAwait(true);
+
+        // Not tied to the switch's state, so it lands even when the user
+        // answered first.
+        StartWithWindowsAccountNote = accountNote ?? string.Empty;
 
         if (!_startupTaskQueryPending)
         {

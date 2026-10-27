@@ -231,7 +231,13 @@ public sealed class FanCurveEditor : FrameworkElement
         _dragIndex = HitTestPoint(mouse);
         if (_dragIndex >= 0)
         {
-            CaptureMouse();
+            // Moves only count while captured (see OnMouseMove), and losing the
+            // capture is what ends the drag; no capture, no drag.
+            if (!CaptureMouse())
+            {
+                _dragIndex = -1;
+            }
+
             InvalidateVisual();
         }
     }
@@ -239,30 +245,49 @@ public sealed class FanCurveEditor : FrameworkElement
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
-        if (_dragIndex < 0 || IsReadOnly)
+
+        // Only while the press that started the drag holds the capture: a drag
+        // whose button-up went elsewhere must not turn hovering into edits.
+        if (_dragIndex < 0 || IsReadOnly || !IsMouseCaptured)
         {
             return;
         }
 
+        // The edit rules (whole degrees, a degree between neighbours, never
+        // impossible clamp bounds) live in Core, where they are tested (R-40).
         var (temp, duty) = ToData(e.GetPosition(this));
-        var points = Config.Points.ToList();
-
-        // Keep temperature strictly between neighbors.
-        double minTemp = _dragIndex > 0 ? points[_dragIndex - 1].TempC + 1 : TempMin;
-        double maxTemp = _dragIndex < points.Count - 1 ? points[_dragIndex + 1].TempC - 1 : TempMax;
-        temp = Math.Clamp(temp, minTemp, maxTemp);
-
-        points[_dragIndex] = new FanPoint(Math.Round(temp), Math.Round(duty));
-        Config = Config with { Points = MakeMonotonic(points, _dragIndex) };
+        if (FanCurveEditing.MovePoint(Config.Points, _dragIndex, temp, duty, TempMin, TempMax) is { } moved)
+        {
+            Config = Config with { Points = moved };
+        }
+        else
+        {
+            // The curve was replaced under the drag (a profile applied by a
+            // shortcut, say) and this point is gone: drop the drag, which has no
+            // edit left to report.
+            _dragIndex = -1;
+            ReleaseMouseCapture();
+            InvalidateVisual();
+        }
     }
 
     protected override void OnMouseLeftButtonUp(MouseButtonEventArgs e)
     {
         base.OnMouseLeftButtonUp(e);
+        ReleaseMouseCapture();
+    }
+
+    /// <summary>
+    /// Ends a drag however the capture went: the button released here, or taken
+    /// away (Alt+Tab, a dialog). The curve already shows the dragged point, so
+    /// the edit is reported either way.
+    /// </summary>
+    protected override void OnLostMouseCapture(MouseEventArgs e)
+    {
+        base.OnLostMouseCapture(e);
         if (_dragIndex >= 0)
         {
             _dragIndex = -1;
-            ReleaseMouseCapture();
             InvalidateVisual();
             CurveEdited?.Invoke(this, Config);
         }
@@ -277,54 +302,22 @@ public sealed class FanCurveEditor : FrameworkElement
         }
 
         int hit = HitTestPoint(e.GetPosition(this));
-        if (hit >= 0 && Config.Points.Count > 2)
+        if (hit >= 0 && FanCurveEditing.RemovePoint(Config.Points, hit) is { } remaining)
         {
-            var points = Config.Points.ToList();
-            points.RemoveAt(hit);
-            Config = Config with { Points = points };
+            Config = Config with { Points = remaining };
             CurveEdited?.Invoke(this, Config);
         }
     }
 
     private void AddPoint(Point mouse)
     {
-        if (Config.Points.Count >= FanCurveConfig.MaxPoints)
-        {
-            return;
-        }
-
+        // A double-click on an existing point (or between two a degree apart)
+        // adds nothing rather than a duplicate temperature (R-40).
         var (temp, duty) = ToData(mouse);
-        var points = Config.Points.ToList();
-        int insertAt = points.FindIndex(p => p.TempC > temp);
-        if (insertAt < 0)
+        if (FanCurveEditing.AddPoint(Config.Points, temp, duty) is { } added)
         {
-            insertAt = points.Count;
+            Config = Config with { Points = added };
+            CurveEdited?.Invoke(this, Config);
         }
-
-        points.Insert(insertAt, new FanPoint(Math.Round(temp), Math.Round(duty)));
-        Config = Config with { Points = MakeMonotonic(points, insertAt) };
-        CurveEdited?.Invoke(this, Config);
-    }
-
-    /// <summary>Pushes neighboring duties so the curve never decreases, anchored at the edited index.</summary>
-    private static List<FanPoint> MakeMonotonic(List<FanPoint> points, int anchor)
-    {
-        for (int i = anchor + 1; i < points.Count; i++)
-        {
-            if (points[i].DutyPct < points[i - 1].DutyPct)
-            {
-                points[i] = points[i] with { DutyPct = points[i - 1].DutyPct };
-            }
-        }
-
-        for (int i = anchor - 1; i >= 0; i--)
-        {
-            if (points[i].DutyPct > points[i + 1].DutyPct)
-            {
-                points[i] = points[i] with { DutyPct = points[i + 1].DutyPct };
-            }
-        }
-
-        return points;
     }
 }

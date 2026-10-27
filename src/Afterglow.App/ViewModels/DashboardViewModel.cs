@@ -41,6 +41,16 @@ public partial class DashboardViewModel : ObservableObject, ILivePage
     [ObservableProperty] public partial string MemJunctionText { get; set; } = "—";
     [ObservableProperty] public partial string PowerText { get; set; } = "—";
     [ObservableProperty] public partial string PowerLimitText { get; set; } = string.Empty;
+
+    /// <summary>
+    /// "Board power", unless the source says it measured the GPU chip alone
+    /// (Intel's chip-energy fallback, R-18): a title must not claim the whole
+    /// card for a number that leaves out its VRAM, regulators and fans.
+    /// </summary>
+    [ObservableProperty] public partial string PowerTitle { get; set; } = "Board power";
+
+    /// <summary>"memory junction", or "VRAM" where the reading is the hottest VRAM sensor (Intel, R-19).</summary>
+    [ObservableProperty] public partial string MemSeriesLabel { get; set; } = "memory junction";
     [ObservableProperty] public partial string UtilText { get; set; } = "—";
     [ObservableProperty] public partial string VramText { get; set; } = "—";
     [ObservableProperty] public partial double VramFraction { get; set; }
@@ -146,7 +156,7 @@ public partial class DashboardViewModel : ObservableObject, ILivePage
                 ExpandedFixedMax = 100;
                 break;
             case "power":
-                ExpandedTitle = "Board power · last 10 min";
+                ExpandedTitle = $"{PowerTitle} · last 10 min";
                 ExpandedUnit = "W";
                 ExpandedSeries = PowerSeries;
                 ExpandedStroke = SeriesBrush("SeriesPower");
@@ -242,6 +252,8 @@ public partial class DashboardViewModel : ObservableObject, ILivePage
         HotSpotText = s.HotSpotTempC is double hs ? $"{hs:F0}° hot spot" : "hot spot n/a";
         MemJunctionText = s.MemJunctionTempC is double mj ? $"{mj:F0}° memory" : string.Empty;
         PowerText = s.PowerW is double p ? p.ToString("F0") : "—";
+        PowerTitle = s.PowerIsChipOnly == true ? "GPU chip power" : "Board power";
+        MemSeriesLabel = s.MemTempIsVramSensor == true ? "VRAM" : "memory junction";
         PowerLimitText = (s.PowerAvgW, s.PowerLimitW) switch
         {
             (double avg, double pl) => $"avg {avg:F0} W · limit {pl:F0} W",

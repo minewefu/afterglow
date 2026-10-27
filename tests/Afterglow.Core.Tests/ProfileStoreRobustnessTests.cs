@@ -69,6 +69,39 @@ public sealed class ProfileStoreRobustnessTests : IDisposable
         }
     }
 
+    // R-24: JSON null passes straight through System.Text.Json into the
+    // profile's non-nullable collections, and validation then dereferenced
+    // them: a NullReferenceException out of LoadAll, which ProfilesViewModel
+    // calls while the main window is still being built (and which sits behind
+    // the MCP server's list_profiles). One hand-edited or half-written file
+    // must cost that file, not the app.
+    [Theory]
+    [InlineData("""{"name":"bad","fanMode":"Curve","fanCurve":{"points":null}}""")]
+    [InlineData("""{"name":"bad","fanMode":"Curve","fanCurve":{"points":[null,{"tempC":90,"dutyPct":100}]}}""")]
+    [InlineData("""{"name":"bad","fanMode":"Fixed","fanCurve":{"points":null}}""")]
+    [InlineData("""{"name":"bad","certifications":null}""")]
+    [InlineData("""{"name":"bad","certifications":[null]}""")]
+    public void A_profile_with_null_collections_is_isolated_and_reported(string json)
+    {
+        string dir = Path.Combine(_scratch, "nulls");
+        var store = new ProfileStore(dir);
+        store.Save(Sample("good"));
+        string bad = Path.Combine(dir, "bad.json");
+        File.WriteAllText(bad, json);
+
+        var loaded = store.LoadAll();                   // must not throw
+
+        Assert.Equal("good", Assert.Single(loaded).Name);
+        var (file, error) = Assert.Single(store.LastLoadErrors);
+        Assert.Equal(bad, file);
+        Assert.False(string.IsNullOrWhiteSpace(error));
+
+        // Not handed out by name either (startup profile, game rules,
+        // automation, MCP apply_profile, the certifier): those collections
+        // would only throw later, in the apply or the certification stamp.
+        Assert.Null(store.Load("bad"));
+    }
+
     public void Dispose()
     {
         try

@@ -1,5 +1,6 @@
 using Afterglow.Core.Interop.Igcl;
 using Afterglow.Core.Telemetry;
+using Afterglow.Core.Tests.Fakes;
 
 namespace Afterglow.Core.Tests;
 
@@ -90,6 +91,231 @@ public class IntelSensorSourceTests
         var after = new CtlTelemetryItem { Supported = 1, Units = CtlUnits.EnergyJoules, Type = CtlDataType.Uint64 };
         after.Value.DataU64 = 1020;
         Assert.Equal(20.0, IntelSensorSource.PowerFromEnergyCounters(before, after, 1.0));
+    }
+}
+
+/// <summary>
+/// The real <see cref="IntelSensorSource.Poll"/> against an in-memory IGCL
+/// adapter: which counter board power comes from (R-18) and where the memory
+/// temperature comes from when no memory sensor is enumerated (R-19). Samples
+/// are one second apart, so a counter's per-sample step is its watts.
+/// </summary>
+public class IntelSensorSourcePollTests
+{
+    private static CtlTelemetryItem Joules(double value) => FakeIntelTelemetryDevice.Item(value, CtlUnits.EnergyJoules);
+
+    private static CtlTelemetryItem Celsius(double value) => FakeIntelTelemetryDevice.Item(value, CtlUnits.TemperatureCelsius);
+
+    /// <summary>
+    /// One bulk block at <paramref name="second"/>: the GPU-chip counter steps
+    /// 50 J/s and, when present, the total-card counter 100 J/s — the
+    /// review's discrete-board shape, where the card draws twice the chip.
+    /// </summary>
+    private static CtlPowerTelemetry Sample(int second, bool card = true, CtlUnits cardUnits = CtlUnits.EnergyJoules, double? vramC = null)
+    {
+        var t = new CtlPowerTelemetry
+        {
+            TimeStamp = FakeIntelTelemetryDevice.Item(second, CtlUnits.TimeSeconds),
+            GpuEnergyCounter = Joules(3600 + (50 * second)),
+        };
+        if (card)
+        {
+            t.TotalCardEnergyCounter = FakeIntelTelemetryDevice.Item(7200 + (100 * second), cardUnits);
+        }
+
+        if (vramC is double c)
+        {
+            t.VramCurrentTemperature = Celsius(c);
+        }
+
+        return t;
+    }
+
+    private static GpuSnapshot SecondPoll(FakeIntelTelemetryDevice device)
+    {
+        var source = new IntelSensorSource(device, 0);
+        _ = source.Poll();
+        return source.Poll();
+    }
+
+    [Fact]
+    public void Board_power_comes_from_the_total_card_counter_when_the_driver_supports_it()
+    {
+        // R-18: chip +50 J and card +100 J over one second. The card drew
+        // 100 W; reporting the chip's 50 W as board power halved it.
+        var snapshot = SecondPoll(new FakeIntelTelemetryDevice(Sample(0), Sample(1)));
+
+        Assert.Equal(100.0, snapshot.PowerW);
+        Assert.Equal(100.0, snapshot.PowerAvgW);
+        // 7300 J of card energy = 7300 / 3600 Wh.
+        Assert.Equal(7300 / 3600.0, snapshot.EnergyWh);
+        Assert.False(snapshot.PowerIsChipOnly);
+    }
+
+    [Fact]
+    public void Without_a_card_counter_the_chip_counter_still_answers()
+    {
+        // The fallback this source always used — kept, not dropped to "—".
+        var snapshot = SecondPoll(new FakeIntelTelemetryDevice(Sample(0, card: false), Sample(1, card: false)));
+
+        Assert.Equal(50.0, snapshot.PowerW);
+        Assert.Equal(50.0, snapshot.PowerAvgW);
+        Assert.Equal(3650 / 3600.0, snapshot.EnergyWh);
+        // ...and says it measured the chip, not the board.
+        Assert.True(snapshot.PowerIsChipOnly);
+    }
+
+    [Fact]
+    public void A_card_counter_in_non_joule_units_falls_back_to_the_chip()
+    {
+        // The card item is "supported" but not in joules: dividing it as
+        // joules would be a guess, so the chip counter answers instead.
+        var snapshot = SecondPoll(new FakeIntelTelemetryDevice(
+            Sample(0, cardUnits: CtlUnits.PowerMilliwatts), Sample(1, cardUnits: CtlUnits.PowerMilliwatts)));
+
+        Assert.Equal(50.0, snapshot.PowerW);
+        Assert.Equal(3650 / 3600.0, snapshot.EnergyWh);
+        Assert.True(snapshot.PowerIsChipOnly);
+    }
+
+    [Fact]
+    public void A_card_counter_that_appears_mid_stream_never_borrows_the_chip_delta()
+    {
+        // The previous block had no card counter, this one does. Its card
+        // energy is reported; its power waits one tick for a card delta
+        // instead of passing the chip's 50 W off under the card's scope.
+        var snapshot = SecondPoll(new FakeIntelTelemetryDevice(Sample(0, card: false), Sample(1)));
+
+        Assert.Null(snapshot.PowerW);
+        Assert.Null(snapshot.PowerAvgW);
+        Assert.Equal(7300 / 3600.0, snapshot.EnergyWh);
+        Assert.False(snapshot.PowerIsChipOnly);
+    }
+
+    [Fact]
+    public void A_card_counter_reset_reports_no_power_rather_than_the_chip_figure()
+    {
+        // The card counter went backwards (driver reset) while the chip
+        // counter moved on: an honest "—" for one tick, not 50 W as board power.
+        var reset = Sample(1);
+        reset.TotalCardEnergyCounter = Joules(10);
+        var snapshot = SecondPoll(new FakeIntelTelemetryDevice(Sample(0), reset));
+
+        Assert.Null(snapshot.PowerW);
+    }
+
+    [Fact]
+    public void A_card_counter_that_advances_less_than_the_chip_is_not_trusted_as_the_card()
+    {
+        // "Supported" but stalled: the card's energy includes the chip's, so
+        // a card delta below the chip delta cannot be the whole card. The poll
+        // reports the chip — labelled as the chip — not 0 W of board power.
+        var stalledBefore = Sample(0);
+        stalledBefore.TotalCardEnergyCounter = Joules(0);
+        var stalledAfter = Sample(1);
+        stalledAfter.TotalCardEnergyCounter = Joules(0);
+        var snapshot = SecondPoll(new FakeIntelTelemetryDevice(stalledBefore, stalledAfter));
+
+        Assert.Equal(50.0, snapshot.PowerW);
+        Assert.Equal(3650 / 3600.0, snapshot.EnergyWh);
+        Assert.True(snapshot.PowerIsChipOnly);
+    }
+
+    [Fact]
+    public void A_card_counter_equal_to_the_chip_still_counts_as_the_card()
+    {
+        // The guard is "less than", not "not more than": a card whose
+        // non-chip draw rounds away is still the driver's whole-card figure.
+        var before = Sample(0);
+        before.TotalCardEnergyCounter = Joules(1000);
+        var after = Sample(1);
+        after.TotalCardEnergyCounter = Joules(1050);
+        var snapshot = SecondPoll(new FakeIntelTelemetryDevice(before, after));
+
+        Assert.Equal(50.0, snapshot.PowerW);
+        Assert.False(snapshot.PowerIsChipOnly);
+    }
+
+    [Fact]
+    public void No_energy_counter_at_all_reports_no_power_and_no_energy()
+    {
+        var empty = new CtlPowerTelemetry { TimeStamp = FakeIntelTelemetryDevice.Item(0, CtlUnits.TimeSeconds) };
+        var later = new CtlPowerTelemetry { TimeStamp = FakeIntelTelemetryDevice.Item(1, CtlUnits.TimeSeconds) };
+        var snapshot = SecondPoll(new FakeIntelTelemetryDevice(empty, later));
+
+        Assert.Null(snapshot.PowerW);
+        Assert.Null(snapshot.EnergyWh);
+        Assert.Null(snapshot.PowerIsChipOnly);
+    }
+
+    [Fact]
+    public void Bulk_vram_temperature_answers_when_no_memory_sensor_is_enumerated()
+    {
+        // R-19: the review's driver shape — 92 °C supported in the bulk
+        // block, no memory temperature sensor handle — produced null, so
+        // memory alerts and rules never fired.
+        var snapshot = new IntelSensorSource(new FakeIntelTelemetryDevice(Sample(0, vramC: 92)), 0).Poll();
+
+        Assert.Equal(92.0, snapshot.MemJunctionTempC);
+        // The hottest VRAM sensor, not a memory-junction reading.
+        Assert.True(snapshot.MemTempIsVramSensor);
+    }
+
+    [Fact]
+    public void An_enumerated_memory_sensor_still_wins_over_the_bulk_value()
+    {
+        var device = new FakeIntelTelemetryDevice(Sample(0, vramC: 92));
+        device.AddMemorySensor(81.5);
+        var snapshot = new IntelSensorSource(device, 0).Poll();
+
+        Assert.Equal(81.5, snapshot.MemJunctionTempC);
+        // Documented as "the maximum temperature across all sensors in the
+        // local memory": also a VRAM reading, labelled the same way.
+        Assert.True(snapshot.MemTempIsVramSensor);
+    }
+
+    [Fact]
+    public void Bulk_vram_temperature_fills_in_when_the_memory_sensor_read_fails()
+    {
+        var device = new FakeIntelTelemetryDevice(Sample(0, vramC: 92));
+        device.AddMemorySensor(readingC: null);
+        var source = new IntelSensorSource(device, 0);
+
+        Assert.Equal(92.0, source.Poll().MemJunctionTempC);
+    }
+
+    [Fact]
+    public void Unsupported_or_non_celsius_bulk_vram_temperature_stays_unavailable()
+    {
+        var unsupported = new IntelSensorSource(new FakeIntelTelemetryDevice(Sample(0)), 0).Poll();
+        Assert.Null(unsupported.MemJunctionTempC);
+        Assert.Null(unsupported.MemTempIsVramSensor);
+
+        var wrongUnits = Sample(0);
+        wrongUnits.VramCurrentTemperature = FakeIntelTelemetryDevice.Item(92, CtlUnits.Percent);
+        Assert.Null(new IntelSensorSource(new FakeIntelTelemetryDevice(wrongUnits), 0).Poll().MemJunctionTempC);
+
+        var notANumber = Sample(0);
+        notANumber.VramCurrentTemperature = Celsius(double.NaN);
+        Assert.Null(new IntelSensorSource(new FakeIntelTelemetryDevice(notANumber), 0).Poll().MemJunctionTempC);
+    }
+
+    [Fact]
+    public void Scope_labels_reach_the_json_and_stay_out_of_it_when_unset()
+    {
+        // CLI --json and MCP get_telemetry serialize the snapshot itself: the
+        // label rides along with the Intel numbers, while a snapshot that
+        // states no scope (every NVIDIA one) serializes exactly as before.
+        var options = new System.Text.Json.JsonSerializerOptions { PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase };
+        var intel = SecondPoll(new FakeIntelTelemetryDevice(Sample(0, card: false, vramC: 70), Sample(1, card: false, vramC: 70)));
+        string intelJson = System.Text.Json.JsonSerializer.Serialize(intel, options);
+        Assert.Contains("\"powerIsChipOnly\":true", intelJson, StringComparison.Ordinal);
+        Assert.Contains("\"memTempIsVramSensor\":true", intelJson, StringComparison.Ordinal);
+
+        var nvidia = new GpuSnapshot { Timestamp = DateTimeOffset.UnixEpoch, DeviceIndex = 0, PowerW = 300, MemJunctionTempC = 80 };
+        string nvidiaJson = System.Text.Json.JsonSerializer.Serialize(nvidia, options);
+        Assert.DoesNotContain("powerIsChipOnly", nvidiaJson, StringComparison.Ordinal);
+        Assert.DoesNotContain("memTempIsVramSensor", nvidiaJson, StringComparison.Ordinal);
     }
 }
 

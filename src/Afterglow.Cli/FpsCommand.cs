@@ -28,29 +28,69 @@ internal static class FpsCommand
             return 1;
         }
 
+        bool endedEarly = false;
         for (int elapsed = 0; elapsed < seconds; elapsed++)
         {
             Thread.Sleep(1000);
-            if (service.Session.State == PresentMonState.Failed)
+            var state = service.Session.State;
+            if (state == PresentMonState.Failed)
             {
                 Console.Error.WriteLine(service.Session.FailureReason);
                 return 1;
             }
+
+            if (state != PresentMonState.Running)
+            {
+                // PresentMon ended on its own (its trace was stopped from outside,
+                // or it crashed): report what was captured and say so, rather than
+                // wait out a capture that is already over.
+                Console.Error.WriteLine(
+                    $"Capture ended after {elapsed + 1} of {seconds} s: {service.Session.FailureReason ?? "PresentMon exited."}");
+                endedEarly = true;
+                break;
+            }
         }
 
-        var apps = service.GetTrackedApps();
-        Console.WriteLine(
+        int exitCode = WriteSummary(service, Console.Out);
+        if (endedEarly)
+        {
+            exitCode = 1;
+        }
+
+        service.Dispose();
+
+        // A killed elevated child can leave a lingering handle that blocks normal
+        // process exit; the CLI has printed everything it needs to.
+        Environment.Exit(exitCode);
+        return exitCode;
+    }
+
+    /// <summary>
+    /// The end-of-run report. Returns the exit code: 0 when any application
+    /// presented during the capture, 3 when none did.
+    /// </summary>
+    internal static int WriteSummary(FrameMetricsService service, TextWriter output)
+    {
+        // Every application that took part in the capture (R-30). The live list
+        // this used drops an application ten seconds after its last frame, so a
+        // benchmark that finished before the capture did was missing from the
+        // report of that very capture.
+        var apps = service.GetCapturedApps();
+        output.WriteLine(
             $"Capture state: {service.Session.State}, stdout lines: {service.Session.TotalLines}, " +
             $"parse errors: {service.Session.ParseErrors}, header parsed: {service.Session.HeaderParsed}");
         if (!service.Session.HeaderParsed)
         {
             foreach (string line in service.Session.FirstLines)
             {
-                Console.WriteLine($"  raw: {line}");
+                output.WriteLine($"  raw: {line}");
             }
         }
-        Console.WriteLine($"Presenting apps seen: {apps.Count}");
-        foreach (var app in apps.Take(10))
+
+        output.WriteLine($"Presenting apps seen: {apps.Count}");
+
+        // All of them: the count above is a promise that each one gets a line.
+        foreach (var app in apps)
         {
             // A report over a finished capture, not a live readout: a game that
             // quit a few seconds before the window closed still has its whole
@@ -60,7 +100,7 @@ internal static class FpsCommand
             var stats = service.GetStats(app.ProcessId, requireFresh: false);
             if (stats is null)
             {
-                Console.WriteLine(
+                output.WriteLine(
                     $"  {app.Application,-34} pid {app.ProcessId,-7} {app.RecentFrames} frames (not enough frames for stats)");
                 continue;
             }
@@ -69,7 +109,7 @@ internal static class FpsCommand
             string liveness = service.IsLive(app.ProcessId)
                 ? string.Empty
                 : "  (stopped presenting before the capture ended)";
-            Console.WriteLine(
+            output.WriteLine(
                 $"  {app.Application,-34} pid {app.ProcessId,-7} {s.AverageFps,7:F1} fps  " +
                 $"P1 {s.P1Fps,6:F1}  1%low {s.Low1Fps,6:F1}  ft {s.AverageFrametimeMs,6:F2} ms  [{app.PresentMode}]{liveness}");
         }
@@ -77,15 +117,9 @@ internal static class FpsCommand
         var target = service.GetTargetStats();
         if (target is not null)
         {
-            Console.WriteLine($"Auto-selected target: {target.Value.App.Application}");
+            output.WriteLine($"Auto-selected target: {target.Value.App.Application}");
         }
 
-        int exitCode = apps.Count > 0 ? 0 : 3;
-        service.Dispose();
-
-        // A killed elevated child can leave a lingering handle that blocks normal
-        // process exit; the CLI has printed everything it needs to.
-        Environment.Exit(exitCode);
-        return exitCode;
+        return apps.Count > 0 ? 0 : 3;
     }
 }

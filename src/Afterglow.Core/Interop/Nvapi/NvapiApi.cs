@@ -56,7 +56,7 @@ public sealed unsafe class NvapiApi
 /// sensor reads (thermals, voltage, fan status) allocate nothing beyond their
 /// managed results.
 /// </summary>
-public sealed unsafe class NvapiGpu
+public sealed unsafe class NvapiGpu : INvapiTuningGpu
 {
     private readonly nint _handle;
     private readonly NvapiGpuFunctions _fn;

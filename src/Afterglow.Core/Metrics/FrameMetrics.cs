@@ -144,11 +144,30 @@ public sealed class FrametimeWindow
         lock (_lock)
         {
             _entries.Enqueue(new Entry(timestampMs, frametimeMs));
-            double cutoff = timestampMs - _windowMs;
-            while (_entries.Count > 0 && _entries.Peek().TimestampMs < cutoff)
-            {
-                _entries.Dequeue();
-            }
+            EvictOlderThan(timestampMs - _windowMs);
+        }
+    }
+
+    /// <summary>
+    /// Ages the window against <paramref name="nowMs"/> on the capture's shared
+    /// timeline, for a window that has not presented itself: <see cref="Add"/>
+    /// evicts only on the window's own frames, so a swap chain that stopped
+    /// presenting otherwise kept its whole window indefinitely (R-27).
+    /// </summary>
+    public void Age(double nowMs)
+    {
+        lock (_lock)
+        {
+            EvictOlderThan(nowMs - _windowMs);
+        }
+    }
+
+    /// <summary>Caller holds the lock.</summary>
+    private void EvictOlderThan(double cutoffMs)
+    {
+        while (_entries.Count > 0 && _entries.Peek().TimestampMs < cutoffMs)
+        {
+            _entries.Dequeue();
         }
     }
 

@@ -110,7 +110,10 @@ public static class VfPointPlanner
                     $"Slot {index} is not a live core V/F point on this GPU (list them with `afterglow-cli vfpoints`) — nothing was written.");
             }
 
-            if (Math.Abs(offset) > NvapiGpu.VfpOffsetLimitMHz)
+            // Relational, never Math.Abs: |int.MinValue| does not fit an int,
+            // so "30=-2147483648" threw OverflowException here instead of
+            // being refused (R-48).
+            if (offset is < -NvapiGpu.VfpOffsetLimitMHz or > NvapiGpu.VfpOffsetLimitMHz)
             {
                 return FormattableString.Invariant(
                     $"Slot {index}: {offset:+0;-0} MHz is outside the driver's ±{NvapiGpu.VfpOffsetLimitMHz} MHz per-point range — nothing was written.");
@@ -253,9 +256,29 @@ public static class VfPointPlanner
             return null;
         }
 
+        // Finite first (R-21): every relational bound below is false for NaN,
+        // so a NaN clock passed the range check, every computed delta then
+        // converted to 0 and the "plan" cleared the whole curve; a NaN or
+        // infinite voltage is never nearer than the first point, so the
+        // flatten anchored at the lowest-voltage slot nobody asked for.
+        if (!double.IsFinite(targetVoltageMv) || !double.IsFinite(targetClockMHz))
+        {
+            refusal = "The target voltage and clock must be finite numbers (e.g. 875 mV and 1875 MHz).";
+            return null;
+        }
+
         if (targetClockMHz is < 300 or > 4500)
         {
             refusal = "Target clock outside 300..4500 MHz.";
+            return null;
+        }
+
+        // The same reasoning for what the driver handed back: a non-finite
+        // stored voltage or clock would corrupt the anchor search and every
+        // delta computed from it.
+        if (points.Any(point => !double.IsFinite(point.VoltageMv) || !double.IsFinite(point.ClockMHz)))
+        {
+            refusal = "The stored V/F table read back with a non-finite voltage or clock — nothing was planned.";
             return null;
         }
 
@@ -270,7 +293,7 @@ public static class VfPointPlanner
         }
 
         int anchorDelta = (int)Math.Round(targetClockMHz - anchor.ClockMHz);
-        if (Math.Abs(anchorDelta) > MaxPlannedOffsetMHz)
+        if (anchorDelta is < -MaxPlannedOffsetMHz or > MaxPlannedOffsetMHz) // relational: safe for every int (R-48)
         {
             refusal = FormattableString.Invariant(
                 $"Reaching {targetClockMHz:F0} MHz at {anchor.VoltageMv:F0} mV needs a ") +
@@ -310,7 +333,7 @@ public static class VfPointPlanner
                 flattened++;
             }
 
-            if (Math.Abs(delta) > NvapiGpu.VfpOffsetLimitMHz)
+            if (delta is < -NvapiGpu.VfpOffsetLimitMHz or > NvapiGpu.VfpOffsetLimitMHz)
             {
                 refusal = FormattableString.Invariant(
                     $"Capping the {point.VoltageMv:F0} mV point to {targetClockMHz:F0} MHz needs ") +

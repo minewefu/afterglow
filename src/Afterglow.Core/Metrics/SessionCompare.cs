@@ -22,8 +22,13 @@ public static class SessionCompare
                 $"⚠ Different applications ({older.Application} vs {newer.Application}) — FPS deltas are not comparable."));
         }
 
+        if (MixedTuningWarning(older, newer) is string mixed)
+        {
+            sb.AppendLine(mixed);
+        }
+
         sb.AppendLine(FormattableString.Invariant(
-            $"A (baseline): {older.Application} {older.StartedAt:MM-dd HH:mm} · core {Off(older.CoreOffsetMHz)} / mem {Off(older.MemOffsetMHz)} MHz"));
+            $"A (baseline):{older.Application} {older.StartedAt:MM-dd HH:mm} · core {Off(older.CoreOffsetMHz)} / mem {Off(older.MemOffsetMHz)} MHz"));
         sb.AppendLine(FormattableString.Invariant(
             $"B (newer):    {newer.Application} {newer.StartedAt:MM-dd HH:mm} · core {Off(newer.CoreOffsetMHz)} / mem {Off(newer.MemOffsetMHz)} MHz"));
         sb.AppendLine(Delta("Avg FPS", older.AvgFps, newer.AvgFps, "F1", percentOfBase: true));
@@ -64,6 +69,12 @@ public static class SessionCompare
                 $"> ⚠ Different applications ({older.Application} vs {newer.Application}) — FPS deltas are not comparable."));
         }
 
+        if (MixedTuningWarning(older, newer) is string mixed)
+        {
+            sb.AppendLine();
+            sb.AppendLine("> " + mixed);
+        }
+
         sb.AppendLine();
         sb.AppendLine("| Metric | A | B | Δ |");
         sb.AppendLine("|---|---|---|---|");
@@ -78,6 +89,25 @@ public static class SessionCompare
 
     private static (SessionReport Older, SessionReport Newer) Order(SessionReport a, SessionReport b) =>
         a.StartedAt <= b.StartedAt ? (a, b) : (b, a);
+
+    /// <summary>
+    /// A before/after delta is a statement about two configurations; a side whose
+    /// measured window spans a tuning change measured neither cleanly (R-28).
+    /// </summary>
+    private static string? MixedTuningWarning(SessionReport older, SessionReport newer)
+    {
+        string sides = (older.TuningChangedDuringWindow == true, newer.TuningChangedDuringWindow == true) switch
+        {
+            (true, true) => "both A's and B's measured windows",
+            (true, false) => "A's measured window",
+            (false, true) => "B's measured window",
+            _ => string.Empty,
+        };
+
+        return sides.Length == 0
+            ? null
+            : $"⚠ The tuning changed during {sides} — those numbers mix two configurations.";
+    }
 
     private static string Off(int? mhz) =>
         mhz is { } m ? m.ToString("+0;-0;0", CultureInfo.InvariantCulture) : "—";

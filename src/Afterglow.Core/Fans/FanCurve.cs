@@ -50,18 +50,26 @@ public sealed record FanCurveConfig
         new(90, 100),
     ];
 
-    /// <summary>Validates points; returns an error description or null when valid.</summary>
     /// <summary>Highest zero-RPM threshold accepted (the Fans page offers 30–60 °C).</summary>
     public const double MaxZeroRpmBelowC = 60;
 
     /// <summary>Lowest duty the curve's hottest point may ask for.</summary>
     public const double MinTopDutyPct = 30;
 
+    /// <summary>Validates points; returns an error description or null when valid.</summary>
     public string? Validate()
     {
         if (Points.Count is < 2 or > MaxPoints)
         {
             return $"Curve needs 2..{MaxPoints} points.";
+        }
+
+        // NaN fails every comparison, so the range and ordering checks below
+        // would pass it as "in range" and "increasing".
+        if (Points.Any(p => !double.IsFinite(p.TempC) || !double.IsFinite(p.DutyPct)) ||
+            !double.IsFinite(HysteresisC) || !double.IsFinite(ZeroRpmHysteresisC) || !double.IsFinite(ZeroRpmBelowC))
+        {
+            return "Curve values must be finite numbers.";
         }
 
         for (int i = 0; i < Points.Count; i++)

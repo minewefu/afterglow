@@ -76,6 +76,66 @@ public sealed class AppliedStateStoreTests : IDisposable
 
         Assert.All(AppliedStateStore.LoadAll(), s => Assert.True(s.CleanShutdown));
     }
+
+    private static int RecoveryCandidates() =>
+        AppliedStateStore.LoadAll().Count(s => !s.CleanShutdown || s.ProbeLockPending);
+
+    [Fact]
+    public void A_cli_set_on_one_card_leaves_another_cards_unfinished_record_unclean()
+    {
+        // R-15: the running app has an untested stepper offset on card A.
+        AppliedStateStore.RecordPending("live GUI stepper +600", UuidA);
+
+        // `afterglow-cli set --gpu 1 ...` on card B, start to finish.
+        var claim = AppliedStateStore.BeginCommand(UuidB);
+        AppliedStateStore.RecordPending("cli", UuidB);
+        AppliedStateStore.Record(Profile("cli"), true, null, UuidB);
+        Assert.True(claim.MarkClean());
+
+        Assert.False(AppliedStateStore.Load(UuidA)!.CleanShutdown);
+        Assert.True(AppliedStateStore.Load(UuidB)!.CleanShutdown);
+        Assert.Equal(1, RecoveryCandidates());
+    }
+
+    [Fact]
+    public void A_command_does_not_vouch_for_an_unclean_record_it_found_on_its_own_card()
+    {
+        // The app crashed (or is running) with tuning on card B; nobody has acknowledged it.
+        AppliedStateStore.RecordPending("Gaming", UuidB);
+
+        var claim = AppliedStateStore.BeginCommand(UuidB);
+        AppliedStateStore.Record(Profile("cli"), true, null, UuidB);
+
+        Assert.False(claim.MarkClean());
+        Assert.False(AppliedStateStore.Load(UuidB)!.CleanShutdown);
+    }
+
+    [Fact]
+    public void The_keyed_mark_touches_neither_other_cards_nor_an_unadopted_legacy_file()
+    {
+        AppliedStateStore.WriteLegacyRecord(new AppliedStateStore.AppliedState("legacy", DateTimeOffset.Now, true, false));
+        AppliedStateStore.Record(Profile("card A"), true, null, UuidA);
+        AppliedStateStore.Record(Profile("card B"), true, null, UuidB);
+
+        AppliedStateStore.MarkCleanShutdown([UuidB]);
+
+        Assert.True(AppliedStateStore.Load(UuidB)!.CleanShutdown);
+        Assert.False(AppliedStateStore.Load(UuidA)!.CleanShutdown);
+        Assert.Contains(AppliedStateStore.LoadAll(), s => s.ProfileName == "legacy" && !s.CleanShutdown);
+    }
+
+    [Fact]
+    public void The_keyed_mark_keeps_the_probe_flag_like_the_app_level_one()
+    {
+        AppliedStateStore.RecordProbeLockPending(UuidB);
+        AppliedStateStore.Record(Profile("cli"), true, null, UuidB);
+
+        AppliedStateStore.MarkCleanShutdown([UuidB]);
+
+        var b = AppliedStateStore.Load(UuidB);
+        Assert.True(b!.CleanShutdown);
+        Assert.True(b.ProbeLockPending);
+    }
 }
 
 [Collection("AppPaths")]

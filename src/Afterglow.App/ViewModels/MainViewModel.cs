@@ -87,8 +87,9 @@ public partial class MainViewModel : ObservableObject
         Metrics = new MetricsViewModel(services);
         VfCurve = new VfCurveViewModel(services);
         Stability = new StabilityViewModel(services);
-        Profiles = new ProfilesViewModel(services, Tuning, Fans, p => ApplyProfileFull(p));
+        Profiles = new ProfilesViewModel(services, Tuning, Fans, ApplyFromProfilesPage);
         Settings = new SettingsViewModel(services);
+        Tuning.ResetCompleted += Fans.NoteReset;
 
         CurrentPage = Dashboard;
         services.WindowVisibleChanged += _ => UpdateLivePages();
@@ -140,6 +141,8 @@ public partial class MainViewModel : ObservableObject
 
         services.GameWatcher.GameStarted += rule =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnGameStarted(rule));
+        services.GameWatcher.GameHandedOff += (exited, next) =>
+            Application.Current?.Dispatcher.BeginInvoke(() => OnGameHandedOff(exited, next));
         services.GameWatcher.GameExited += rule =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnGameExited(rule));
         services.TdrWatchdog.DriverResetDetected += description =>
@@ -297,9 +300,10 @@ public partial class MainViewModel : ObservableObject
         // apply, and every caller that reports to the user reads AllSucceeded.
         var results = result.Results.ToList();
 
-        // The Fans page editor mirrors the SELECTED card only — an apply
-        // landing on another GPU must not rewrite the editor's state.
-        bool syncEditor = gpu.Index == _services.SelectedGpu?.Index;
+        // The fan configuration is recorded for the card it landed on: the
+        // Fans page editor for the selected card, that card's own saved entry
+        // for any other — the editor mirrors the SELECTED card only, and an
+        // apply landing on another GPU used to persist nothing at all (R-23).
         if (_services.FanControl.TryGetValue(gpu.Index, out var fans))
         {
             switch (profile.FanMode)
@@ -308,21 +312,14 @@ public partial class MainViewModel : ObservableObject
                     results.Add(fans.SetFixed(profile.FixedFanPct)
                         ? KnobResult.Ok("fans", $"fixed {profile.FixedFanPct}%")
                         : KnobResult.Fail("fans", $"the driver did not accept fixed {profile.FixedFanPct}%"));
-                    if (syncEditor)
-                    {
-                        Fans.SyncFromApplied(Core.Profiles.FanMode.Fixed, profile.FixedFanPct, profile.FanCurve);
-                    }
-
+                    Fans.RecordApplied(gpu, Core.Profiles.FanMode.Fixed, profile.FixedFanPct, profile.FanCurve);
                     break;
                 case Core.Profiles.FanMode.Curve when profile.FanCurve is not null:
                     try
                     {
                         fans.SetCurve(profile.FanCurve);
                         results.Add(KnobResult.Ok("fans", "curve armed"));
-                        if (syncEditor)
-                        {
-                            Fans.SyncFromApplied(Core.Profiles.FanMode.Curve, profile.FixedFanPct, profile.FanCurve);
-                        }
+                        Fans.RecordApplied(gpu, Core.Profiles.FanMode.Curve, profile.FixedFanPct, profile.FanCurve);
                     }
                     catch (ArgumentException ex)
                     {
@@ -338,11 +335,7 @@ public partial class MainViewModel : ObservableObject
                     results.Add(fans.SetAuto()
                         ? KnobResult.Ok("fans", "firmware (auto)")
                         : KnobResult.Fail("fans", "the driver did not accept the release to firmware control"));
-                    if (syncEditor)
-                    {
-                        Fans.SyncFromApplied(Core.Profiles.FanMode.Auto, profile.FixedFanPct, null);
-                    }
-
+                    Fans.RecordApplied(gpu, Core.Profiles.FanMode.Auto, profile.FixedFanPct, null);
                     break;
                 default:
                     // Game context + Auto: the profile has no fan opinion.
@@ -350,10 +343,37 @@ public partial class MainViewModel : ObservableObject
             }
         }
 
-        Tuning.RefreshFromHardware();
+        // The Tuning sliders show the selected card. Reloading them after an
+        // apply to ANOTHER GPU changed nothing they show, and threw away the
+        // edit the user was composing there (R-49).
+        if (gpu.Index == _services.SelectedGpu?.Index)
+        {
+            Tuning.RefreshFromHardware();
+        }
+
         return results.Count == result.Results.Count
             ? result
             : new ApplyResult(results.All(r => r.Applied), results);
+    }
+
+    /// <summary>
+    /// The Profiles page's Apply. The profile is loaded into the Tuning sliders
+    /// first only when it lands on the SELECTED card: a full apply reloads them
+    /// when it lands, so they end on what the card is running, and a refused
+    /// apply leaves the profile loaded and visibly unapplied. A profile stamped
+    /// for another GPU leaves the selected card's sliders — and any edit in
+    /// progress there — alone; loading it put another card's values on them
+    /// (R-49).
+    /// </summary>
+    private ApplyResult ApplyFromProfilesPage(Core.Profiles.TuningProfile profile)
+    {
+        var gpu = TargetGpuFor(profile);
+        if (gpu is null || gpu.Index == _services.SelectedGpu?.Index)
+        {
+            Tuning.LoadProfile(profile);
+        }
+
+        return ApplyProfileFull(profile);
     }
 
     private void OnGameStarted(GameRule rule)
@@ -400,6 +420,104 @@ public partial class MainViewModel : ObservableObject
             (result.AllSucceeded ? string.Empty : " (some knobs failed)"));
     }
 
+    /// <summary>
+    /// The game whose profile was active exited while <paramref name="next"/>,
+    /// another configured game, still runs (R1). Its profile used to stay on
+    /// until the last game closed. Now <paramref name="next"/>'s profile takes
+    /// over, and the snapshot taken before the first game stays the restore
+    /// target; see <see cref="GameHandoff"/> for the three ways this goes.
+    /// </summary>
+    private void OnGameHandedOff(GameRule exited, GameRule next)
+    {
+        var pre = _preGame;
+        var profile = _services.Profiles.Load(next.ProfileName);
+        var gpu = profile is null ? null : TargetGpuFor(profile);
+        switch (GameSessionRestore.PlanHandoff(pre, profile, gpu?.Index, gpu?.Tuner.GpuUuid))
+        {
+            case GameHandoff.Swap when pre is not null && profile is not null && gpu is not null:
+                SwapGameProfile(pre, exited, next, profile, gpu);
+                break;
+            case GameHandoff.EndThenStart:
+                // The exited game's part ends as its own exit would — restored
+                // if its rule says so, otherwise left as it is with the snapshot
+                // dropped — and the remaining game starts as if alone.
+                if (exited.RevertOnExit)
+                {
+                    OnGameExited(exited);
+                }
+                else
+                {
+                    _preGame = null;
+                }
+
+                OnGameStarted(next);
+                break;
+            default:
+                OnGameStarted(next);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// A same-card hand-off: the pre-game state goes back first, without being
+    /// consumed, then the next game's profile is applied on top — exactly what
+    /// that game gets when it starts alone, and nothing of the exited game's
+    /// profile survives where the next one has no value of its own. No new
+    /// snapshot is captured: one taken now would make the exited game's
+    /// leftovers "the state before the game".
+    /// </summary>
+    private void SwapGameProfile(
+        PreGameSnapshot pre, GameRule exited, GameRule next, Core.Profiles.TuningProfile profile,
+        Core.Hardware.GpuContext gpu)
+    {
+        var (restore, fansRestored, plan) = RestorePreGame(pre, gpu);
+        var applied = ApplyProfileFull(profile, gameContext: true, target: gpu);
+        _preGame = GameSessionRestore.HandedOff(pre, next.ExecutableName, profile);
+
+        string message = GameSessionRestore.DescribeHandoff(
+            exited.ExecutableName, next, restore, fansRestored, plan.NotRestored, applied);
+        Core.Diagnostics.Log.Info(
+            $"Game hand-off on GPU {gpu.Index}: {message} Restore: {restore.Summary} Apply: {applied.Summary}");
+        TrayAlert?.Invoke("Afterglow profile applied", message);
+
+        // A refused apply returns before ApplyProfileFull refreshes the sliders,
+        // and the restore half did change the card.
+        if (applied.Results.Any(r => r.Knob == "profile" && !r.Applied) && gpu.Index == _services.SelectedGpu?.Index)
+        {
+            Tuning.RefreshFromHardware();
+        }
+    }
+
+    /// <summary>
+    /// Puts a session's pre-game state back on its card: the tuning, and the
+    /// fans when the game profile changed them. Does not consume the snapshot.
+    /// </summary>
+    private (ApplyResult Result, bool? FansRestored, GameRestorePlan Plan) RestorePreGame(
+        PreGameSnapshot pre, Core.Hardware.GpuContext gpu)
+    {
+        var plan = GameSessionRestore.Plan(pre);
+
+        // The plan carries the V/F table itself when the game could have
+        // changed it; otherwise it has no opinion on the curve, and must not be
+        // read as "the user wants no curve".
+        var result = gpu.Tuner.Apply(plan.Profile, reconcileVfPoints: false);
+
+        // Fans only when the game profile changed them, and only this card's.
+        bool? fansRestored = null;
+        if (plan.Fans is { } fans && _services.FanControl.TryGetValue(gpu.Index, out var fanService))
+        {
+            fansRestored = GameSessionRestore.ApplyFans(fanService, fans);
+            if (fansRestored == true)
+            {
+                // Persisted for this card whichever card is selected (R-23):
+                // otherwise its saved fans kept describing the game's.
+                Fans.RecordApplied(gpu, fans.Mode, fans.FixedPct, fans.Curve);
+            }
+        }
+
+        return (result, fansRestored, plan);
+    }
+
     private void OnGameExited(GameRule rule)
     {
         // Consumed exactly once: a session's snapshot is never applied twice,
@@ -422,28 +540,16 @@ public partial class MainViewModel : ObservableObject
             return;
         }
 
-        var plan = GameSessionRestore.Plan(pre);
-
-        // The plan carries the V/F table itself when the game could have
-        // changed it; otherwise it has no opinion on the curve, and must not be
-        // read as "the user wants no curve".
-        var result = gpu.Tuner.Apply(plan.Profile, reconcileVfPoints: false);
-
-        // Fans only when the game profile changed them, and only this card's.
-        bool? fansRestored = null;
-        if (plan.Fans is { } fans && _services.FanControl.TryGetValue(gpu.Index, out var fanService))
-        {
-            fansRestored = GameSessionRestore.ApplyFans(fanService, fans);
-            if (fansRestored == true && gpu.Index == _services.SelectedGpu?.Index)
-            {
-                Fans.SyncFromApplied(fans.Mode, fans.FixedPct, fans.Curve);
-            }
-        }
-
+        var (result, fansRestored, plan) = RestorePreGame(pre, gpu);
         string message = GameSessionRestore.Describe(rule.ExecutableName, result, fansRestored, plan.NotRestored);
         Core.Diagnostics.Log.Info($"Game exit restore on GPU {gpu.Index}: {message} {result.Summary}");
         TrayAlert?.Invoke("Afterglow", message);
-        Tuning.RefreshFromHardware();
+
+        // Only the card the restore landed on; see ApplyProfileFull (R-49).
+        if (gpu.Index == _services.SelectedGpu?.Index)
+        {
+            Tuning.RefreshFromHardware();
+        }
     }
 
     private void OnDriverReset(string description)
@@ -460,23 +566,51 @@ public partial class MainViewModel : ObservableObject
             return;
         }
 
-        foreach (var gpu in _services.Gpus)
-        {
-            _ = gpu.Tuner.ResetToDefaults();
-        }
-
-        foreach (var fans in _services.FanControl.Values)
-        {
-            fans.SetAuto();
-        }
-
+        // Right after a driver fault is exactly when writes get refused, so the
+        // banner reports what the reset did, not what it asked for (R-10).
+        var cards = ResetAllCards();
+        bool nameCards = _services.Gpus.Count > 1;
         ShowCrashBanner = true;
-        CrashBannerText =
-            "A GPU driver reset (TDR) was detected — Afterglow returned all tuning to driver defaults. " +
-            "If you were testing an overclock, it is likely unstable. " + description;
-        TrayAlert?.Invoke("GPU driver reset detected", "Tuning was reset to driver defaults for safety.");
+        CrashBannerText = DefaultsReset.DriverResetBanner(cards, nameCards, description);
+        TrayAlert?.Invoke("GPU driver reset detected", DefaultsReset.DriverResetTray(cards, nameCards));
         Core.Diagnostics.Log.Warn($"TDR watchdog reset: {description}");
         Tuning.RefreshFromHardware();
+        NoteFanResets(cards);
+    }
+
+    /// <summary>
+    /// Every card back to driver defaults — its fan service first, then its
+    /// tuner (<see cref="DefaultsReset.Card"/>) — keeping each card's outcome;
+    /// the panic and driver-crash resets used to discard them and announce
+    /// success whatever the driver answered (R-10). An incomplete card's
+    /// per-knob answers go to the log, where the short messages point.
+    /// </summary>
+    private List<CardResetResult> ResetAllCards()
+    {
+        var cards = new List<CardResetResult>(_services.Gpus.Count);
+        foreach (var gpu in _services.Gpus)
+        {
+            _services.FanControl.TryGetValue(gpu.Index, out var fans);
+            var card = DefaultsReset.Card(gpu.Index, gpu.Tuner, fans);
+            if (!card.AllReturned)
+            {
+                Core.Diagnostics.Log.Warn(
+                    $"Reset to driver defaults incomplete on GPU {gpu.Index}: {card.AsApplyResult().Summary}");
+            }
+
+            cards.Add(card);
+        }
+
+        return cards;
+    }
+
+    /// <summary>Tells the Fans page what a reset did to the selected card's fans (UI thread).</summary>
+    private void NoteFanResets(IReadOnlyList<CardResetResult> cards)
+    {
+        foreach (var card in cards)
+        {
+            Fans.NoteReset(card);
+        }
     }
 
     private readonly Core.Services.TemperatureAlertMonitor _temperatureAlerts = new();
@@ -537,7 +671,15 @@ public partial class MainViewModel : ObservableObject
     /// this path did not.
     /// </para>
     /// </summary>
-    public void PanicReset()
+    public void PanicReset() => _ = StartPanicReset();
+
+    /// <summary>
+    /// The panic reset (see <see cref="PanicReset"/>). Returns each card's
+    /// outcome when the reset ran at once; null when a run was still stopping
+    /// and the reset finishes off the message pump. Either way it reports
+    /// itself through <see cref="TrayAlert"/>.
+    /// </summary>
+    private List<CardResetResult>? StartPanicReset()
     {
         // Asking is instant, so it happens on the calling thread: a run stops
         // advancing the moment the key is pressed.
@@ -547,8 +689,7 @@ public partial class MainViewModel : ObservableObject
 
         if (!wasActive)
         {
-            CompletePanicReset(stopped: true);
-            return;
+            return CompletePanicReset(stopped: true);
         }
 
         // Something is running, and unwinding it can take seconds — the stepper's
@@ -563,29 +704,23 @@ public partial class MainViewModel : ObservableObject
             bool stopped = Stability.WaitForStop(budget);
             var left = budget - clock.Elapsed;
             stopped &= VfCurve.CancelProbeAndWait(left > TimeSpan.Zero ? left : TimeSpan.Zero);
-            CompletePanicReset(stopped);
+            _ = CompletePanicReset(stopped);
         });
+        return null;
     }
 
-    private void CompletePanicReset(bool stopped)
+    private List<CardResetResult> CompletePanicReset(bool stopped)
     {
-        foreach (var gpu in _services.Gpus)
-        {
-            _ = gpu.Tuner.ResetToDefaults();
-        }
-
-        foreach (var fans in _services.FanControl.Values)
-        {
-            fans.SetAuto();
-        }
+        // The message is derived from what every card answered (R-10): it used
+        // to say "all tuning returned to driver defaults" over a refused write.
+        var cards = ResetAllCards();
+        string message = DefaultsReset.PanicMessage(cards, stopped, _services.Gpus.Count > 1);
 
         void Finish()
         {
-            TrayAlert?.Invoke("Afterglow", stopped
-                ? "Panic reset: all tuning returned to driver defaults."
-                : "Panic reset: tuning returned to driver defaults, but a stability run or V/F probe was still " +
-                  "stopping and may re-apply settings. Check the Stability page.");
+            TrayAlert?.Invoke("Afterglow", message);
             Tuning.RefreshFromHardware();
+            NoteFanResets(cards);
         }
 
         if (System.Windows.Application.Current?.Dispatcher is { } dispatcher && !dispatcher.CheckAccess())
@@ -596,6 +731,8 @@ public partial class MainViewModel : ObservableObject
         {
             Finish();
         }
+
+        return cards;
     }
 
     /// <summary>Hotkey: apply the Nth saved profile (alphabetical).</summary>
@@ -608,9 +745,12 @@ public partial class MainViewModel : ObservableObject
         }
 
         var result = ApplyProfileFull(profiles[slot]);
+        string shortcut = _services.Hotkeys.StatusOf(Core.Hotkeys.HotkeyActions.ProfileSlot(slot))?.Chord is { } chord
+            ? $" ({chord})"
+            : string.Empty;
         TrayAlert?.Invoke(
             "Afterglow profile applied",
-            $"'{profiles[slot].Name}' (Ctrl+Alt+{slot + 1})" + (result.AllSucceeded ? string.Empty : " — some knobs failed"));
+            $"'{profiles[slot].Name}'{shortcut}" + (result.AllSucceeded ? string.Empty : " — some knobs failed"));
     }
 
     /// <summary>
@@ -667,9 +807,14 @@ public partial class MainViewModel : ObservableObject
             }
             else
             {
+                // Marked stable is what decides, even when its passes came from
+                // the burn before R-01's fix; that is only reported (R2-B), in
+                // this launch's one startup notice rather than a second alert.
                 var result = ApplyProfileFull(profile);
-                Core.Diagnostics.Log.Info($"Startup profile '{profileName}': {(result.AllSucceeded ? "applied" : "partial")}");
-                TrayAlert?.Invoke("Afterglow", $"Startup profile '{profileName}' applied.");
+                string? olderBurn = Core.Profiles.StartupProfileNotice.OlderStressTestNote(profile);
+                Core.Diagnostics.Log.Info($"Startup profile '{profileName}': {(result.AllSucceeded ? "applied" : "partial")}" +
+                                          (olderBurn is null ? string.Empty : $". {olderBurn}"));
+                TrayAlert?.Invoke("Afterglow", Core.Profiles.StartupProfileNotice.Applied(profile));
             }
         }
     }
@@ -704,10 +849,10 @@ public partial class MainViewModel : ObservableObject
     [RelayCommand]
     private void ResetAfterCrash()
     {
-        foreach (var gpu in _services.Gpus)
-        {
-            _ = gpu.Tuner.ResetToDefaults();
-        }
+        // Fan service first, then tuner, per card — the same order as every
+        // other reset, so a curve armed meanwhile can't re-pin the fans between
+        // the two releases (R-09).
+        var cards = ResetAllCards();
 
         // No sweep of probe-lock records here: each tuner resolves its own
         // card's record (by the stable key the GPU manager gave it) when its
@@ -716,11 +861,6 @@ public partial class MainViewModel : ObservableObject
         // a card whose reset the driver had just refused, and a record for a
         // card that is absent right now is the only trace of a lock nobody
         // released.
-
-        foreach (var fans in _services.FanControl.Values)
-        {
-            fans.SetAuto();
-        }
 
         // Re-read the store rather than assume: a record for a card that is
         // absent, or whose reset the driver refused, is still there, and
@@ -740,6 +880,7 @@ public partial class MainViewModel : ObservableObject
         }
 
         Tuning.RefreshFromHardware();
+        NoteFanResets(cards);
     }
 
     [RelayCommand]
@@ -788,10 +929,10 @@ public partial class MainViewModel : ObservableObject
                         : $"the driver did not accept fixed {rule.ActionFanPct}% on the fans";
                     break;
                 case "reset":
-                    PanicReset();
-                    action = Stability.AnyRunActive || VfCurve.ProbeRunning
-                        ? "stopping the running stability task, then resetting all tuning to driver defaults"
-                        : "all tuning reset to driver defaults";
+                    // What the reset did, not what it asked for (R-10).
+                    action = StartPanicReset() is { } cards
+                        ? DefaultsReset.AutomationAction(cards, _services.Gpus.Count > 1)
+                        : "stopping the running stability task, then resetting all tuning to driver defaults";
                     break;
                 default:
                     action = "no action taken (rule misconfigured)";

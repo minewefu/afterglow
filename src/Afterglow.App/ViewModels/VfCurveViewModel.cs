@@ -81,9 +81,53 @@ public partial class VfCurveViewModel : ObservableObject, ILivePage
         _gpu = services.SelectedGpu;
         services.Telemetry.SnapshotTaken += OnSnapshot;
         WatchTuner();
+        TrackTuningEpochs();
         RefreshCurve();
         RefreshVfPoints();
     }
+
+    // --- Measurement epochs (R-20) -------------------------------------------
+    // Every card's curve fills from telemetry whether or not this page is on
+    // screen, and a plan is only valid against samples taken under the tuning
+    // it builds on. So every card's recorder is told the tuning its card runs
+    // — now, and after every write to that card from anywhere — and sets its
+    // old samples aside when that tuning moved. OnTargetPicked re-reads it
+    // before planning, which also catches a change made by another program.
+
+    private void TrackTuningEpochs()
+    {
+        if (_services.DemoMode)
+        {
+            // The demo curve is synthetic stock data, made at stock by construction.
+            _services.VfCurve.AdoptTuningState(VfTuningState.Stock);
+            return;
+        }
+
+        foreach (var gpu in _services.Gpus)
+        {
+            _services.VfCurveFor(gpu.Index).SetTuningState(VfTuningState.Read(gpu.Tuner));
+            gpu.Tuner.StateWritten += OnAnyTunerWritten;
+        }
+    }
+
+    // Raised on the writing thread after the tuner released its lock. Reading
+    // the new tuning is a driver call, so it happens on the UI thread, never in
+    // the writer's path. The probe's own pins land here too and change nothing
+    // (a clock lock is not part of the tuning a curve depends on).
+    private void OnAnyTunerWritten(IGpuTuner tuner) =>
+        Application.Current?.Dispatcher.BeginInvoke(() =>
+        {
+            if (_services.Gpus.FirstOrDefault(g => ReferenceEquals(g.Tuner, tuner)) is { } gpu
+                && _services.VfCurveFor(gpu.Index).SetTuningState(VfTuningState.Read(tuner))
+                && gpu.Index == _gpu?.Index)
+            {
+                RefreshCurve();
+            }
+        });
+
+    /// <summary>Re-reads the selected card's tuning into its curve; true when old samples were set aside.</summary>
+    private bool RestampSelected() =>
+        _gpu is { } gpu && Recorder.SetTuningState(VfTuningState.Read(gpu.Tuner));
 
     // --- Per-point curve editor --------------------------------------------
     // Shown on whatever GPU answers the clock-boost interfaces: the capability
@@ -252,8 +296,12 @@ public partial class VfCurveViewModel : ObservableObject, ILivePage
             return;
         }
 
+        // NumberStyles.Float accepts "NaN" and "Infinity"; a NaN target reached
+        // the planner as an all-zero plan that wiped every point (R-21). The
+        // planner refuses it too — this says so in the box's own terms.
         if (!double.TryParse(VfpTargetClockText, System.Globalization.NumberStyles.Float,
-                System.Globalization.CultureInfo.InvariantCulture, out double targetClock))
+                System.Globalization.CultureInfo.InvariantCulture, out double targetClock)
+            || !double.IsFinite(targetClock))
         {
             VfpStatusText = "Enter the target clock in MHz (e.g. 1875).";
             return;
@@ -413,18 +461,47 @@ public partial class VfCurveViewModel : ObservableObject, ILivePage
     /// <summary>Called by the chart when the user picks a target point.</summary>
     public void OnTargetPicked(double voltageMv, double clockMHz)
     {
+        // A chart with a degenerate axis maps the pointer to NaN or infinity;
+        // nothing downstream may treat that as a target (R-21).
+        if (!double.IsFinite(voltageMv) || !double.IsFinite(clockMHz))
+        {
+            _plan = null;
+            HasPlan = false;
+            PlanText = "That point could not be read off the chart — click inside the plotted area.";
+            return;
+        }
+
         TargetVoltage = Math.Round(voltageMv / 5) * 5;
         TargetClock = Math.Round(clockMHz / 15) * 15;
 
-        int currentOffset = _gpu?.Tuner.ReadCurrent().CoreOffsetMHz ?? 0;
-        _plan = Recorder.PlanUndervolt(TargetVoltage, TargetClock, currentOffset, _gpu?.Tuner.Capabilities);
+        // Plan against the tuning the card runs NOW, and only from samples
+        // taken under it (R-20): the read also sets older samples aside if the
+        // tuning moved without a notification reaching this page.
+        var recorder = Recorder;
+        var tuning = _gpu is { } gpu ? VfTuningState.Read(gpu.Tuner) : VfTuningState.Stock;
+        bool setAside = _gpu is not null && recorder.SetTuningState(tuning);
+        _plan = recorder.PlanUndervolt(TargetVoltage, TargetClock, tuning, _gpu?.Tuner.Capabilities);
 
         if (_plan is null)
         {
             HasPlan = false;
-            PlanText = $"No plan for {TargetVoltage:F0} mV / {TargetClock:F0} MHz — either the curve has too " +
-                       "few samples near that voltage yet (keep gaming or run the probe), or the required " +
-                       "offset/lock would fall outside what this GPU's driver accepts.";
+            PlanText = setAside
+                ? $"No plan for {TargetVoltage:F0} mV / {TargetClock:F0} MHz — this card's tuning changed since the " +
+                  $"curve was measured (it now runs {tuning.Describe()}), so those samples were set aside: a plan " +
+                  "may only use samples taken under the tuning it builds on. Keep gaming or run the probe to rebuild it."
+                : tuning.PointShape is not null
+                    ? $"No plan for {TargetVoltage:F0} mV / {TargetClock:F0} MHz — the stored V/F table carries " +
+                      "per-point edits. A plan is a single core offset, which would erase them, and the measured " +
+                      "clock at this voltage includes that point's own edit, so the offset cannot be worked out " +
+                      "from it. Clear the point offsets below, let the curve rebuild, then plan."
+                    : $"No plan for {TargetVoltage:F0} mV / {TargetClock:F0} MHz — either the curve has too " +
+                      "few samples near that voltage yet (keep gaming or run the probe), or the required " +
+                      "offset/lock would fall outside what this GPU's driver accepts.";
+            if (setAside)
+            {
+                RefreshCurve();
+            }
+
             return;
         }
 
@@ -461,6 +538,16 @@ public partial class VfCurveViewModel : ObservableObject, ILivePage
         var result = _gpu.Tuner.Apply(profile);
         ApplyResultText = result.Summary;
         LastApplyFailed = !result.AllSucceeded;
+
+        // The samples behind this plan were measured under the old offset;
+        // the curve starts again under the new one (R-20). Said here because
+        // the chart empties the moment it does.
+        if (RestampSelected())
+        {
+            ApplyResultText += " The measured curve restarts under the new tuning — keep gaming or run the probe " +
+                               "before planning again.";
+            RefreshCurve();
+        }
 
         // The core offset just written lives in the stored table too: show it.
         // (The Tuning page learns of this write through GpuTuner.StateWritten.)
@@ -519,7 +606,8 @@ public partial class VfCurveViewModel : ObservableObject, ILivePage
     }
 
     /// <summary>
-    /// Maps the whole curve in about a minute: locks the clock at each step under
+    /// Maps the whole curve in a minute or two (each step samples until its
+    /// voltage can drive a plan, R-47): locks the clock at each step under
     /// load and records the voltage the driver selects. Restores the previous
     /// lock state when done.
     /// </summary>
@@ -621,6 +709,15 @@ public partial class VfCurveViewModel : ObservableObject, ILivePage
                     restoreWarning += $"  ⚠ {loadFault}";
                 }
 
+                // Measured is not the same as plannable (R-47): a step whose
+                // voltage bin stayed under the plan minimum cannot drive an
+                // undervolt yet, and "complete" alone implied it could.
+                string coverageNote = progress.StepsBelowPlanCoverage > 0
+                    ? $" {progress.StepsBelowPlanCoverage} of {progress.StepIndex} steps collected fewer than " +
+                      $"{VfCurveRecorder.PlanMinBinSamples} samples at their voltage, so an undervolt can't be planned " +
+                      "there yet — run the probe again or keep gaming to fill them in."
+                    : string.Empty;
+
                 ProbeStatusText = progress.Running
                     ? progress.MeasuredVoltageMv is double mv
                         ? $"Step {progress.StepIndex}/{progress.StepCount}: {progress.TargetClockMHz} MHz measured at {mv:F0} mV{card}"
@@ -634,7 +731,16 @@ public partial class VfCurveViewModel : ObservableObject, ILivePage
                         VfProbeOutcome.Completed => (card.Length == 0
                             ? "Probe complete — the curve below is your GPU's measured V/F map."
                             : $"Probe complete on GPU {gpu.Index} — {gpu.Name}; the readings went to that card's curve. The curve below is the selected card's.")
+                            + coverageNote
                             + restoreWarning,
+
+                        // Somebody else wrote this card mid-sweep (R-02). The
+                        // probe stopped there rather than pin over that write.
+                        VfProbeOutcome.Interrupted =>
+                            $"Probe stopped after {progress.StepIndex} of {progress.StepCount} steps: this card's tuning " +
+                            "was changed elsewhere (a reset, a profile, a hotkey, a rule or another page) while it ran, " +
+                            "so it did not pin the clock again. The curve holds only the steps measured before that." +
+                            $"{card}{restoreWarning}",
                         VfProbeOutcome.Cancelled =>
                             $"Probe cancelled after {progress.StepIndex} of {progress.StepCount} steps; " +
                             (progress.RestoreFailed

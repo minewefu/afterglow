@@ -262,9 +262,68 @@ public sealed class VfProbeScenarioTests : IDisposable
 
         Assert.Equal(VfProbeOutcome.Completed, second.Outcome);
         Assert.False(second.RestoreFailed, second.Phase);
+        // Named as the pin it is — not a "2300 MHz ceiling" from another tool.
+        Assert.Contains("exact 2300 MHz clock pin", second.Phase, StringComparison.Ordinal);
         Assert.Equal((100d, 2300d), (dev.Min, dev.Max));
         Assert.Null(tuner.AppliedLockMHz);
         Assert.NotEqual(true, AppliedStateStore.Load(Uuid)?.ProbeLockPending);
+    }
+
+    [Fact]
+    public void A_retried_sweep_restores_the_users_lock_an_earlier_sweep_could_not_put_back()
+    {
+        // R-16, end to end: the first sweep's restore of the user's 1800 lock
+        // is refused, leaving its last pin on the card; the retry must put the
+        // 1800 lock back, not release to the factory range.
+        var dev = new FakeArcDevice();
+        var tuner = Tuner(dev);
+        Assert.True(tuner.Apply(Lock(1800)).AllSucceeded);
+        var first = Probe(tuner, dev);
+        first.ProgressChanged += p =>
+        {
+            if (p.Running && p.Phase == "measured" && p.StepIndex == p.StepCount)
+            {
+                dev.WriteResult = CtlResult.ErrorUnknown; // the restore write is refused
+            }
+        };
+
+        var failed = RunToEnd(first);
+
+        Assert.True(failed.RestoreFailed, failed.Phase);
+        Assert.Equal(1800u, tuner.AppliedLockMHz);
+        Assert.True(AppliedStateStore.Load(Uuid)?.ProbeLockPending);
+
+        dev.WriteResult = CtlResult.Success;
+        var retry = RunToEnd(Probe(tuner, dev));
+
+        Assert.Equal(VfProbeOutcome.Completed, retry.Outcome);
+        Assert.False(retry.RestoreFailed, retry.Phase);
+        Assert.Equal((100d, 1800d), (dev.Min, dev.Max));
+        Assert.Equal(1800u, tuner.AppliedLockMHz);
+        Assert.Equal(2300d, dev.PinnedTargets.Max()); // the retry swept against the true ceiling too
+        var record = AppliedStateStore.Load(Uuid);
+        Assert.Equal(1800u, record?.LockedCoreClockMHz);
+        Assert.NotEqual(true, record?.ProbeLockPending);
+    }
+
+    [Fact]
+    public void A_raised_factory_floor_card_gets_a_full_sweep_and_ends_at_its_factory_range()
+    {
+        // R-17: the factory floor (300) sits above the hardware minimum (100),
+        // which Intel's contract allows. It used to read as an unreleasable
+        // clamp, and the probe refused to start.
+        var dev = new FakeArcDevice { HwMin = 100, FactoryMin = 300 };
+        var tuner = Tuner(dev);
+
+        var final = RunToEnd(Probe(tuner, dev));
+
+        Assert.Equal(VfProbeOutcome.Completed, final.Outcome);
+        Assert.Equal(5, final.StepCount);
+        Assert.False(final.RestoreFailed, final.Phase);
+        Assert.Equal(2300d, dev.PinnedTargets.Max());
+        Assert.Equal((300d, 2300d), (dev.Min, dev.Max));
+        Assert.Null(tuner.ReadCurrent().LockedCoreClockMHz);
+        Assert.Null(AppliedStateStore.Load(Uuid));
     }
 
     [Fact]

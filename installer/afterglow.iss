@@ -36,7 +36,11 @@ Name: "{autodesktop}\Afterglow"; Filename: "{app}\Afterglow.exe"; Tasks: desktop
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"
-Name: "startup"; Description: "Start Afterglow with Windows (elevated via Task Scheduler, no UAC prompt at logon)"; GroupDescription: "Startup:"; Flags: unchecked
+; The task is for the account signed in to Windows, even when setup itself runs
+; as another administrator whose password was typed into the UAC prompt (R-41).
+; A standard account's task can only start Afterglow with that account's own
+; rights, so Afterglow then asks for elevation as on any other launch.
+Name: "startup"; Description: "Start Afterglow when you sign in to Windows (elevated via Task Scheduler, no UAC prompt on an administrator account)"; GroupDescription: "Startup:"; Flags: unchecked
 
 [Registry]
 ; Pre-1.0.2 installs used a Run-key autostart (unelevated, prompted at every
@@ -52,6 +56,13 @@ Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 Filename: "{app}\Afterglow.exe"; Description: "Launch Afterglow"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
+; R-46: every Windows user who turned "Start with Windows" on has their own
+; "Afterglow-<SID>" task, so no fixed /TN can remove them all. [UninstallRun]
+; runs as the uninstaller's first step, while Afterglow.exe still exists, and
+; the exe enumerates every user's task (elevated, schtasks lists them all) and
+; deletes them along with the legacy machine-global "Afterglow" task. The plain
+; schtasks entry stays as the fallback for that legacy task if the exe can't run.
+Filename: "{app}\Afterglow.exe"; Parameters: "--unregister-startup-all-users"; RunOnceId: "RemoveStartupTasks"; Flags: runhidden skipifdoesntexist
 Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""Afterglow"" /F"; RunOnceId: "RemoveStartupTask"; Flags: runhidden
 
 [UninstallDelete]
@@ -64,7 +75,12 @@ Type: files; Name: "{commonappdata}\Afterglow\applied-state*.json"
 [Code]
 // F-67: register the elevated logon task from code so the exit code is checked.
 // Setup already runs elevated (PrivilegesRequired=admin), so the child inherits
-// that token and only Task Scheduler itself can refuse.
+// that token. R-41: that token may be an administrator whose password a standard
+// user typed into the UAC prompt, so the child registers the task for the user
+// signed in to this Windows session, not for its own account, and refuses when
+// nobody is signed in (a deployment tool running setup as SYSTEM). Nothing is
+// passed from here: ExecAsOriginalUser can only return an exit code, and after
+// "Run as administrator" Setup has no original-user credentials to return to.
 procedure RegisterStartupTask;
 var
   ResultCode: Integer;
@@ -80,8 +96,10 @@ begin
       Log(Format('register-startup failed with exit code %d', [ResultCode]));
       if not WizardSilent then
         MsgBox('Afterglow was installed, but turning on "Start Afterglow with Windows"'
-          + ' did not work: the Task Scheduler task could not be created. This is often'
-          + ' group policy or security software blocking scheduled-task creation.'
+          + ' did not work: the Task Scheduler task could not be created. The reason is in '
+          + ExpandConstant('{commonappdata}\Afterglow\logs\afterglow.log')
+          + '. Group policy or security software blocking scheduled-task creation is a'
+          + ' common one.'
           + #13#10#13#10 + 'You can try again later from Settings; the rest of the install'
           + ' completed normally.', mbError, MB_OK);
     end;

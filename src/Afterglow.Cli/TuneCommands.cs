@@ -90,6 +90,10 @@ internal static class TuneCommands
         var (core, mem, power, boost, lockMHz) = gpu.Tuner.ReadCurrent();
         var caps = gpu.Tuner.Capabilities;
 
+        // A lock applied before the system slept or hibernated: not shown as
+        // applied, and not hidden either — the driver may still hold it.
+        uint? unconfirmedLock = lockMHz is null ? gpu.Tuner.UnconfirmedLockMHz : null;
+
         // A knob this device does not expose has no "current value": printing 0
         // there is the same fabrication the power-limit slot was made nullable
         // to avoid, and it directly contradicts what `caps` says one line over.
@@ -107,6 +111,7 @@ internal static class TuneCommands
                 power_limit_w = power,
                 voltage_boost_pct = boost,
                 lock_clock_mhz = lockMHz,
+                lock_clock_unconfirmed_mhz = unconfirmedLock,
             }, JsonOut));
             return 0;
         }
@@ -126,7 +131,9 @@ internal static class TuneCommands
             ? gpu.Vendor == GpuVendor.Intel
                 ? $"  Clock lock      clamped to {lc} MHz (read back from the driver)"
                 : $"  Clock lock      210..{lc} MHz (Afterglow-tracked; the driver has no getter)"
-            : "  Clock lock      none");
+            : unconfirmedLock is uint maybe
+                ? $"  Clock lock      unconfirmed: {GpuTuner.DescribeUnconfirmedLock(maybe)}"
+                : "  Clock lock      none");
 
         return 0;
     }
@@ -232,6 +239,12 @@ internal static class TuneCommands
             VoltageBoostPct = voltageBoost,
         };
 
+        // Claimed before the first write (R-15): the clean mark at the end
+        // vouches for this card's record only, and only if this command found
+        // it clean — a running app's unfinished record, or an unacknowledged
+        // crash, on this card or any other, is not this command's to clear.
+        var claim = AppliedStateStore.BeginCommand(gpu.Tuner.RecordKey);
+
         // An explicit `--lock-clock off` is one operation with one verdict:
         // Apply releases the lock itself — whether or not this session tracks
         // one — and reports it as the "clock lock" knob. Releasing from here
@@ -239,6 +252,7 @@ internal static class TuneCommands
         // a FAIL followed by a verified release and exit 1.
         var result = gpu.Tuner.Apply(profile, releaseLock: unlock);
         bool allOk = result.AllSucceeded;
+        bool fansLeftOnRecord = false;
         foreach (var knob in result.Results)
         {
             Console.WriteLine($"  {(knob.Applied ? "ok  " : "FAIL")} {knob.Knob,-18} {knob.Detail}");
@@ -254,7 +268,9 @@ internal static class TuneCommands
         else if (fan is not null && uint.TryParse(fan, out uint requestedDuty))
         {
             uint duty = TuningMath.NormalizeFixedFanDuty(requestedDuty, gpu.Tuner.Capabilities.FanMinDutyPct);
-            var rc = gpu.Tuner.SetAllFansRaw(duty);
+            var write = FanWriteResult.SetAllFans(gpu.Tuner, duty);
+            var rc = write.Result;
+            fansLeftOnRecord = !write.Succeeded && write.FansMayBeManual;
             string detail = duty == requestedDuty
                 ? $"{duty}% fixed"
                 : $"{duty}% fixed (requested {requestedDuty}%, raised to the hardware minimum spin duty)";
@@ -263,8 +279,15 @@ internal static class TuneCommands
         }
 
         // A completed CLI apply is a clean session end — don't trip the app's
-        // crash-recovery banner on its next start.
-        AppliedStateStore.MarkCleanShutdown();
+        // crash-recovery banner on its next start for it. The mark covers this
+        // command's own card (see the claim above); it used to mark every
+        // card's record clean. Not after a refused fan write that may have left
+        // a fan pinned (R-06): that is on record as possibly manual, and
+        // marking it clean here would hide it from the next launch's banner.
+        if (!fansLeftOnRecord)
+        {
+            claim.MarkClean();
+        }
 
         if (!allOk)
         {

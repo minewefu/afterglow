@@ -105,7 +105,7 @@ public sealed class NvmlApi : IDisposable
 /// "unsupported on this GPU" from real errors. Newer driver exports missing on
 /// old drivers surface as <see cref="NvmlReturn.FunctionNotFound"/>.
 /// </summary>
-public sealed unsafe class NvmlDevice
+public sealed unsafe class NvmlDevice : INvmlTuningDevice
 {
     private readonly nint _handle;
 

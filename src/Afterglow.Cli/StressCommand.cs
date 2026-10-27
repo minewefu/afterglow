@@ -214,8 +214,16 @@ internal static class StressCommand
         }
 
         // Probe the same vendor an actual unbound run would resolve, so the
-        // diagnostic describes what the engine will really do.
-        uint fallbackVendor = StressAdapter.DetectDefaultVendor();
+        // diagnostic describes what the engine will really do — including a
+        // refusal, which an unbound run now gives before loading anything.
+        var fallbackChoice = StressAdapter.ResolveDefaultVendor();
+        if (fallbackChoice.Refusal is { } refusal)
+        {
+            Console.WriteLine($"no-bus fallback: refused — {refusal}");
+            return 0;
+        }
+
+        uint fallbackVendor = fallbackChoice.VendorId;
         string fallbackLabel = fallbackVendor == StressAdapter.NvidiaVendorId ? "largest NVIDIA" : "largest Intel";
         using var fallback = StressAdapter.Select(fallbackVendor, null, out string fallbackDesc);
         Console.WriteLine($"no-bus fallback ({fallbackLabel}): {(fallback is null ? "none" : fallbackDesc)}");

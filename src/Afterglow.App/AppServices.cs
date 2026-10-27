@@ -35,6 +35,9 @@ public sealed class AppServices : IDisposable
 
     public CsvLogger? ActiveCsvLogger { get; set; }
 
+    /// <summary>Global shortcuts; the app attaches them to its window, Settings shows and edits them.</summary>
+    public Services.HotkeyService Hotkeys { get; } = new();
+
     public string DriverVersion { get; init; } = "—";
 
     public required GameWatcher GameWatcher { get; init; }
@@ -157,8 +160,13 @@ public sealed class AppServices : IDisposable
     /// <summary>Mutates and persists settings; side effects (interval, rules) are applied.</summary>
     public void UpdateSettings(Func<AppSettings, AppSettings> mutate)
     {
-        _settings = mutate(_settings);
-        SettingsStore.Save(_settings);
+        // Saved before it is kept (R-37): settings the file can't hold (a NaN
+        // threshold) used to replace the in-memory copy first, so the save threw
+        // and every later, unrelated change failed the same way until a restart.
+        // Save still swallows disk errors, so a read-only disk behaves as before.
+        var next = mutate(_settings);
+        SettingsStore.Save(next);
+        _settings = next;
         Telemetry.Interval = TimeSpan.FromMilliseconds(_settings.PollingIntervalMs);
         GameWatcher.UpdateRules(_settings.GameRules);
         SettingsChanged?.Invoke(_settings);
@@ -358,8 +366,22 @@ public sealed class AppServices : IDisposable
 
         if (flights.Count > 0)
         {
-            var tunersByIndex = manager.Gpus.ToDictionary(g => g.Index, g => g.Tuner);
-            var flightTicks = new Dictionary<uint, int>();
+            // Each card's tuning reaches its recording the moment any writer
+            // changes it — page, hotkey, game rule, stepper, certifier, probe,
+            // TDR watchdog — with the clock lock, the V/F-point edits and the
+            // card's identity (R-43). The once-a-minute offsets-only sample
+            // missed a profile applied just before a crash and never saw a
+            // lock or a per-point edit. Each sampler also re-reads on a fixed
+            // period, for writes made by another process (CLI, MCP).
+            var tuningSamplers = new Dictionary<uint, Core.Diagnostics.TuningFlightSampler>();
+            foreach (var gpu in manager.Gpus)
+            {
+                if (flights.TryGetValue(gpu.Index, out var gpuFlight))
+                {
+                    tuningSamplers[gpu.Index] = new Core.Diagnostics.TuningFlightSampler(gpu.Tuner, gpuFlight, gpu.StableKey);
+                }
+            }
+
             telemetry.SnapshotTaken += snapshot =>
             {
                 if (!flights.TryGetValue(snapshot.DeviceIndex, out var recorder))
@@ -368,21 +390,9 @@ public sealed class AppServices : IDisposable
                 }
 
                 recorder.Record(snapshot);
-
-                // Offsets change rarely; sample once a minute per card so
-                // CLI-applied tuning is captured too (dedup inside the recorder).
-                flightTicks.TryGetValue(snapshot.DeviceIndex, out int tick);
-                flightTicks[snapshot.DeviceIndex] = tick + 1;
-                if (tick % 60 == 0 && tunersByIndex.TryGetValue(snapshot.DeviceIndex, out var tuner))
+                if (tuningSamplers.TryGetValue(snapshot.DeviceIndex, out var sampler))
                 {
-                    try
-                    {
-                        var current = tuner.ReadCurrent();
-                        recorder.RecordOffsets(current.CoreOffsetMHz, current.MemOffsetMHz);
-                    }
-                    catch (InvalidOperationException)
-                    {
-                    }
+                    sampler.OnSnapshot(snapshot.Timestamp);
                 }
             };
         }
@@ -412,39 +422,100 @@ public sealed class AppServices : IDisposable
         return services;
     }
 
-    public void Dispose()
+    private bool? _hardwareReleased;
+
+    public void Dispose() => _ = Shutdown();
+
+    /// <summary>
+    /// Tears every service down and says whether the hardware was handed back:
+    /// true only when every card's fan release succeeded (R-05). App.OnExit
+    /// stamps the session clean only on true. Each step runs on its own — one
+    /// that throws is logged and the rest still run: a CSV flush failing on a
+    /// full or disconnected drive used to throw out of here before the fans
+    /// were released, leaving a card pinned at a manual duty after exit with
+    /// the session already stamped clean. Later calls return the first answer.
+    /// <para>
+    /// Every step that can wait is bounded, so a GPU driver that stops answering
+    /// cannot hold the exit (and the mutexes App.OnExit releases after it): about
+    /// 2 s for PresentMon, 3 s for the telemetry thread, up to 9 s per card for
+    /// the fan release (<see cref="FanControlService.ShutdownDriverBudget"/> plus
+    /// its 1 s release floor), 2 s for the driver library teardown or none when
+    /// it is skipped, and 3 s per flight recorder only when the disk is stuck.
+    /// Threads left inside the driver are background threads, which do not keep
+    /// the process alive.
+    /// </para>
+    /// </summary>
+    public bool Shutdown()
     {
+        if (_hardwareReleased is bool done)
+        {
+            return done;
+        }
+
+        var steps = new ShutdownSteps();
+        steps.Run("game watcher", GameWatcher.Dispose);
+        steps.Run("TDR watchdog", TdrWatchdog.Dispose);
+
+        // Telemetry before the fans. Its SnapshotTaken subscription drives the
+        // fan curve, and stopping the fans while snapshots are still arriving
+        // let one land after the release and command the fans again — leaving
+        // the card on manual fans after exit. FrameMetrics is disposed here too
+        // because its teardown waits on PresentMon for up to two seconds, which
+        // used to sit between the fan release and the poller still feeding it.
+        steps.Run("frame metrics", FrameMetrics.Dispose);
+        steps.Run("telemetry", Telemetry.Dispose);
+
+        foreach (var (index, fans) in FanControl)
+        {
+            steps.RunEssential($"GPU {index} fan release", fans.ReleaseForShutdown);
+        }
+
+        // File writes wait until the hardware is safe: a slow or failing disk
+        // must not delay the fan release, let alone skip it.
+        if (ActiveCsvLogger is { } csv)
+        {
+            steps.Run("CSV log", csv.Dispose);
+        }
+
         if (!DemoMode)
         {
             foreach (var recorder in VfCurves.Values)
             {
-                recorder.Save();
+                steps.Run("V/F curve save", () => recorder.Save());
             }
-        }
-
-        GameWatcher.Dispose();
-        TdrWatchdog.Dispose();
-
-        // Telemetry FIRST. Its SnapshotTaken subscription drives the fan curve,
-        // and stopping the fans while snapshots are still arriving let one land
-        // after the release and command the fans again — leaving the card on
-        // manual fans after exit. FrameMetrics is disposed here too because its
-        // teardown waits on PresentMon for up to two seconds, which used to sit
-        // between the fan release and the poller still feeding it.
-        FrameMetrics.Dispose();
-        ActiveCsvLogger?.Dispose();
-        Telemetry.Dispose();
-
-        foreach (var fans in FanControl.Values)
-        {
-            fans.Dispose();
         }
 
         foreach (var flightRecorder in Flights.Values)
         {
-            flightRecorder.Dispose();
+            steps.Run("flight recorder", flightRecorder.Dispose);
         }
 
-        Manager?.Dispose();
+        if (Manager is { } manager)
+        {
+            if (FanControl.Values.Any(fans => fans.DriverHung))
+            {
+                // nvmlShutdown and ctlClose are driver calls too. Under a fan
+                // call that never came back they could block behind it, or free
+                // library state it is still inside; process exit releases both.
+                Core.Diagnostics.Log.Warn("GPU driver teardown skipped: a fan call into the driver did not return at shutdown.");
+            }
+            else
+            {
+                // Still bounded: the driver can stop answering with no fan call
+                // in flight (a stuck telemetry poll outlives Telemetry.Dispose's
+                // 3 s join). The teardown frees only what process exit frees.
+                var teardownBudget = TimeSpan.FromSeconds(2);
+                steps.Run("GPU manager", () =>
+                {
+                    if (!BoundedCall.TryRun(manager.Dispose, teardownBudget, "Afterglow GPU teardown"))
+                    {
+                        Core.Diagnostics.Log.Warn($"GPU driver teardown did not finish within {teardownBudget.TotalSeconds:0} s; left to process exit.");
+                    }
+                });
+            }
+        }
+
+        _hardwareReleased = steps.EssentialSucceeded;
+        return steps.EssentialSucceeded;
     }
 }

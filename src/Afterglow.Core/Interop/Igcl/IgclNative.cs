@@ -913,7 +913,7 @@ internal static unsafe partial class IgclNative
 
     [LibraryImport(Lib)]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
-    internal static partial CtlResult ctlOverclockGpuLockGet(nint device, out CtlOcVfPair vfPair);
+    internal static partial CtlResult ctlOverclockGpuLockGet(nint device, ref CtlOcVfPair vfPair); // ref: Size is [in] (R-45)
 
     [LibraryImport(Lib)]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
