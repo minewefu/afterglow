@@ -7,6 +7,8 @@ namespace Afterglow.Core.Telemetry;
 /// answer stays null — the honest "unavailable" the rest of the pipeline
 /// already renders. Power and utilization only exist as deltas between two
 /// monotonic counters, so the first poll after start reports them as null.
+/// Power is the whole card's where the driver counts it and the GPU chip's
+/// otherwise, and every snapshot says which (<see cref="GpuSnapshot.PowerIsChipOnly"/>).
 /// Component handles are enumerated once in the constructor (IGCL handles stay
 /// valid for the API's lifetime). <see cref="Poll"/> is called from more than
 /// one thread — the telemetry loop, the V/F probe's sampler, and the CLI/MCP
@@ -14,7 +16,7 @@ namespace Afterglow.Core.Telemetry;
 /// </summary>
 public sealed class IntelSensorSource : ISensorSource
 {
-    private readonly IgclDevice _device;
+    private readonly IIntelTelemetryDevice _device;
     private readonly nint _gpuFreqDomain;
     private readonly nint _mediaFreqDomain;
     private readonly nint _memoryFreqDomain;
@@ -27,6 +29,11 @@ public sealed class IntelSensorSource : ISensorSource
     private bool _hasLast;
 
     public IntelSensorSource(IgclDevice device, uint deviceIndex)
+        : this(new IgclTelemetryDevice(device), deviceIndex)
+    {
+    }
+
+    internal IntelSensorSource(IIntelTelemetryDevice device, uint deviceIndex)
     {
         _device = device;
         DeviceIndex = deviceIndex;
@@ -73,6 +80,8 @@ public sealed class IntelSensorSource : ISensorSource
         uint? gpuUtil = null;
         double? powerW = null;
         double? energyWh = null;
+        bool? powerIsChipOnly = null;
+        double? bulkVramTemp = null;
 
         if (_device.TryGetPowerTelemetry(out var t) == CtlResult.Success)
         {
@@ -86,10 +95,16 @@ public sealed class IntelSensorSource : ISensorSource
                 gpuTemp = (uint)Math.Max(0, Math.Round(t.GpuCurrentTemperature.AsDouble()));
             }
 
-            if (t.GpuEnergyCounter is { Supported: not 0, Units: CtlUnits.EnergyJoules })
+            // Unit-checked like the energy counters: a value the driver labels
+            // as anything but °C is not read as one (R-19, used below).
+            if (t.VramCurrentTemperature is { Supported: not 0, Units: CtlUnits.TemperatureCelsius }
+                && double.IsFinite(t.VramCurrentTemperature.AsDouble()))
             {
-                energyWh = t.GpuEnergyCounter.AsDouble() / 3600.0;
+                bulkVramTemp = Math.Round(t.VramCurrentTemperature.AsDouble(), 1);
             }
+
+            double? cardW = null;
+            double? chipW = null;
 
             // The previous sample is a multi-word struct read and written by
             // whichever threads call Poll — the telemetry loop, the V/F probe's
@@ -109,7 +124,8 @@ public sealed class IntelSensorSource : ISensorSource
                     double dt = t.TimeStamp.AsDouble() - _last.TimeStamp.AsDouble();
                     if (dt <= 30.0)
                     {
-                        powerW = PowerFromEnergyCounters(_last.GpuEnergyCounter, t.GpuEnergyCounter, dt);
+                        cardW = PowerFromEnergyCounters(_last.TotalCardEnergyCounter, t.TotalCardEnergyCounter, dt);
+                        chipW = PowerFromEnergyCounters(_last.GpuEnergyCounter, t.GpuEnergyCounter, dt);
                         gpuUtil = UtilFromActivityCounters(_last.GlobalActivityCounter, t.GlobalActivityCounter, dt);
                     }
                 }
@@ -117,10 +133,45 @@ public sealed class IntelSensorSource : ISensorSource
                 _last = t;
                 _hasLast = true;
             }
+
+            // R-18: board power comes from the total-card counter. The IGCL
+            // header documents gpuEnergyCounter as "the total energy consumed
+            // by the GPU chip" — on a discrete board that leaves out VRAM,
+            // regulators, fans and conversion losses, and reading it as board
+            // power understated the card (chip +50 J, card +100 J in one
+            // second came out as 50 W), which every power rule, session report
+            // and FPS-per-watt comparison inherited. The chip counter stays the
+            // fallback where the driver has no card counter in joules, and the
+            // snapshot says so in PowerIsChipOnly. One counter answers all
+            // three power fields per poll so that one label is true of each: a
+            // card counter with no usable previous card sample gives no power
+            // this tick rather than borrowing the chip's delta under the
+            // card's label.
+            bool cardCounter = t.TotalCardEnergyCounter is { Supported: not 0, Units: CtlUnits.EnergyJoules };
+
+            // The card's energy includes the chip's, so a card counter that
+            // advanced less than the chip counter over the same interval is
+            // not counting the whole card (IGCL answering zeros for something
+            // the device does not do is on record for the overclock getters,
+            // docs/research/intel-driver-apis.md). That poll falls back to the
+            // chip, labelled so, instead of reporting a stalled counter's 0 W
+            // as board power.
+            if (cardCounter && cardW is double card && chipW is double chip && card < chip)
+            {
+                cardCounter = false;
+            }
+
+            var energy = cardCounter ? t.TotalCardEnergyCounter : t.GpuEnergyCounter;
+            if (energy is { Supported: not 0, Units: CtlUnits.EnergyJoules })
+            {
+                energyWh = energy.AsDouble() / 3600.0;
+                powerW = cardCounter ? cardW : chipW;
+                powerIsChipOnly = !cardCounter;
+            }
         }
 
         double? coreVoltageMv = null;
-        if (_gpuFreqDomain != 0 && IgclDevice.TryGetFrequencyState(_gpuFreqDomain, out var gpuState) == CtlResult.Success)
+        if (_gpuFreqDomain != 0 && _device.TryGetFrequencyState(_gpuFreqDomain, out var gpuState) == CtlResult.Success)
         {
             coreClock ??= gpuState.Actual >= 0 ? (uint)Math.Round(gpuState.Actual) : null;
             if (gpuState.CurrentVoltage >= 0)
@@ -130,23 +181,23 @@ public sealed class IntelSensorSource : ISensorSource
         }
 
         uint? videoClock = null;
-        if (_mediaFreqDomain != 0 && IgclDevice.TryGetFrequencyState(_mediaFreqDomain, out var mediaState) == CtlResult.Success
+        if (_mediaFreqDomain != 0 && _device.TryGetFrequencyState(_mediaFreqDomain, out var mediaState) == CtlResult.Success
             && mediaState.Actual >= 0)
         {
             videoClock = (uint)Math.Round(mediaState.Actual);
         }
 
         uint? memClock = null;
-        if (_memoryFreqDomain != 0 && IgclDevice.TryGetFrequencyState(_memoryFreqDomain, out var memState) == CtlResult.Success
+        if (_memoryFreqDomain != 0 && _device.TryGetFrequencyState(_memoryFreqDomain, out var memState) == CtlResult.Success
             && memState.Actual >= 0)
         {
             memClock = (uint)Math.Round(memState.Actual);
         }
 
-        double? memJunction = null;
+        double? memTemp = null;
         foreach (var (handle, type) in _tempSensors)
         {
-            if (IgclDevice.TryGetTemperature(handle, out double c) != CtlResult.Success)
+            if (_device.TryGetTemperature(handle, out double c) != CtlResult.Success)
             {
                 continue;
             }
@@ -158,16 +209,26 @@ public sealed class IntelSensorSource : ISensorSource
                     gpuTemp = (uint)Math.Max(0, Math.Round(c));
                     break;
                 case CtlTempSensor.Memory:
-                    memJunction = Math.Round(c, 1);
+                    memTemp = Math.Round(c, 1);
                     break;
                 default:
                     break;
             }
         }
 
+        // R-19: a driver can answer the bulk block's VRAM temperature without
+        // enumerating a memory sensor handle; reading only the handles turned
+        // a supported 92 °C into null, so memory alerts and rules never fired.
+        // An enumerated sensor that read still wins. Both are documented as
+        // the hottest memory sensor — CTL_TEMP_SENSORS_MEMORY "the maximum
+        // temperature across all sensors in the local memory",
+        // vramCurrentTemperature "read from the sensor reporting the highest
+        // value" — so either one is labelled a VRAM reading, not a junction.
+        memTemp ??= bulkVramTemp;
+
         ulong? vramUsed = null;
         ulong? vramTotal = null;
-        if (_memoryModule != 0 && IgclDevice.TryGetMemoryState(_memoryModule, out var mem) == CtlResult.Success
+        if (_memoryModule != 0 && _device.TryGetMemoryState(_memoryModule, out var mem) == CtlResult.Success
             && mem.Total > 0)
         {
             vramUsed = mem.Total - Math.Min(mem.Free, mem.Total);
@@ -182,7 +243,8 @@ public sealed class IntelSensorSource : ISensorSource
             MemClockMHz = memClock,
             VideoClockMHz = videoClock,
             GpuTempC = gpuTemp,
-            MemJunctionTempC = memJunction,
+            MemJunctionTempC = memTemp,
+            MemTempIsVramSensor = memTemp is null ? null : true,
             GpuUtilPct = gpuUtil,
             // Encoder/decoder stay null: IGCL's media activity counter covers
             // encode+decode combined, and labeling that as either would lie.
@@ -192,6 +254,7 @@ public sealed class IntelSensorSource : ISensorSource
             PowerW = powerW,
             PowerAvgW = powerW,
             EnergyWh = energyWh,
+            PowerIsChipOnly = powerIsChipOnly,
             CoreVoltageMv = coreVoltageMv,
         };
     }
@@ -242,4 +305,46 @@ public sealed class IntelSensorSource : ISensorSource
 
         return (uint)Math.Clamp(Math.Round(100.0 * busy / dtSeconds), 0, 100);
     }
+
+    /// <summary>The production seam: every read forwarded to the IGCL adapter, unchanged.</summary>
+    private sealed class IgclTelemetryDevice(IgclDevice device) : IIntelTelemetryDevice
+    {
+        public IReadOnlyList<(nint Handle, CtlFreqProperties Properties)> GetFrequencyDomains() => device.GetFrequencyDomains();
+
+        public IReadOnlyList<(nint Handle, CtlMemProperties Properties)> GetMemoryModules() => device.GetMemoryModules();
+
+        public IReadOnlyList<(nint Handle, CtlTempProperties Properties)> GetTemperatureSensors() => device.GetTemperatureSensors();
+
+        public CtlResult TryGetPowerTelemetry(out CtlPowerTelemetry telemetry) => device.TryGetPowerTelemetry(out telemetry);
+
+        public CtlResult TryGetFrequencyState(nint domain, out CtlFreqState state) => IgclDevice.TryGetFrequencyState(domain, out state);
+
+        public CtlResult TryGetTemperature(nint sensor, out double temperatureC) => IgclDevice.TryGetTemperature(sensor, out temperatureC);
+
+        public CtlResult TryGetMemoryState(nint module, out CtlMemState state) => IgclDevice.TryGetMemoryState(module, out state);
+    }
+}
+
+/// <summary>
+/// The IGCL reads <see cref="IntelSensorSource"/> makes — reads only, so a
+/// substitute can never stand in for a write. <see cref="IgclDevice"/> answers
+/// them in production; the test suite substitutes an in-memory device so the
+/// counter-scope and sensor-fallback rules run through the real
+/// <see cref="IntelSensorSource.Poll"/> instead of an argument about it.
+/// </summary>
+internal interface IIntelTelemetryDevice
+{
+    IReadOnlyList<(nint Handle, CtlFreqProperties Properties)> GetFrequencyDomains();
+
+    IReadOnlyList<(nint Handle, CtlMemProperties Properties)> GetMemoryModules();
+
+    IReadOnlyList<(nint Handle, CtlTempProperties Properties)> GetTemperatureSensors();
+
+    CtlResult TryGetPowerTelemetry(out CtlPowerTelemetry telemetry);
+
+    CtlResult TryGetFrequencyState(nint domain, out CtlFreqState state);
+
+    CtlResult TryGetTemperature(nint sensor, out double temperatureC);
+
+    CtlResult TryGetMemoryState(nint module, out CtlMemState state);
 }
