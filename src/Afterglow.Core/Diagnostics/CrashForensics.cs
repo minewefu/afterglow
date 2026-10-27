@@ -10,6 +10,11 @@ namespace Afterglow.Core.Diagnostics;
 /// multi-GPU machine the offsets and load state in the report body belong to
 /// exactly one card, and an unlabelled report was read as describing the whole
 /// machine.
+/// <paramref name="TuningApplied"/> covers every recorded knob — offsets, clock
+/// lock and V/F-point edits (R-43) — and <paramref name="Cause"/> keeps an
+/// unknown cause apart from a confirmed reset or power loss (R-44).
+/// <paramref name="RecordedGpuId"/> is the card identity the recording itself
+/// names, when it names one.
 /// </summary>
 public sealed record CrashReport(
     DateTimeOffset CrashedAt,
@@ -17,7 +22,9 @@ public sealed record CrashReport(
     string ReportText,
     bool TuningApplied = false,
     uint? GpuIndex = null,
-    string? GpuName = null);
+    string? GpuName = null,
+    CrashCause Cause = CrashCause.Unknown,
+    string? RecordedGpuId = null);
 
 /// <summary>
 /// Startup crash forensics: if the previous flight recording ended without a
@@ -83,28 +90,7 @@ public static class CrashForensics
         }
 
         var events = QuerySystemLog(end);
-        var evidence = new CrashEvidence
-        {
-            SessionEnd = end,
-            BugcheckCode = events.BugcheckCode,
-            UnexpectedShutdownLogged = events.UnexpectedShutdown,
-            WheaErrorsLogged = events.WheaCount > 0,
-            TdrLogged = events.TdrCount > 0,
-            DisplayDriverEventCount = events.DriverEventCount,
-            EventLogAvailable = events.Available,
-            HeavyLoadAtDeath = session.HeavyLoadAtEnd(),
-            SecondsSinceHeavyLoadEnded = session.SecondsSinceHeavyLoadEnded(),
-            CoreOffsetMHz = session.CoreOffsetMHz,
-            MemOffsetMHz = session.MemOffsetMHz,
-
-            // How stale the reset evidence is. Without this the classifier
-            // asserted an instant reset "under sustained load" from records that
-            // could have been logged up to a day later.
-            ResetLoggedAfter = events.ResetLoggedAt is { } at
-                ? at - end.LocalDateTime
-                : null,
-        };
-
+        var evidence = BuildEvidence(session, end, events);
         var verdict = CrashClassifier.Classify(evidence);
         if (verdict is null)
         {
@@ -128,7 +114,48 @@ public static class CrashForensics
             end,
             verdict.Headline,
             text,
-            TuningApplied: session.CoreOffsetMHz != 0 || session.MemOffsetMHz != 0);
+            TuningApplied: evidence.TuningApplied,
+            Cause: verdict.Cause,
+            RecordedGpuId: session.Tuning?.GpuId);
+    }
+
+    /// <summary>
+    /// The classifier's input for one recording: what the event log said, and
+    /// what the recording says the card was doing and was tuned to. Separate
+    /// from the event-log query so the mapping is testable without a real log.
+    /// </summary>
+    internal static CrashEvidence BuildEvidence(FlightSession session, DateTimeOffset end, EventEvidence events)
+    {
+        var tuning = session.Tuning;
+        return new CrashEvidence
+        {
+            SessionEnd = end,
+            BugcheckCode = events.BugcheckCode,
+            UnexpectedShutdownLogged = events.UnexpectedShutdown,
+            WheaErrorsLogged = events.WheaCount > 0,
+            TdrLogged = events.TdrCount > 0,
+            DisplayDriverEventCount = events.DriverEventCount,
+            EventLogAvailable = events.Available,
+            HeavyLoadAtDeath = session.HeavyLoadAtEnd(),
+            SecondsSinceHeavyLoadEnded = session.SecondsSinceHeavyLoadEnded(),
+            CoreOffsetMHz = session.CoreOffsetMHz,
+            MemOffsetMHz = session.MemOffsetMHz,
+
+            // The rest of the tuning (R-43). A recording that never stated it —
+            // written before it was recorded, or with no tuning line at all —
+            // is "not recorded", which no verdict may read as "stock".
+            LockedCoreClockMHz = tuning?.LockedCoreClockMHz,
+            VfPointsEdited = tuning?.VfPointsEdited ?? 0,
+            VfPointMaxOffsetMHz = tuning?.VfPointMaxOffsetMHz ?? 0,
+            TuningFullyRecorded = tuning?.FullyRecorded ?? false,
+
+            // How stale the reset evidence is. Without this the classifier
+            // asserted an instant reset "under sustained load" from records that
+            // could have been logged up to a day later.
+            ResetLoggedAfter = events.ResetLoggedAt is { } at
+                ? at - end.LocalDateTime
+                : null,
+        };
     }
 
     internal sealed record EventEvidence(
@@ -388,7 +415,7 @@ public static class CrashForensics
         return null;
     }
 
-    private static string BuildReport(
+    internal static string BuildReport(
         FlightSession session, CrashEvidence e, EventEvidence events, CrashVerdict verdict, string? gpuLabel)
     {
         var sb = new StringBuilder();
@@ -419,9 +446,30 @@ public static class CrashForensics
                 ? string.Create(CultureInfo.InvariantCulture,
                     $"  The last sustained heavy load ended {s / 60:F1} min before death.")
                 : "  No sustained heavy load was seen this session.");
-        sb.AppendLine(string.Create(
-            CultureInfo.InvariantCulture,
-            $"  Offsets applied: {e.CoreOffsetMHz:+0;-0;+0} MHz core, {e.MemOffsetMHz:+0;-0;+0} MHz memory"));
+        // The tuning, and "not recorded" where the recording could not say —
+        // a zero or a blank would read as "none" (R-43).
+        var tuning = session.Tuning;
+        sb.AppendLine(tuning is null
+            ? "  Offsets applied: not recorded"
+            : string.Create(
+                CultureInfo.InvariantCulture,
+                $"  Offsets applied: {e.CoreOffsetMHz:+0;-0;+0} MHz core, {e.MemOffsetMHz:+0;-0;+0} MHz memory"));
+        sb.AppendLine(tuning is { LockRecorded: true }
+            ? e.LockedCoreClockMHz is uint lockMHz
+                ? string.Create(CultureInfo.InvariantCulture, $"  Clock lock applied by Afterglow: {lockMHz} MHz")
+                : "  Clock lock applied by Afterglow: none"
+            : "  Clock lock: not recorded");
+        sb.AppendLine(tuning?.VfPointsEdited is null
+            ? "  Per-point V/F edits: not recorded"
+            : e.VfPointsEdited > 0
+                ? string.Create(CultureInfo.InvariantCulture,
+                    $"  Per-point V/F edits: {e.VfPointsEdited} point(s), highest {e.VfPointMaxOffsetMHz:+0;-0;0} MHz")
+                : "  Per-point V/F edits: none");
+        if (tuning?.GpuId is { } recordedGpu)
+        {
+            sb.Append("  Tuning recorded for: ").AppendLine(recordedGpu);
+        }
+
         sb.AppendLine();
 
         sb.AppendLine("Windows event log around the crash:");

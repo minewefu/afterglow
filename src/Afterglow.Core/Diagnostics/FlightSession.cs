@@ -35,6 +35,13 @@ public sealed class FlightSession
 
     public int MemOffsetMHz { get; private init; }
 
+    /// <summary>
+    /// The last tuning state the recording names — offsets, clock lock, V/F
+    /// points and card identity, as far as the recording states them. Null
+    /// when the parsed lines carry no "offsets" marker at all.
+    /// </summary>
+    public FlightTuning? Tuning { get; private init; }
+
     public IReadOnlyList<string> Markers { get; private init; } = [];
 
     /// <summary>True when the parsed lines include an "offsets" marker.</summary>
@@ -139,9 +146,7 @@ public sealed class FlightSession
         var samples = new List<FlightSample>();
         var markers = new List<string>();
         bool clean = false;
-        int core = 0;
-        int mem = 0;
-        bool sawOffsets = false;
+        FlightTuning? tuning = null;
         DateTimeOffset? endedAt = null;
 
         foreach (string line in lines)
@@ -176,22 +181,7 @@ public sealed class FlightSession
                 }
                 else if (text.StartsWith("offsets ", StringComparison.Ordinal))
                 {
-                    sawOffsets = true;
-                    foreach (string part in text.Split(' ', StringSplitOptions.RemoveEmptyEntries))
-                    {
-                        if (part.StartsWith("core=", StringComparison.Ordinal) &&
-                            int.TryParse(part.AsSpan(5), NumberStyles.AllowLeadingSign,
-                                CultureInfo.InvariantCulture, out int c))
-                        {
-                            core = c;
-                        }
-                        else if (part.StartsWith("mem=", StringComparison.Ordinal) &&
-                            int.TryParse(part.AsSpan(4), NumberStyles.AllowLeadingSign,
-                                CultureInfo.InvariantCulture, out int m))
-                        {
-                            mem = m;
-                        }
-                    }
+                    tuning = FlightTuning.Parse(text, tuning);
                 }
 
                 continue;
@@ -225,10 +215,11 @@ public sealed class FlightSession
             Samples = samples,
             CleanShutdown = clean,
             EndedAt = endedAt,
-            CoreOffsetMHz = core,
-            MemOffsetMHz = mem,
+            CoreOffsetMHz = tuning?.CoreOffsetMHz ?? 0,
+            MemOffsetMHz = tuning?.MemOffsetMHz ?? 0,
+            Tuning = tuning,
             Markers = markers,
-            HasOffsetsMarker = sawOffsets,
+            HasOffsetsMarker = tuning is not null,
         };
     }
 

@@ -72,6 +72,27 @@ public class CrashCorrelationTests
     }
 
     [Fact]
+    public void A_stale_reset_with_only_a_lock_or_point_edits_is_not_declared_untuned()
+    {
+        // R-43: the staleness hedge decided "no tuning" from the two offsets
+        // alone, so a lock-only or per-point-only session was told Afterglow's
+        // settings were not implicated.
+        foreach (var evidence in new[]
+        {
+            UnderLoadWithOffset() with { CoreOffsetMHz = 0, LockedCoreClockMHz = 2100, ResetLoggedAfter = TimeSpan.FromHours(6) },
+            UnderLoadWithOffset() with { CoreOffsetMHz = 0, VfPointsEdited = 3, VfPointMaxOffsetMHz = 90, ResetLoggedAfter = TimeSpan.FromHours(6) },
+        })
+        {
+            var verdict = CrashClassifier.Classify(evidence);
+
+            Assert.NotNull(verdict);
+            Assert.Equal(CrashCause.Uncorrelated, verdict.Cause);
+            Assert.DoesNotContain("not implicated", verdict.Recommendation, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("Re-run the stability tests", verdict.Recommendation, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
     public void A_stale_bluescreen_is_hedged_too_not_just_a_stale_hard_reset()
     {
         // The bugcheck branch sits above the hard-reset branches, so a staleness

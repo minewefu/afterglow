@@ -1,3 +1,4 @@
+using Afterglow.Core.Diagnostics;
 using Afterglow.Core.Metrics;
 using Afterglow.Core.Telemetry;
 using Afterglow.Core.Tuning;
@@ -215,6 +216,67 @@ public class HonestReportingTests
         Assert.False(recorder.VoltageSensorLooksAbsent);
         Assert.Equal(0, recorder.SamplesMissingVoltage);
         Assert.Equal(0, recorder.SamplesWithVoltage);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void An_unreadable_event_log_yields_an_unknown_cause_not_a_hard_reset_or_a_tuning_verdict(bool tuned)
+    {
+        // R-44: when the System log cannot be read, the evidence holds no crash
+        // signature at all — yet the classifier fell through to its hard-reset
+        // branches and asserted an instant power loss, naming the applied
+        // offsets as the likeliest cause. An unclean app exit is all that is
+        // actually known.
+        var verdict = CrashClassifier.Classify(new CrashEvidence
+        {
+            SessionEnd = DateTimeOffset.UtcNow,
+            EventLogAvailable = false,
+            HeavyLoadAtDeath = true,
+            SecondsSinceHeavyLoadEnded = 0,
+            CoreOffsetMHz = tuned ? 200 : 0,
+            MemOffsetMHz = tuned ? 1000 : 0,
+        });
+
+        Assert.NotNull(verdict);
+        Assert.Equal(CrashCause.Unknown, verdict!.Cause);
+        Assert.Contains("unknown", verdict.Headline, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("reset", verdict.Headline, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("stock", verdict.Headline, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("lost power", verdict.Interpretation, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("likeliest cause", verdict.Interpretation, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("margin", verdict.Interpretation, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Reduce the core offset", verdict.Recommendation, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("not implicated", verdict.Recommendation, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("could not be read", verdict.Interpretation, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void A_report_built_without_the_event_log_says_so_and_asserts_no_reset()
+    {
+        // The same case end to end: a tuned recording that died under load,
+        // analysed with the event log unreadable (what QuerySystemLog returns
+        // when EventLogReader throws).
+        string[] lines =
+        [
+            "#flight v1 started=1000",
+            "#1000 offsets core=200 mem=1000 lock=none vf=0 gpu=GPU-X",
+            .. Enumerable.Range(2, 30).Select(s => FormattableString.Invariant($"{s * 1000}|2900|15001|70|85|450|99|1050|55")),
+        ];
+        var session = FlightSession.Parse(lines);
+        var unreadable = new CrashForensics.EventEvidence(false, null, false, 0, 0, 0);
+
+        var evidence = CrashForensics.BuildEvidence(session, session.EndedAt!.Value, unreadable);
+        var verdict = CrashClassifier.Classify(evidence);
+        Assert.NotNull(verdict);
+        Assert.Equal(CrashCause.Unknown, verdict.Cause);
+
+        string report = CrashForensics.BuildReport(session, evidence, unreadable, verdict, "GPU 0 — Fake");
+        Assert.Contains("(event log could not be read)", report, StringComparison.Ordinal);
+        Assert.Contains("Offsets applied: +200 MHz core, +1000 MHz memory", report, StringComparison.Ordinal);
+        Assert.DoesNotContain("Hard reset", report, StringComparison.Ordinal);
+        Assert.DoesNotContain("lost power", report, StringComparison.Ordinal);
+        Assert.DoesNotContain("likeliest cause", report, StringComparison.Ordinal);
     }
 
     [Fact]

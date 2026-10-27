@@ -134,6 +134,78 @@ public class CrashClassifierTests
     }
 
     [Fact]
+    public void A_hard_reset_with_only_a_clock_lock_is_not_called_stock_or_blamed_on_it()
+    {
+        // R-43: a lock never reached the recording, so a lock-only session read
+        // as "stock settings… Afterglow's tuning is not implicated". A lock caps
+        // the clock rather than raising it, so it is not blamed either.
+        var verdict = CrashClassifier.Classify(Base() with { LockedCoreClockMHz = 1800 });
+
+        Assert.NotNull(verdict);
+        Assert.Equal(CrashCause.HardReset, verdict.Cause);
+        Assert.DoesNotContain("stock", verdict.Headline, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("not implicated", verdict.Recommendation, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("1800 MHz clock lock", verdict.Interpretation, StringComparison.Ordinal);
+        Assert.DoesNotContain("margin", verdict.Interpretation, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void A_memory_offset_below_the_transition_threshold_is_still_tuning()
+    {
+        // +300 MHz memory sits under the +500 transition-signature threshold and
+        // used to fall through to "Hard reset at stock settings… with no tuning
+        // applied" — a false statement about the session.
+        var verdict = CrashClassifier.Classify(Base() with { MemOffsetMHz = 300 });
+
+        Assert.NotNull(verdict);
+        Assert.DoesNotContain("stock settings", verdict.Headline, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("no tuning applied", verdict.Interpretation, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("+300 MHz memory", verdict.Interpretation, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Raised_v_f_points_under_load_are_read_as_core_margin()
+    {
+        var verdict = CrashClassifier.Classify(Base() with
+        {
+            HeavyLoadAtDeath = true,
+            SecondsSinceHeavyLoadEnded = 0,
+            VfPointsEdited = 4,
+            VfPointMaxOffsetMHz = 200,
+        });
+
+        Assert.NotNull(verdict);
+        Assert.Contains("margin", verdict.Interpretation, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("+200", verdict.Interpretation, StringComparison.Ordinal);
+        Assert.Contains("V/F points", verdict.Recommendation, StringComparison.Ordinal);
+        Assert.DoesNotContain("At stock clocks", verdict.Interpretation, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Every_signature_verdict_names_its_cause_and_the_full_tuning()
+    {
+        var tuned = Base() with { CoreOffsetMHz = 100, LockedCoreClockMHz = 2400, VfPointsEdited = 1, VfPointMaxOffsetMHz = 150 };
+
+        var tdr = CrashClassifier.Classify(tuned with { TdrLogged = true });
+        var whea = CrashClassifier.Classify(tuned with { WheaErrorsLogged = true });
+        var bsod = CrashClassifier.Classify(tuned with { BugcheckCode = 0x133 });
+        var reset = CrashClassifier.Classify(tuned);
+        var stale = CrashClassifier.Classify(tuned with { ResetLoggedAfter = TimeSpan.FromHours(6) });
+
+        Assert.Equal(CrashCause.DriverReset, tdr!.Cause);
+        Assert.Equal(CrashCause.HardwareError, whea!.Cause);
+        Assert.Equal(CrashCause.Bluescreen, bsod!.Cause);
+        Assert.Equal(CrashCause.HardReset, reset!.Cause);
+        Assert.Equal(CrashCause.Uncorrelated, stale!.Cause);
+        foreach (var verdict in new[] { tdr, whea, bsod })
+        {
+            Assert.Contains("+100 MHz core", verdict.Interpretation, StringComparison.Ordinal);
+            Assert.Contains("2400 MHz clock lock", verdict.Interpretation, StringComparison.Ordinal);
+            Assert.Contains("per-point V/F edits on 1 point (highest +150 MHz)", verdict.Interpretation, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
     public void No_crash_signals_means_no_report()
     {
         var verdict = CrashClassifier.Classify(new CrashEvidence

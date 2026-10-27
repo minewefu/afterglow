@@ -6,8 +6,8 @@ namespace Afterglow.Core.Diagnostics;
 
 /// <summary>
 /// Always-on telemetry black box: appends one compact line per snapshot to a
-/// session file, plus event markers (applied offsets, stress runs, clean
-/// shutdown). After a hard crash the file ends mid-flight — the missing
+/// session file, plus event markers (applied tuning — see <see cref="FlightTuning"/> —
+/// stress runs, clean shutdown). After a hard crash the file ends mid-flight — the missing
 /// clean-shutdown marker plus the last recorded seconds are what
 /// <see cref="CrashForensics"/> reconstructs the death from.
 /// Costs ~50 bytes/second. The file is capped at <see cref="SegmentBytes"/>:
@@ -38,8 +38,12 @@ public sealed class FlightRecorder : IDisposable
     // hours into a session would be analyzed as "at stock".
     private string? _offsetsMarker;
 
-    private int _lastCoreOffset = int.MinValue;
-    private int _lastMemOffset = int.MinValue;
+    // Tuning is recorded from every thread that writes the GPU (R-43), not only
+    // from the telemetry tick, so the dedup and the enqueue are one step under
+    // a lock: two writers must not both pass the check, nor enqueue in the
+    // opposite order to the one the check saw.
+    private readonly Lock _tuningLock = new();
+    private FlightTuning? _lastTuning;
     private int _disposed;
 
     public string CurrentPath { get; }
@@ -75,17 +79,27 @@ public sealed class FlightRecorder : IDisposable
 
     public void Record(GpuSnapshot snapshot) => Enqueue(FormatLine(snapshot));
 
-    /// <summary>Logs the currently applied offsets; deduplicated, so call freely.</summary>
-    public void RecordOffsets(int coreOffsetMHz, int memOffsetMHz)
-    {
-        if (coreOffsetMHz == _lastCoreOffset && memOffsetMHz == _lastMemOffset)
-        {
-            return;
-        }
+    /// <summary>Logs the currently applied offsets alone; deduplicated, so call freely.</summary>
+    public void RecordOffsets(int coreOffsetMHz, int memOffsetMHz) =>
+        RecordTuning(new FlightTuning { CoreOffsetMHz = coreOffsetMHz, MemOffsetMHz = memOffsetMHz });
 
-        _lastCoreOffset = coreOffsetMHz;
-        _lastMemOffset = memOffsetMHz;
-        Marker($"offsets core={coreOffsetMHz} mem={memOffsetMHz}");
+    /// <summary>
+    /// Logs the card's tuning state (offsets, clock lock, V/F-point edits, GPU
+    /// identity) when it differs from the last one logged; safe from any thread.
+    /// See <see cref="TuningFlightSampler"/> for who calls it and when.
+    /// </summary>
+    public void RecordTuning(FlightTuning tuning)
+    {
+        lock (_tuningLock)
+        {
+            if (tuning == _lastTuning)
+            {
+                return;
+            }
+
+            _lastTuning = tuning;
+            Marker(tuning.ToMarkerText());
+        }
     }
 
     public void Marker(string text) => Enqueue(MarkerLine(text));
@@ -155,6 +169,16 @@ public sealed class FlightRecorder : IDisposable
                 line.AsSpan(space + 1).StartsWith("offsets ", StringComparison.Ordinal))
             {
                 _offsetsMarker = line[(space + 1)..];
+
+                // The tuning line is the one a crash report most needs, and
+                // AutoFlush only hands it to the Windows file cache, which a
+                // hard reset or bluescreen discards. Tuning changes are rare,
+                // so they alone are pushed through to the disk — here, on the
+                // writer thread, never on the thread that wrote the GPU (R-43).
+                if (_writer.BaseStream is FileStream file)
+                {
+                    file.Flush(flushToDisk: true);
+                }
             }
         }
         catch (IOException)

@@ -122,6 +122,106 @@ public sealed class FlightRecorderTests : IDisposable
     }
 
     [Fact]
+    public void A_roll_over_restates_the_whole_tuning_line_not_just_the_offsets()
+    {
+        // R-43 widened the tuning line; the carry-over at a segment roll must
+        // carry the lock, the V/F edits and the card identity with it, or a
+        // crash ten hours in would lose them exactly as it once lost the offsets.
+        using (var recorder = new FlightRecorder(_dir, segmentBytes: 2_000))
+        {
+            recorder.RecordTuning(new FlightTuning
+            {
+                CoreOffsetMHz = 0,
+                MemOffsetMHz = 0,
+                LockRecorded = true,
+                LockedCoreClockMHz = 1800,
+                VfPointsEdited = 3,
+                VfPointMaxOffsetMHz = 120,
+                GpuId = "GPU-ROLL",
+            });
+            for (int i = 0; i < 200; i++)
+            {
+                recorder.Record(Snap(1_000 + (i * 1_000L)));
+            }
+        }
+
+        Assert.True(File.Exists(PathOf("current.older.log")));
+        var tail = FlightSession.Parse(File.ReadAllLines(PathOf("current.log")));
+        Assert.Equal(1800u, tail.Tuning?.LockedCoreClockMHz);
+        Assert.Equal(3, tail.Tuning?.VfPointsEdited);
+        Assert.Equal(120, tail.Tuning?.VfPointMaxOffsetMHz);
+        Assert.Equal("GPU-ROLL", tail.Tuning?.GpuId);
+    }
+
+    [Fact]
+    public void The_tuning_line_is_still_an_offsets_line_to_older_readers()
+    {
+        // Every reader before R-43 split the marker on spaces and read only
+        // core= and mem=, keeping the last value of each. The widened line has
+        // to give such a reader the same two numbers — so it keeps the old
+        // prefix, and nothing it adds can be mistaken for either field.
+        string text = new FlightTuning
+        {
+            CoreOffsetMHz = -25,
+            MemOffsetMHz = 800,
+            LockRecorded = true,
+            LockedCoreClockMHz = null,
+            VfPointsEdited = 2,
+            VfPointMaxOffsetMHz = 90,
+            GpuId = "NVIDIA core=999 mem=999\nGPU",   // hostile identity: spaces, fake fields, a newline
+        }.ToMarkerText();
+
+        Assert.StartsWith("offsets core=-25 mem=800 ", text, StringComparison.Ordinal);
+        Assert.DoesNotContain('\n', text);
+        string[] parts = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        Assert.Single(parts, p => p.StartsWith("core=", StringComparison.Ordinal));
+        Assert.Single(parts, p => p.StartsWith("mem=", StringComparison.Ordinal));
+
+        var parsed = FlightTuning.Parse(text);
+        Assert.Equal(-25, parsed.CoreOffsetMHz);
+        Assert.Equal(800, parsed.MemOffsetMHz);
+        Assert.True(parsed.LockRecorded);
+        Assert.Null(parsed.LockedCoreClockMHz);
+        Assert.Equal("NVIDIA_core=999_mem=999_GPU", parsed.GpuId);
+    }
+
+    [Fact]
+    public void A_recording_from_before_the_tuning_line_reads_its_lock_and_curve_as_not_recorded()
+    {
+        // Existing recordings stay readable — and honest: their offsets are
+        // known, but "no lock field" means the lock was never recorded, not
+        // that there was none.
+        var session = FlightSession.Parse(["#flight v1 started=1", "#1000 offsets core=0 mem=0", "2000|300|405|40|40|30|2|700|30"]);
+
+        Assert.NotNull(session.Tuning);
+        Assert.False(session.Tuning.LockRecorded);
+        Assert.Null(session.Tuning.VfPointsEdited);
+        Assert.False(session.Tuning.FullyRecorded);
+
+        var evidence = CrashForensics.BuildEvidence(
+            session, session.EndedAt!.Value, new CrashForensics.EventEvidence(true, 0, true, 0, 0, 0));
+        Assert.False(evidence.TuningFullyRecorded);
+
+        var verdict = CrashClassifier.Classify(evidence);
+        Assert.NotNull(verdict);
+        Assert.DoesNotContain("not implicated", verdict.Recommendation, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void A_later_tuning_line_does_not_inherit_an_earlier_lock()
+    {
+        var session = FlightSession.Parse(
+        [
+            "#1000 offsets core=0 mem=0 lock=1500 vf=0 gpu=GPU-A",
+            "#2000 offsets core=0 mem=0 lock=none vf=0 gpu=GPU-A",
+        ]);
+
+        Assert.True(session.Tuning?.LockRecorded);
+        Assert.Null(session.Tuning?.LockedCoreClockMHz);
+        Assert.False(session.Tuning?.AnyApplied);
+    }
+
+    [Fact]
     public void An_older_segment_from_a_session_that_is_not_the_previous_one_is_dropped()
     {
         Directory.CreateDirectory(_dir);

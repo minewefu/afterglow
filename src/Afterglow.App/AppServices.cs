@@ -361,8 +361,22 @@ public sealed class AppServices : IDisposable
 
         if (flights.Count > 0)
         {
-            var tunersByIndex = manager.Gpus.ToDictionary(g => g.Index, g => g.Tuner);
-            var flightTicks = new Dictionary<uint, int>();
+            // Each card's tuning reaches its recording the moment any writer
+            // changes it — page, hotkey, game rule, stepper, certifier, probe,
+            // TDR watchdog — with the clock lock, the V/F-point edits and the
+            // card's identity (R-43). The once-a-minute offsets-only sample
+            // missed a profile applied just before a crash and never saw a
+            // lock or a per-point edit. Each sampler also re-reads on a fixed
+            // period, for writes made by another process (CLI, MCP).
+            var tuningSamplers = new Dictionary<uint, Core.Diagnostics.TuningFlightSampler>();
+            foreach (var gpu in manager.Gpus)
+            {
+                if (flights.TryGetValue(gpu.Index, out var gpuFlight))
+                {
+                    tuningSamplers[gpu.Index] = new Core.Diagnostics.TuningFlightSampler(gpu.Tuner, gpuFlight, gpu.StableKey);
+                }
+            }
+
             telemetry.SnapshotTaken += snapshot =>
             {
                 if (!flights.TryGetValue(snapshot.DeviceIndex, out var recorder))
@@ -371,21 +385,9 @@ public sealed class AppServices : IDisposable
                 }
 
                 recorder.Record(snapshot);
-
-                // Offsets change rarely; sample once a minute per card so
-                // CLI-applied tuning is captured too (dedup inside the recorder).
-                flightTicks.TryGetValue(snapshot.DeviceIndex, out int tick);
-                flightTicks[snapshot.DeviceIndex] = tick + 1;
-                if (tick % 60 == 0 && tunersByIndex.TryGetValue(snapshot.DeviceIndex, out var tuner))
+                if (tuningSamplers.TryGetValue(snapshot.DeviceIndex, out var sampler))
                 {
-                    try
-                    {
-                        var current = tuner.ReadCurrent();
-                        recorder.RecordOffsets(current.CoreOffsetMHz, current.MemOffsetMHz);
-                    }
-                    catch (InvalidOperationException)
-                    {
-                    }
+                    sampler.OnSnapshot(snapshot.Timestamp);
                 }
             };
         }
