@@ -183,16 +183,31 @@ public static partial class StressAdapter
     }
 
     /// <summary>
-    /// The vendor an unbound stress run should target: NVIDIA when any NVIDIA
-    /// adapter exists (the historical largest-VRAM fallback), and Intel only
-    /// when Intel is the sole hardware GPU vendor on the machine. Everything
-    /// else returns NVIDIA so the historical loud refusal fires instead of a
-    /// silent retarget — that covers AMD-plus-iGPU laptops, a disabled or
-    /// TDR-dropped NVIDIA card that is absent from DXGI but still present on
-    /// the PCI bus (checked via the documented cfgmgr32 device list), and any
-    /// failure of the queries themselves. No driver stack is initialized.
+    /// The vendor an unbound stress run targets, as <see cref="ResolveDefaultVendor"/>
+    /// decides it, for callers that cannot show its refusal: a refused choice
+    /// returns NVIDIA, so on a machine without an NVIDIA adapter the engines
+    /// refuse ("No NVIDIA adapter found") rather than burn the Intel one.
     /// </summary>
-    public static uint DetectDefaultVendor()
+    public static uint DetectDefaultVendor() => ResolveDefaultVendor().VendorId;
+
+    /// <summary>
+    /// The vendor an unbound stress run (no card named) should target: NVIDIA
+    /// when DXGI shows an NVIDIA adapter (the historical largest-VRAM fallback),
+    /// and Intel only when Intel is the sole hardware vendor in DXGI AND the
+    /// documented cfgmgr32 PCI device list confirms no NVIDIA card is present.
+    /// <para>
+    /// The list is what catches a disabled or TDR-dropped NVIDIA card, which
+    /// DXGI no longer shows. When it lists one, or when the list can't be read
+    /// at all, the run is refused with a reason (R2-D): it used to treat a
+    /// failed query as "no NVIDIA card" and test the Intel adapter. Every other
+    /// case returns NVIDIA without a reason, so the engines' historical "No
+    /// NVIDIA adapter found" refusal fires — AMD-plus-iGPU laptops, and a
+    /// machine whose DXGI shows no hardware adapter. A DXGI failure also returns
+    /// NVIDIA: the engine hits the same failure and reports it. No driver stack
+    /// is initialized.
+    /// </para>
+    /// </summary>
+    public static DefaultVendorChoice ResolveDefaultVendor()
     {
         try
         {
@@ -214,20 +229,49 @@ public static partial class StressAdapter
         {
             // The engine worker will hit (and cleanly report) the same DXGI
             // failure through its historical NVIDIA path.
-            return NvidiaVendorId;
+            return DefaultVendorChoice.Vendor(NvidiaVendorId);
         }
     }
+
+    /// <summary>
+    /// What <see cref="ResolveDefaultVendor"/> decided: the vendor an unbound
+    /// run targets, or — when <see cref="Refusal"/> is set — why no adapter can
+    /// be picked without guessing. The reason says what was found, not what to
+    /// do: each surface adds how to name a card there (CLI `--gpu N`). A refused
+    /// choice still carries NVIDIA, so a caller that ignores the reason fails
+    /// closed through the engines' "No NVIDIA adapter found" refusal.
+    /// </summary>
+    public readonly record struct DefaultVendorChoice(uint VendorId, string? Refusal)
+    {
+        public static DefaultVendorChoice Vendor(uint vendorId) => new(vendorId, null);
+
+        public static DefaultVendorChoice Refused(string reason) => new(NvidiaVendorId, reason);
+    }
+
+    /// <summary>The reason given when the PCI device list can't be read (R2-D).</summary>
+    internal const string DeviceListUnreadableReason =
+        "No GPU was named, and Afterglow can't tell which one to test: DirectX shows Intel graphics and no NVIDIA " +
+        "adapter, but Windows' list of PCI devices couldn't be read, so a disabled or driver-reset NVIDIA card " +
+        "can't be ruled out. Testing the Intel adapter would be a guess, so the run is refused.";
+
+    /// <summary>The reason given when the PCI device list shows an NVIDIA card DirectX doesn't.</summary>
+    internal const string NvidiaHiddenFromDirectXReason =
+        "No GPU was named, and Afterglow won't guess which one to test: Windows lists an NVIDIA card that " +
+        "DirectX doesn't show (it may be disabled, or its driver may have failed or reset), so testing the " +
+        "Intel adapter instead could stamp a result on the wrong card. The run is refused.";
 
     /// <summary>One DXGI adapter as the default-vendor policy sees it (Software = WARP / Basic Render Driver).</summary>
     internal readonly record struct AdapterVendor(uint VendorId, bool Software);
 
     /// <summary>
-    /// The default-vendor policy of <see cref="DetectDefaultVendor"/>, separated
+    /// The default-vendor policy of <see cref="ResolveDefaultVendor"/>, separated
     /// from DXGI and the PnP query so it can be tested without this machine's
     /// devices. <paramref name="nvidiaPresentOnPciBus"/> is only asked when
-    /// DXGI shows Intel as the sole hardware vendor.
+    /// DXGI shows Intel as the sole hardware vendor; null means the device list
+    /// couldn't be read.
     /// </summary>
-    internal static uint ChooseDefaultVendor(IEnumerable<AdapterVendor> adapters, Func<bool> nvidiaPresentOnPciBus)
+    internal static DefaultVendorChoice ChooseDefaultVendor(
+        IEnumerable<AdapterVendor> adapters, Func<bool?> nvidiaPresentOnPciBus)
     {
         bool intelSeen = false;
         bool otherHardwareSeen = false;
@@ -240,21 +284,36 @@ public static partial class StressAdapter
 
             if (adapter.VendorId == NvidiaVendorId)
             {
-                return NvidiaVendorId;
+                return DefaultVendorChoice.Vendor(NvidiaVendorId);
             }
 
             intelSeen |= adapter.VendorId == IntelVendorId;
             otherHardwareSeen |= adapter.VendorId != IntelVendorId;
         }
 
-        return intelSeen && !otherHardwareSeen && !nvidiaPresentOnPciBus()
-            ? IntelVendorId
-            : NvidiaVendorId;
+        if (!intelSeen || otherHardwareSeen)
+        {
+            return DefaultVendorChoice.Vendor(NvidiaVendorId);
+        }
+
+        // Fail closed (R2-D): "couldn't ask" is not "no NVIDIA card". The doc
+        // promised NVIDIA for a failed query, but a failed query returned false
+        // and the run went to the Intel adapter.
+        return nvidiaPresentOnPciBus() switch
+        {
+            false => DefaultVendorChoice.Vendor(IntelVendorId),
+            true => DefaultVendorChoice.Refused(NvidiaHiddenFromDirectXReason),
+            null => DefaultVendorChoice.Refused(DeviceListUnreadableReason),
+        };
     }
 
-    // cfgmgr32.h (Windows SDK 10.0.26100): CM_GETIDLIST_FILTER_ENUMERATOR, CM_GETIDLIST_FILTER_PRESENT.
+    // cfgmgr32.h (Windows SDK 10.0.26100): CM_GETIDLIST_FILTER_ENUMERATOR, CM_GETIDLIST_FILTER_PRESENT, CR_BUFFER_SMALL.
     internal const uint CmGetIdListFilterEnumerator = 0x1;
     internal const uint CmGetIdListFilterPresent = 0x100;
+    internal const int CrBufferSmall = 0x1A;
+
+    /// <summary>Size-then-list rounds before a list that keeps growing counts as unreadable.</summary>
+    private const int DeviceListAttempts = 3;
 
     /// <summary>
     /// The flags both configuration-manager calls pass: PCI-enumerated devices
@@ -274,31 +333,45 @@ public static partial class StressAdapter
     internal delegate int DeviceIdList(string filter, char[] buffer, uint bufferLength, uint flags);
 
     /// <summary>
-    /// True when any NVIDIA PCI device is present per the PnP device list —
-    /// a disabled or driver-failed card is still listed there even when DXGI
-    /// no longer enumerates it, and an unbound run must refuse loudly rather
-    /// than silently retarget the iGPU in that state.
+    /// Whether any NVIDIA PCI device is present per the PnP device list — a
+    /// disabled or driver-failed card is still listed there even when DXGI no
+    /// longer enumerates it, and an unbound run must refuse loudly rather than
+    /// silently retarget the iGPU in that state. Null when the list can't be
+    /// read: a failed call, a size of zero (not even the list's terminator, on a
+    /// machine whose Intel GPU is itself a PCI device), a list that kept growing
+    /// past every retry, or cfgmgr32 missing. A null used to be false, which
+    /// sent the run to the Intel adapter (R2-D).
     /// </summary>
-    internal static bool NvidiaPresentOnPciBus(DeviceIdListSize getSize, DeviceIdList getList)
+    internal static bool? NvidiaPresentOnPciBus(DeviceIdListSize getSize, DeviceIdList getList)
     {
         try
         {
-            if (getSize(out uint length, "PCI", PciDeviceListFlags) != 0 || length == 0)
+            // The documented pattern: a device arriving between the two calls
+            // makes the list CR_BUFFER_SMALL, so size it again and retry.
+            for (int attempt = 0; attempt < DeviceListAttempts; attempt++)
             {
-                return false;
+                if (getSize(out uint length, "PCI", PciDeviceListFlags) != 0 || length == 0)
+                {
+                    return null;
+                }
+
+                var buffer = new char[length];
+                int result = getList("PCI", buffer, length, PciDeviceListFlags);
+                if (result == CrBufferSmall)
+                {
+                    continue;
+                }
+
+                return result == 0
+                    ? new string(buffer).Contains("VEN_10DE", StringComparison.OrdinalIgnoreCase)
+                    : null;
             }
 
-            var buffer = new char[length];
-            if (getList("PCI", buffer, length, PciDeviceListFlags) != 0)
-            {
-                return false;
-            }
-
-            return new string(buffer).Contains("VEN_10DE", StringComparison.OrdinalIgnoreCase);
+            return null;
         }
-        catch (DllNotFoundException)
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
         {
-            return false;
+            return null;
         }
     }
 

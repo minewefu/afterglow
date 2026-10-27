@@ -192,6 +192,15 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
     [ObservableProperty] public partial bool StartWithWindows { get; set; }
     [ObservableProperty] public partial string StartWithWindowsNote { get; set; } = string.Empty;
 
+    /// <summary>
+    /// What the logon task means for the signed-in account (R2-A): on a standard
+    /// account it can only start Afterglow unelevated, so Windows asks for an
+    /// administrator's password at every sign-in. Shown whether the switch is on
+    /// or off, and kept apart from <see cref="StartWithWindowsNote"/>, which a
+    /// successful toggle clears.
+    /// </summary>
+    [ObservableProperty] public partial string StartWithWindowsAccountNote { get; set; } = string.Empty;
+
     public System.Collections.ObjectModel.ObservableCollection<AutomationRule> AutomationRules { get; } = [];
 
     [ObservableProperty] public partial int NewAutoMetricIndex { get; set; }
@@ -375,6 +384,12 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
             StartupProfileNote = string.Empty;
             _services.UpdateSettings(s => s with { ApplyProfileOnStart = null });
         }
+        else
+        {
+            // Re-read on every visit: the profile may have been re-certified,
+            // marked stable or edited on the Profiles page since.
+            UpdateStartupProfileNote(SelectedStartupProfile);
+        }
     }
 
     partial void OnStartWithWindowsChanged(bool value)
@@ -432,19 +447,30 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
         }
 
         string? chosen = value == "(none)" ? null : value;
-        if (chosen is not null)
-        {
-            var profile = _services.Profiles.Load(chosen);
-            StartupProfileNote = profile is { MarkedStable: false }
-                ? "This profile isn't marked stable yet — it won't actually apply at startup until you validate it (Stability page) and press 'Mark stable' in Profiles."
-                : string.Empty;
-        }
-        else
-        {
-            StartupProfileNote = string.Empty;
-        }
-
+        UpdateStartupProfileNote(value);
         _services.UpdateSettings(s => s with { ApplyProfileOnStart = chosen });
+    }
+
+    /// <summary>
+    /// The note under the startup-profile picker. Computed when the page loads
+    /// and on every visit as well as on a change, so it describes the profile
+    /// startup will actually use — it used to appear only right after picking.
+    /// </summary>
+    private void UpdateStartupProfileNote(string? selection)
+    {
+        var profile = selection is null or "(none)" ? null : _services.Profiles.Load(selection);
+        StartupProfileNote = profile switch
+        {
+            null => string.Empty,
+            { MarkedStable: false } =>
+                "This profile isn't marked stable yet — it won't actually apply at startup until you validate it (Stability page) and press 'Mark stable' in Profiles.",
+
+            // R2-B: still applied (it is marked stable), and the tray says the
+            // same once per launch when it is.
+            _ => Core.Profiles.StartupProfileNotice.OlderStressTestNote(profile) is { } note
+                ? $"{note} It still applies at startup, because it's marked stable."
+                : string.Empty,
+        };
     }
 
     private void LoadFrom(AppSettings s)
@@ -474,10 +500,14 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
         OverlayShowClock = s.Overlay.ShowClock;
         OverlayShowVram = s.Overlay.ShowVram;
         OverlayShowFan = s.Overlay.ShowFan;
-        SelectedStartupProfile = s.ApplyProfileOnStart is { } startup && StartupProfileOptions.Contains(startup)
-            ? startup
+        // Matched the way startup resolves it (ProfileStore.Load ignores case),
+        // so the picker never shows "(none)" for a profile startup applies.
+        SelectedStartupProfile = s.ApplyProfileOnStart is { } startup
+            ? StartupProfileOptions.Skip(1).FirstOrDefault(
+                  name => string.Equals(name, startup, StringComparison.OrdinalIgnoreCase)) ?? "(none)"
             : "(none)";
         _loading = false;
+        UpdateStartupProfileNote(SelectedStartupProfile);
     }
 
     /// <summary>
@@ -491,8 +521,13 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
     private async Task LoadStartupTaskStateAsync()
     {
         _startupTaskQueryPending = true;
-        var (enabled, note) = await Task.Run(() =>
+        var (enabled, note, accountNote) = await Task.Run(() =>
         {
+            // R2-A: who the task would start Afterglow for decides whether it
+            // can start elevated at all. Off the UI thread: a domain account's
+            // group lookup can wait on a domain controller.
+            string? standardAccount = Core.Security.AdministratorMembership.StartWithWindowsNote(
+                Core.Security.AdministratorMembership.IsSignedInUserAdministrator());
             bool exists = Services.StartupTaskService.IsEnabled();
 
             // A task registered before the location check existed (or from a copy
@@ -507,8 +542,12 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
                   $"administrator-only: {untrusted.Reason}. Anything able to replace the exe would inherit those " +
                   "rights at logon. Turn this off, or reinstall into Program Files with the setup .exe."
                 : null;
-            return (exists, warning);
+            return (exists, warning, standardAccount);
         }).ConfigureAwait(true);
+
+        // Not tied to the switch's state, so it lands even when the user
+        // answered first.
+        StartWithWindowsAccountNote = accountNote ?? string.Empty;
 
         if (!_startupTaskQueryPending)
         {

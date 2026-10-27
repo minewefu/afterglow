@@ -39,8 +39,9 @@
                             </Grid.ColumnDefinitions>
                             <StackPanel Margin="0,0,24,0">
                                 <TextBlock Text="Start with Windows" Style="{StaticResource RowTitle}" />
-                                <TextBlock Text="Runs elevated through Task Scheduler, so there is no UAC prompt at sign-in."
+                                <TextBlock Text="Starts Afterglow at sign-in through Task Scheduler. On an administrator account it runs elevated, with no UAC prompt."
                                            Style="{StaticResource RowHint}" />
+                                <TextBlock Text="{Binding StartWithWindowsAccountNote}" Style="{StaticResource WarnNote}" Margin="0,4,0,0" />
                                 <TextBlock Text="{Binding StartWithWindowsNote}" Style="{StaticResource WarnNote}" Margin="0,4,0,0" />
                             </StackPanel>
                             <CheckBox Grid.Column="1" Style="{StaticResource ToggleSwitch}" VerticalAlignment="Center"

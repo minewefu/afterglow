@@ -110,7 +110,6 @@ public class ProfileTests : IDisposable
     [InlineData("Game: Quiet", "Game_ Quiet")]
     [InlineData("Game_ Quiet", "Game: Quiet")]
     [InlineData("a/b", "a\\b")]
-    [InlineData("Quiet", "quiet")]
     public void A_name_whose_file_holds_another_profile_is_refused(string first, string second)
     {
         var store = new ProfileStore(_dir);
@@ -126,6 +125,85 @@ public class ProfileTests : IDisposable
         Assert.Equal(first, Assert.Single(store.LoadAll()).Name);
         Assert.False(store.Delete(second));
         Assert.Equal(100, store.Load(first)?.CoreOffsetMHz);
+    }
+
+    [Fact]
+    public void Saving_a_name_that_differs_only_in_case_is_still_refused()
+    {
+        // R-25: 'Quiet' and 'quiet' share one file on NTFS, so the second save
+        // would replace the first. The case-insensitive lookup below doesn't
+        // change that: the existing profile keeps its name and its tuning.
+        var store = new ProfileStore(_dir);
+        store.Save(new TuningProfile { Name = "Quiet", CoreOffsetMHz = 100 });
+
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => store.Save(new TuningProfile { Name = "quiet", CoreOffsetMHz = 500 }));
+        Assert.Contains("'Quiet'", ex.Message, StringComparison.Ordinal);
+
+        var only = Assert.Single(store.LoadAll());
+        Assert.Equal("Quiet", only.Name);
+        Assert.Equal(100, only.CoreOffsetMHz);
+    }
+
+    [Theory]
+    [InlineData("quiet")]
+    [InlineData("QUIET")]
+    [InlineData("qUiEt")]
+    public void A_lookup_that_differs_only_in_case_finds_the_stored_profile(string requested)
+    {
+        // Decision C: after R-25, Load and Delete wanted the exact stored name,
+        // so `certify --profile quiet` no longer found "Quiet". Windows file
+        // names ignore case and Save refuses a second name that differs only in
+        // case (above), so the match is never ambiguous: there is one profile.
+        var store = new ProfileStore(_dir);
+        store.Save(new TuningProfile { Name = "Quiet", CoreOffsetMHz = 100 });
+
+        var loaded = store.Load(requested);
+
+        Assert.NotNull(loaded);
+        Assert.Equal("Quiet", loaded.Name);
+        Assert.Equal(100, loaded.CoreOffsetMHz);
+
+        Assert.True(store.Delete(requested));
+        Assert.Empty(store.LoadAll());
+        Assert.Empty(Directory.GetFiles(_dir, "*.json"));
+    }
+
+    [Theory]
+    [InlineData("Game_ Quiet", "game: quiet")]
+    [InlineData("Game_ Quiet", "GAME: QUIET")]
+    [InlineData("Game: Quiet", "game_ quiet")]
+    [InlineData("Game: Quiet", "GAME_ QUIET")]
+    public void A_case_insensitive_lookup_still_refuses_a_substitution_collision(string stored, string requested)
+    {
+        // Both names map to "Game_ Quiet.json": ':' can't be in a file name and
+        // becomes '_'. Ignoring case must not make them the same profile, or a
+        // reference to one would apply the other's tuning again (R-25).
+        Directory.CreateDirectory(_dir);
+        File.WriteAllText(
+            Path.Combine(_dir, "Game_ Quiet.json"), $$"""{ "name": "{{stored}}", "coreOffsetMHz": 500 }""");
+        var store = new ProfileStore(_dir);
+
+        Assert.Null(store.Load(requested));
+        Assert.False(store.Delete(requested));
+        Assert.Equal(500, store.Load(stored.ToUpperInvariant())?.CoreOffsetMHz);
+        Assert.Single(Directory.GetFiles(_dir, "*.json"));
+    }
+
+    [Fact]
+    public void A_case_only_collision_an_older_build_left_resolves_to_the_survivor()
+    {
+        // What a build before R-25 left after saving 'quiet' and then 'Quiet':
+        // one file, holding 'Quiet'. With case-insensitive lookup a reference
+        // to 'quiet' now reaches 'Quiet' — the only profile Windows can store
+        // under that name (decided: Windows treats the two as one name). Only
+        // collisions through character substitution still resolve to nothing.
+        Directory.CreateDirectory(_dir);
+        File.WriteAllText(Path.Combine(_dir, "quiet.json"), """{ "name": "Quiet", "coreOffsetMHz": 500 }""");
+        var store = new ProfileStore(_dir);
+
+        Assert.Equal("Quiet", store.Load("quiet")?.Name);
+        Assert.Equal(500, store.Load("quiet")?.CoreOffsetMHz);
     }
 
     [Fact]

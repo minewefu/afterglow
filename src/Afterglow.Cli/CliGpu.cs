@@ -116,7 +116,9 @@ internal static class CliGpu
     /// engines bind to the exact card being tuned. With no --gpu, the bus is
     /// null and the engines fall back to the target vendor's largest adapter —
     /// NVIDIA when one exists (the historical behavior, no driver stack
-    /// needed), otherwise Intel so an Intel-only machine tests its own GPU.
+    /// needed), otherwise Intel so an Intel-only machine tests its own GPU,
+    /// once Windows' device list confirms no NVIDIA card is present. When it
+    /// can't (R2-D), the run is refused with the reason and how to name a card.
     /// </summary>
     public static (uint? Bus, uint VendorId, string? Error) ResolveTarget(string[] args)
     {
@@ -130,7 +132,8 @@ internal static class CliGpu
 
         if (parsed is not { } index)
         {
-            return (null, Core.Stress.StressAdapter.DetectDefaultVendor(), null);
+            var fallback = Core.Stress.StressAdapter.ResolveDefaultVendor();
+            return (null, fallback.VendorId, fallback.Refusal is { } refusal ? UnboundRefusal(refusal) : null);
         }
 
         using var manager = new GpuManager();
@@ -149,4 +152,14 @@ internal static class CliGpu
 
         return (gpu.PciBusId, gpu.PciVendorId, null);
     }
+
+    /// <summary>
+    /// A refused unbound `stress`/`vram` run: the reason, then the explicit way
+    /// to pick the card. `--gpu N` binds by PCI vendor and bus through the GPU
+    /// driver, so it never needs the device list that failed; `--probe-adapter`
+    /// shows which index is which card without running a test.
+    /// </summary>
+    internal static string UnboundRefusal(string reason) =>
+        $"{reason} Name the card to test with --gpu N; 'afterglow-cli stress --probe-adapter' lists each GPU's " +
+        "index and the adapter it binds to, without running a test.";
 }

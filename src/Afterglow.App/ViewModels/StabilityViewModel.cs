@@ -60,13 +60,21 @@ public partial class StabilityViewModel : ObservableObject, IDisposable, ILivePa
             return;
         }
 
+        // No bound context (e.g. IGCL failed to init on an Arc machine):
+        // resolve the vendor the way an unbound CLI run would, refusal included.
+        var unbound = _gpu is null ? Core.Stress.StressAdapter.ResolveDefaultVendor() : default;
+        if (unbound.Refusal is { } refusal)
+        {
+            VramFailed = true;
+            VramStatusText = NoCardToPick(refusal);
+            return;
+        }
+
         _vram?.Dispose();
         _vram = new VramTest
         {
             TargetPciBusId = _gpu?.PciBusId,
-            // No bound context (e.g. IGCL failed to init on an Arc machine):
-            // resolve the vendor the way an unbound CLI run would.
-            TargetVendorId = _gpu?.PciVendorId ?? Core.Stress.StressAdapter.DetectDefaultVendor(),
+            TargetVendorId = _gpu?.PciVendorId ?? unbound.VendorId,
         };
         _vram.ProgressChanged += progress =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnVramProgress(progress));
@@ -275,13 +283,21 @@ public partial class StabilityViewModel : ObservableObject, IDisposable, ILivePa
             return;
         }
 
+        var unbound = _gpu is null ? Core.Stress.StressAdapter.ResolveDefaultVendor() : default;
+        if (unbound.Refusal is { } refusal)
+        {
+            StressFailed = true;
+            StressStatusText = NoCardToPick(refusal);
+            return;
+        }
+
         _stress?.Dispose();
         _stress = new GpuStressTest
         {
             IterationsPerDispatch = (uint)Intensity,
             Pattern = SelectedPattern,
             TargetPciBusId = _gpu?.PciBusId,
-            TargetVendorId = _gpu?.PciVendorId ?? Core.Stress.StressAdapter.DetectDefaultVendor(),
+            TargetVendorId = _gpu?.PciVendorId ?? unbound.VendorId,
         };
         _stress.ProgressChanged += progress =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnStressProgress(progress));
@@ -291,6 +307,16 @@ public partial class StabilityViewModel : ObservableObject, IDisposable, ILivePa
         _services.Flight?.Marker($"stress-start pattern={SelectedPattern}");
         _stress.Start();
     }
+
+    /// <summary>
+    /// A refused unbound run (R2-D). This page binds to the GPU picked at the top
+    /// of the window, so it only runs unbound when Afterglow detected no GPU at
+    /// all — and then there is no card to pick here; say so instead of naming one.
+    /// </summary>
+    private static string NoCardToPick(string refusal) =>
+        $"{refusal} There is no card to pick on this page: Afterglow hasn't detected a GPU it can bind the test " +
+        "to. Once it does (check the GPU driver, then restart Afterglow), tests run on the card it shows at the " +
+        "top of the window.";
 
     /// <summary>How long a burn must run before the word "stable" is earned.</summary>
     private static readonly TimeSpan MinimumVerdictTime = TimeSpan.FromSeconds(60);

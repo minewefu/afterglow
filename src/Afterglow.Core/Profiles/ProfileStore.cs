@@ -16,6 +16,12 @@ namespace Afterglow.Core.Profiles;
 /// keeps the mapping injective over the profiles actually stored without moving
 /// any file an earlier build wrote.
 /// </para>
+/// <para>
+/// Lookups ignore letter case, as Windows file names do: `certify --profile
+/// quiet` finds "Quiet". That is never ambiguous, because Save refuses a second
+/// name that differs only in case. A name that only collides through a
+/// substituted character ("Game: Quiet" and "Game_ Quiet") still finds nothing.
+/// </para>
 /// </summary>
 public sealed class ProfileStore
 {
@@ -125,9 +131,10 @@ public sealed class ProfileStore
     }
 
     /// <summary>
-    /// The profile named exactly <paramref name="name"/>, or null when there is
-    /// none — including when its file can't be read, is refused (untrusted
-    /// owner while elevated), or holds a different profile.
+    /// The profile named <paramref name="name"/>, ignoring letter case (see
+    /// <see cref="IsStoredName"/>), or null when there is none — including when
+    /// its file can't be read, is refused (untrusted owner while elevated), or
+    /// holds a different profile. The profile comes back under its stored name.
     /// </summary>
     public TuningProfile? Load(string name)
     {
@@ -148,9 +155,8 @@ public sealed class ProfileStore
             // same file — left by an older build that let the second save
             // replace the first. The startup profile, game rules and
             // automation resolve by name, so they must get nothing here, not
-            // that other profile's tuning. Ordinal: a reference made under one
-            // spelling never silently resolves to another.
-            if (profile is null || !string.Equals(profile.Name, name, StringComparison.Ordinal))
+            // that other profile's tuning.
+            if (profile is null || !IsStoredName(profile.Name, name))
             {
                 return null;
             }
@@ -208,14 +214,14 @@ public sealed class ProfileStore
     }
 
     /// <summary>
-    /// Deletes the profile named exactly <paramref name="name"/>. False when there
-    /// is none — a file that holds a different profile, or that can't be
-    /// identified, is left alone (R-25).
+    /// Deletes the profile named <paramref name="name"/>, ignoring letter case
+    /// (see <see cref="IsStoredName"/>). False when there is none — a file that
+    /// holds a different profile, or that can't be identified, is left alone (R-25).
     /// </summary>
     public bool Delete(string name)
     {
         string path = PathFor(name);
-        if (!File.Exists(path) || !string.Equals(StoredNameAt(path), name, StringComparison.Ordinal))
+        if (!File.Exists(path) || StoredNameAt(path) is not { } stored || !IsStoredName(stored, name))
         {
             return false;
         }
@@ -223,6 +229,23 @@ public sealed class ProfileStore
         File.Delete(path);
         return true;
     }
+
+    /// <summary>
+    /// Whether a lookup by <paramref name="requested"/> means the profile stored
+    /// as <paramref name="stored"/>: the same name, ignoring letter case.
+    /// <para>
+    /// Case alone can't tell two stored profiles apart — NTFS opens "quiet.json"
+    /// for "Quiet.json", and Save refuses a second name that differs only in case
+    /// (R-25) — so `certify --profile quiet` finding "Quiet" is never ambiguous.
+    /// Exact-case lookups made it miss instead. Anything else stays a different
+    /// name: "Game: Quiet" and "Game_ Quiet" share a file only because ':' is
+    /// replaced, and one must never resolve to the other's tuning. A profile an
+    /// older build already overwrote with a case variant resolves to that
+    /// survivor, the one profile Windows can hold under the name.
+    /// </para>
+    /// </summary>
+    private static bool IsStoredName(string stored, string requested) =>
+        string.Equals(stored, requested, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// The name recorded inside an existing profile file, read leniently: only

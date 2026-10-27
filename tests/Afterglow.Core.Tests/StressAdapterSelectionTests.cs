@@ -121,28 +121,61 @@ public class StressAdapterSelectionTests
     private static readonly StressAdapter.AdapterVendor IntelGpu = new(StressAdapter.IntelVendorId, Software: false);
     private static readonly StressAdapter.AdapterVendor BasicRender = new(MicrosoftVendorId, Software: true);
 
+    // cfgmgr32.h CONFIGRET values.
+    private const int CrFailure = 0x13;
+    private const int CrInvalidPointer = 0x3;
+
     /// <summary>
     /// A stand-in PnP device tree for the two cfgmgr32 calls: each device
     /// instance is present or only remembered (a "phantom" — a card that was
     /// removed, or an eGPU that is unplugged), and both calls honour
-    /// CM_GETIDLIST_FILTER_PRESENT the way the documented API does.
+    /// CM_GETIDLIST_FILTER_PRESENT the way the documented API does. It can also
+    /// fail the way the real calls can: an error code, a zero size, a missing
+    /// DLL or export, or devices arriving between the size and the list.
     /// </summary>
     private sealed class FakeDeviceTree(params (string Id, bool Present)[] devices)
     {
+        private readonly List<(string Id, bool Present)> _devices = [.. devices];
+
         public List<(string Call, string Filter, uint Flags)> Calls { get; } = [];
+
+        /// <summary>CONFIGRET of every size call (0 = CR_SUCCESS).</summary>
+        public int SizeResult { get; init; }
+
+        /// <summary>CONFIGRET of every list call whose buffer is big enough.</summary>
+        public int ListResult { get; init; }
+
+        /// <summary>Report a length of zero.</summary>
+        public bool ZeroLength { get; init; }
+
+        /// <summary>Thrown by both calls, as the marshaller does when cfgmgr32 or its export can't be loaded.</summary>
+        public Exception? Throws { get; init; }
+
+        /// <summary>One device arrives right after each size call while any are queued, so that list no longer fits.</summary>
+        public Queue<string> Arrivals { get; } = new();
 
         private string MultiSz(uint flags)
         {
             bool presentOnly = (flags & StressAdapter.CmGetIdListFilterPresent) != 0;
-            var ids = devices.Where(d => d.Present || !presentOnly).Select(d => d.Id + "\0");
+            var ids = _devices.Where(d => d.Present || !presentOnly).Select(d => d.Id + "\0");
             return string.Concat(ids) + "\0";
         }
 
         public int Size(out uint length, string filter, uint flags)
         {
             Calls.Add(("size", filter, flags));
-            length = (uint)MultiSz(flags).Length;
-            return 0;
+            if (Throws is { } ex)
+            {
+                throw ex;
+            }
+
+            length = ZeroLength ? 0 : (uint)MultiSz(flags).Length;
+            if (Arrivals.TryDequeue(out string? arrived))
+            {
+                _devices.Add((arrived, true));
+            }
+
+            return SizeResult;
         }
 
         public int List(string filter, char[] buffer, uint bufferLength, uint flags)
@@ -151,14 +184,19 @@ public class StressAdapterSelectionTests
             string list = MultiSz(flags);
             if (list.Length > bufferLength)
             {
-                return 0x1A;   // CR_BUFFER_SMALL
+                return StressAdapter.CrBufferSmall;
+            }
+
+            if (ListResult != 0)
+            {
+                return ListResult;
             }
 
             list.CopyTo(0, buffer, 0, list.Length);
             return 0;
         }
 
-        public bool NvidiaPresent() => StressAdapter.NvidiaPresentOnPciBus(Size, List);
+        public bool? NvidiaPresent() => StressAdapter.NvidiaPresentOnPciBus(Size, List);
     }
 
     [Fact]
@@ -170,9 +208,79 @@ public class StressAdapterSelectionTests
         // and refuse the working Intel adapter.
         var tree = new FakeDeviceTree((NvidiaInstance, Present: false), (IntelInstance, Present: true));
 
-        uint vendor = StressAdapter.ChooseDefaultVendor([IntelGpu, BasicRender], tree.NvidiaPresent);
+        var choice = StressAdapter.ChooseDefaultVendor([IntelGpu, BasicRender], tree.NvidiaPresent);
 
-        Assert.Equal(StressAdapter.IntelVendorId, vendor);
+        Assert.Equal(StressAdapter.IntelVendorId, choice.VendorId);
+        Assert.Null(choice.Refusal);
+    }
+
+    [Theory]
+    [InlineData("size call fails")]
+    [InlineData("list call fails")]
+    [InlineData("size is zero")]
+    [InlineData("cfgmgr32 missing")]
+    [InlineData("export missing")]
+    [InlineData("list keeps growing")]
+    public void A_device_list_that_cannot_be_read_refuses_instead_of_testing_intel(string failure)
+    {
+        // R2-D: DXGI shows only Intel, and Windows' PCI device list — the one
+        // thing that can reveal a disabled or TDR-dropped NVIDIA card — can't be
+        // read. Reading "couldn't ask" as "no NVIDIA card" sent an unbound run
+        // to the Intel adapter, the opposite of the documented fallback. Before
+        // the fix every row here picked Intel.
+        var tree = failure switch
+        {
+            "size call fails" => new FakeDeviceTree((IntelInstance, true)) { SizeResult = CrFailure },
+            "list call fails" => new FakeDeviceTree((IntelInstance, true)) { ListResult = CrInvalidPointer },
+            "size is zero" => new FakeDeviceTree((IntelInstance, true)) { ZeroLength = true },
+            "cfgmgr32 missing" => new FakeDeviceTree((IntelInstance, true)) { Throws = new DllNotFoundException("cfgmgr32.dll") },
+            "export missing" => new FakeDeviceTree((IntelInstance, true)) { Throws = new EntryPointNotFoundException("CM_Get_Device_ID_ListW") },
+            _ => new FakeDeviceTree((IntelInstance, true)),
+        };
+        if (failure == "list keeps growing")
+        {
+            for (int i = 0; i < 10; i++)
+            {
+                tree.Arrivals.Enqueue($@"PCI\VEN_8086&DEV_{i:X4}\HOTPLUG&{i}");
+            }
+        }
+
+        Assert.Null(tree.NvidiaPresent());
+
+        var choice = StressAdapter.ChooseDefaultVendor([IntelGpu, BasicRender], tree.NvidiaPresent);
+
+        // Fails closed: a reason to show, and NVIDIA for any caller that
+        // ignores it, so the engines find no NVIDIA adapter and refuse too.
+        Assert.Equal(StressAdapter.DeviceListUnreadableReason, choice.Refusal);
+        Assert.Equal(StressAdapter.NvidiaVendorId, choice.VendorId);
+        Assert.NotEqual(StressAdapter.IntelVendorId, choice.VendorId);
+    }
+
+    [Fact]
+    public void A_device_arriving_between_the_two_calls_is_asked_again_not_refused()
+    {
+        // The documented pattern for CM_Get_Device_ID_List: CR_BUFFER_SMALL
+        // means the list grew after it was sized, so size it and ask again.
+        // Now that an unreadable list refuses the run, a hot-plug race must not.
+        var tree = new FakeDeviceTree((IntelInstance, Present: true));
+        tree.Arrivals.Enqueue(@"PCI\VEN_8086&DEV_A0C8&SUBSYS_00008086&REV_00\3&11583659&0&FB");
+
+        var choice = StressAdapter.ChooseDefaultVendor([IntelGpu, BasicRender], tree.NvidiaPresent);
+
+        Assert.Equal(StressAdapter.IntelVendorId, choice.VendorId);
+        Assert.Null(choice.Refusal);
+        Assert.Equal(["size", "list", "size", "list"], tree.Calls.Select(c => c.Call));
+    }
+
+    [Fact]
+    public void A_refused_unbound_cli_run_says_how_to_name_the_card()
+    {
+        // `stress` and `vram` print this and exit 1 before loading anything.
+        string message = Afterglow.Cli.CliGpu.UnboundRefusal(StressAdapter.DeviceListUnreadableReason);
+
+        Assert.StartsWith(StressAdapter.DeviceListUnreadableReason, message, StringComparison.Ordinal);
+        Assert.Contains("--gpu N", message, StringComparison.Ordinal);
+        Assert.Contains("stress --probe-adapter", message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -202,9 +310,12 @@ public class StressAdapterSelectionTests
         // rather than silently burn the iGPU instead.
         var tree = new FakeDeviceTree((NvidiaInstance, Present: true), (IntelInstance, Present: true));
 
-        uint vendor = StressAdapter.ChooseDefaultVendor([IntelGpu, BasicRender], tree.NvidiaPresent);
+        var choice = StressAdapter.ChooseDefaultVendor([IntelGpu, BasicRender], tree.NvidiaPresent);
 
-        Assert.Equal(StressAdapter.NvidiaVendorId, vendor);
+        // Refused before anything loads, with a reason that names the cause
+        // (the engines' "No NVIDIA adapter found" never said there IS one).
+        Assert.Equal(StressAdapter.NvidiaVendorId, choice.VendorId);
+        Assert.Equal(StressAdapter.NvidiaHiddenFromDirectXReason, choice.Refusal);
     }
 
     [Fact]
@@ -212,11 +323,12 @@ public class StressAdapterSelectionTests
     {
         bool asked = false;
 
-        uint vendor = StressAdapter.ChooseDefaultVendor(
+        var choice = StressAdapter.ChooseDefaultVendor(
             [IntelGpu, new(StressAdapter.NvidiaVendorId, Software: false)],
             () => asked = true);
 
-        Assert.Equal(StressAdapter.NvidiaVendorId, vendor);
+        Assert.Equal(StressAdapter.NvidiaVendorId, choice.VendorId);
+        Assert.Null(choice.Refusal);
         Assert.False(asked);
     }
 
@@ -225,10 +337,13 @@ public class StressAdapterSelectionTests
     {
         var tree = new FakeDeviceTree((IntelInstance, Present: true));
 
-        uint vendor = StressAdapter.ChooseDefaultVendor(
+        var choice = StressAdapter.ChooseDefaultVendor(
             [IntelGpu, new(AmdVendorId, Software: false)], tree.NvidiaPresent);
 
-        Assert.Equal(StressAdapter.NvidiaVendorId, vendor);
+        // NVIDIA without a reason: the engines refuse ("No NVIDIA adapter found").
+        Assert.Equal(StressAdapter.NvidiaVendorId, choice.VendorId);
+        Assert.Null(choice.Refusal);
+        Assert.Empty(tree.Calls);
     }
 
     [Fact]
@@ -236,7 +351,9 @@ public class StressAdapterSelectionTests
     {
         var tree = new FakeDeviceTree();
 
-        Assert.Equal(StressAdapter.NvidiaVendorId, StressAdapter.ChooseDefaultVendor([BasicRender], tree.NvidiaPresent));
-        Assert.Equal(StressAdapter.NvidiaVendorId, StressAdapter.ChooseDefaultVendor([], tree.NvidiaPresent));
+        Assert.Equal(StressAdapter.DefaultVendorChoice.Vendor(StressAdapter.NvidiaVendorId),
+            StressAdapter.ChooseDefaultVendor([BasicRender], tree.NvidiaPresent));
+        Assert.Equal(StressAdapter.DefaultVendorChoice.Vendor(StressAdapter.NvidiaVendorId),
+            StressAdapter.ChooseDefaultVendor([], tree.NvidiaPresent));
     }
 }

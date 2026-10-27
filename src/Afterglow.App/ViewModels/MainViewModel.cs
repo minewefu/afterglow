@@ -807,9 +807,14 @@ public partial class MainViewModel : ObservableObject
             }
             else
             {
+                // Marked stable is what decides, even when its passes came from
+                // the burn before R-01's fix; that is only reported (R2-B), in
+                // this launch's one startup notice rather than a second alert.
                 var result = ApplyProfileFull(profile);
-                Core.Diagnostics.Log.Info($"Startup profile '{profileName}': {(result.AllSucceeded ? "applied" : "partial")}");
-                TrayAlert?.Invoke("Afterglow", $"Startup profile '{profileName}' applied.");
+                string? olderBurn = Core.Profiles.StartupProfileNotice.OlderStressTestNote(profile);
+                Core.Diagnostics.Log.Info($"Startup profile '{profileName}': {(result.AllSucceeded ? "applied" : "partial")}" +
+                                          (olderBurn is null ? string.Empty : $". {olderBurn}"));
+                TrayAlert?.Invoke("Afterglow", Core.Profiles.StartupProfileNotice.Applied(profile));
             }
         }
     }
