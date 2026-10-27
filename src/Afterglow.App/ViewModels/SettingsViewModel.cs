@@ -199,7 +199,12 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
     [ObservableProperty] public partial string NewAutoSeconds { get; set; } = "30";
     [ObservableProperty] public partial int NewAutoActionIndex { get; set; }
     [ObservableProperty] public partial string NewAutoFanPct { get; set; } = "85";
-    [ObservableProperty] public partial string NewAutoProfile { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Nullable because WPF writes null here whenever the picker's shared
+    /// options collection is rebuilt under it (R-39).
+    /// </summary>
+    [ObservableProperty] public partial string? NewAutoProfile { get; set; } = string.Empty;
 
     /// <summary>The fan-% box only applies to the fan action; the profile picker only to the profile action.</summary>
     public bool NewAutoActionIsFans => NewAutoActionIndex == 0;
@@ -215,8 +220,8 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
     [RelayCommand]
     private void AddAutomationRule()
     {
-        if (!double.TryParse(NewAutoThreshold, System.Globalization.NumberStyles.Float,
-                System.Globalization.CultureInfo.InvariantCulture, out double threshold) ||
+        // Finite thresholds only: "NaN", "Infinity" and "1e999" all parse (R-37).
+        if (!AutomationRuleInput.TryParseThreshold(NewAutoThreshold, out double threshold) ||
             !int.TryParse(NewAutoSeconds, System.Globalization.NumberStyles.Integer,
                 System.Globalization.CultureInfo.InvariantCulture, out int seconds))
         {
@@ -224,7 +229,8 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
         }
 
         string action = NewAutoActionIndex switch { 1 => "profile", 2 => "reset", _ => "fans" };
-        if (action == "profile" && (NewAutoProfile.Length == 0 || NewAutoProfile == "(none)"))
+        string? profile = NewAutoProfile;
+        if (action == "profile" && (string.IsNullOrEmpty(profile) || profile == "(none)"))
         {
             return;
         }
@@ -234,32 +240,40 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
             ? Math.Clamp(pct, 30u, 100u)
             : 85u;
 
-        AutomationRules.Add(new AutomationRule
+        var rule = new AutomationRule
         {
             Metric = NewAutoMetricIndex switch { 1 => "memjunction", 2 => "power", _ => "gpu" },
             Threshold = threshold,
             ForSeconds = Math.Clamp(seconds, 5, 3600),
             Action = action,
-            ActionProfile = action == "profile" ? NewAutoProfile : null,
+            ActionProfile = action == "profile" ? profile : null,
             ActionFanPct = fanPct,
-        });
-        PersistAutomationRules();
+        };
+
+        // Saved first, listed second: a rule that can't be saved never shows up
+        // as if it were (R-37).
+        PersistAutomationRules([.. AutomationRules, rule]);
+        AutomationRules.Add(rule);
     }
 
     [RelayCommand]
     private void RemoveAutomationRule(AutomationRule? rule)
     {
-        if (rule is not null && AutomationRules.Remove(rule))
+        if (rule is null)
         {
-            PersistAutomationRules();
+            return;
+        }
+
+        var remaining = AutomationRules.ToList();
+        if (remaining.Remove(rule))
+        {
+            PersistAutomationRules([.. remaining]);
+            AutomationRules.Remove(rule);
         }
     }
 
-    private void PersistAutomationRules()
-    {
-        var rules = AutomationRules.ToArray();
+    private void PersistAutomationRules(AutomationRule[] rules) =>
         _services.UpdateSettings(s => s with { AutomationRules = rules });
-    }
 
     [ObservableProperty] public partial double AlertGpuTemp { get; set; }
     [ObservableProperty] public partial double AlertMemTemp { get; set; }
@@ -333,6 +347,11 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
     {
         string previous = SelectedStartupProfile;
 
+        // Clear() takes the selected item away from both pickers, and WPF writes
+        // null back through each SelectedItem binding — the automation one too,
+        // which used to stay null and fail the next "Add rule" (R-39).
+        string? previousAutomation = NewAutoProfile;
+
         _loading = true;
         StartupProfileOptions.Clear();
         StartupProfileOptions.Add("(none)");
@@ -343,6 +362,9 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
 
         bool stillExists = StartupProfileOptions.Contains(previous);
         SelectedStartupProfile = stillExists ? previous : "(none)";
+        NewAutoProfile = previousAutomation is not null && StartupProfileOptions.Contains(previousAutomation)
+            ? previousAutomation
+            : string.Empty;
         _loading = false;
 
         if (!stillExists && previous != "(none)")

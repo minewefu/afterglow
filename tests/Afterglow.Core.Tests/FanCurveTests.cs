@@ -97,4 +97,16 @@ public class FanCurveTests
         Assert.Null(new FanCurveConfig { Points = [new(40, 0), new(90, 30)], ZeroRpmBelowC = 60 }.Validate());
         Assert.Null(new FanCurveConfig().Validate());
     }
+
+    [Fact]
+    public void Validate_rejects_nonfinite_numbers()
+    {
+        // NaN compares false against every bound, so the range and ordering
+        // checks alone passed it as "in range" and "increasing".
+        Assert.NotNull(new FanCurveConfig { Points = [new(40, 30), new(double.NaN, 50), new(90, 100)] }.Validate());
+        Assert.NotNull(new FanCurveConfig { Points = [new(40, 30), new(60, double.NaN), new(90, 100)] }.Validate());
+        Assert.NotNull(new FanCurveConfig { Points = [new(40, 30), new(90, 100)], HysteresisC = double.NaN }.Validate());
+        Assert.NotNull(new FanCurveConfig { Points = [new(40, 30), new(90, 100)], ZeroRpmHysteresisC = double.NaN }.Validate());
+        Assert.NotNull(new FanCurveConfig { Points = [new(40, 30), new(90, 100)], ZeroRpmBelowC = double.NaN }.Validate());
+    }
 }

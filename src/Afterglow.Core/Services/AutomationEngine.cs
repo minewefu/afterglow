@@ -29,9 +29,37 @@ public sealed class AutomationEngine
 
     private Entry[] _entries = [];
 
+    /// <summary>
+    /// Replaces the rule set. Every settings save hands the rules over again —
+    /// a polling, overlay or alert edit included — so an unchanged rule keeps
+    /// its entry, breach timers and cooldowns with it; rebuilding them all let
+    /// a rule fire again seconds into its five-minute cooldown, and postponed
+    /// a breach that was about to act (R-38). Rules match by value, so the
+    /// fresh instances read back from saved settings still count as unchanged;
+    /// each old entry is claimed at most once, so two identical rules keep two
+    /// histories. A changed or removed rule loses its state.
+    /// </summary>
     public void UpdateRules(IReadOnlyList<AutomationRule> rules)
     {
-        _entries = [.. rules.Select(rule => new Entry { Rule = rule })];
+        // Entries are shared with an Evaluate that may be running on the
+        // telemetry thread; only Evaluate touches their dictionaries.
+        var unclaimed = _entries.ToList();
+        var entries = new Entry[rules.Count];
+        for (int i = 0; i < rules.Count; i++)
+        {
+            int match = unclaimed.FindIndex(entry => entry.Rule == rules[i]);
+            if (match >= 0)
+            {
+                entries[i] = unclaimed[match];
+                unclaimed.RemoveAt(match);
+            }
+            else
+            {
+                entries[i] = new Entry { Rule = rules[i] };
+            }
+        }
+
+        _entries = entries;
     }
 
     public IReadOnlyList<AutomationEvent> Evaluate(GpuSnapshot snapshot, DateTimeOffset now)
