@@ -47,6 +47,11 @@ public sealed class FanControlServiceTests : IDisposable
 
         public ManualResetEventSlim? SetEntered { get; set; }
 
+        /// <summary>When set, a release blocks until this opens: a driver call that does not come back.</summary>
+        public ManualResetEventSlim? HoldRestore { get; set; }
+
+        public ManualResetEventSlim? RestoreEntered { get; set; }
+
         public NvmlReturn SetAllFans(uint duty)
         {
             SetCalls.Add(duty);
@@ -79,6 +84,8 @@ public sealed class FanControlServiceTests : IDisposable
         public NvmlReturn RestoreAuto()
         {
             RestoreCalls++;
+            RestoreEntered?.Set();
+            HoldRestore?.Wait(TimeSpan.FromSeconds(30));
             if (RestoreResult == NvmlReturn.Success)
             {
                 Array.Clear(Coolers);
@@ -246,16 +253,16 @@ public sealed class FanControlServiceTests : IDisposable
     public void A_card_with_no_fan_control_leaves_no_record_after_a_refused_write()
     {
         // The other side of R-06: every write to a card with no fan interface
-        // (Arc) is refused as NotSupported. Treating that as a possible
-        // takeover sends one harmless release at shutdown, and the release's
-        // NotSupported must not be persisted as fans left in manual control.
+        // (Arc) is refused as NotSupported. That answer says no fan moved, so
+        // it is not a possible takeover: shutdown has nothing to release and
+        // sends nothing, and nothing is persisted as fans left in manual control.
         var driver = new FakeDriver { SetResult = NvmlReturn.NotSupported, RestoreResult = NvmlReturn.NotSupported };
         using var service = Service(driver);
 
         Assert.False(service.SetFixed(50));
 
         Assert.True(service.ReleaseForShutdown());
-        Assert.Equal(1, driver.RestoreCalls);
+        Assert.Equal(0, driver.RestoreCalls);
         Assert.Null(AppliedStateStore.Load(Uuid));
     }
 
@@ -332,6 +339,91 @@ public sealed class FanControlServiceTests : IDisposable
         Assert.Equal(1, driver.RestoreCalls);
         Assert.Equal(new uint?[] { null, null }, driver.Coolers);
         Assert.Null(service.CommandedDuty);
+    }
+
+    [Fact]
+    public async Task A_fan_command_stuck_in_the_driver_does_not_hang_the_shutdown_release()
+    {
+        // R-07 made shutdown wait for a fan command already inside the driver,
+        // with no limit: a native call that never returned hung Afterglow's
+        // exit, and the mutexes after it. The wait is bounded now. Past it,
+        // nothing more is sent to that card, and the release reports failure on
+        // record, so the session is not stamped clean and the next launch warns.
+        var ct = TestContext.Current.CancellationToken;
+        using var hold = new ManualResetEventSlim(false);
+        using var entered = new ManualResetEventSlim(false);
+        var driver = new FakeDriver { HoldSet = hold, SetEntered = entered };
+        var service = Service(driver);
+        service.SetCurve(LinearCurve());
+        AppliedStateStore.MarkCleanShutdown();   // a session that had ended cleanly until this write
+
+        var tick = Task.Run(() => service.OnSnapshot(Snapshot(70)), ct);
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10), ct), "the curve never wrote");
+
+            var release = Task.Run(() => service.ReleaseForShutdown(TimeSpan.FromMilliseconds(300)), ct);
+            Assert.False(await release.WaitAsync(TimeSpan.FromSeconds(5), ct));
+
+            Assert.Equal(0, driver.RestoreCalls);
+            Assert.True(service.DriverHung);
+            var record = AppliedStateStore.Load(Uuid);
+            Assert.NotNull(record);
+            Assert.Equal("fixed", record.FanMode);
+            Assert.Null(record.FanDuty);   // whether the stuck write landed is unknown
+            Assert.False(record.CleanShutdown);
+
+            // "Firmware (auto)" racing the exit is refused instead of queueing behind the stuck write.
+            var auto = Task.Run(service.SetAuto, ct);
+            Assert.False(await auto.WaitAsync(TimeSpan.FromSeconds(5), ct));
+            Assert.Equal(0, driver.RestoreCalls);
+        }
+        finally
+        {
+            hold.Set();
+            await tick.WaitAsync(TimeSpan.FromSeconds(10), ct);
+        }
+
+        // The write landing late cannot turn the decision into a clean hand-back,
+        // and asking again does not go back to the driver.
+        Assert.False(service.ReleaseForShutdown());
+        Assert.Equal(0, driver.RestoreCalls);
+    }
+
+    [Fact]
+    public async Task A_release_stuck_in_the_driver_does_not_hang_the_shutdown_release()
+    {
+        // The release itself is a driver call too: with nothing in flight, a
+        // driver that stopped answering hung exit inside it instead.
+        var ct = TestContext.Current.CancellationToken;
+        using var hold = new ManualResetEventSlim(false);
+        using var entered = new ManualResetEventSlim(false);
+        var driver = new FakeDriver();
+        var service = Service(driver);
+        Assert.True(service.SetFixed(40));
+        AppliedStateStore.MarkCleanShutdown();   // only the outcome below may make it unclean
+        driver.HoldRestore = hold;
+        driver.RestoreEntered = entered;
+        try
+        {
+            var release = Task.Run(() => service.ReleaseForShutdown(TimeSpan.FromMilliseconds(300)), ct);
+            Assert.False(await release.WaitAsync(TimeSpan.FromSeconds(5), ct));
+
+            Assert.True(service.DriverHung);
+            var record = AppliedStateStore.Load(Uuid)!;
+            Assert.Equal("fixed", record.FanMode);
+            Assert.Equal(40u, record.FanDuty);
+            Assert.False(record.CleanShutdown);
+
+            // "Firmware (auto)" racing the exit is refused instead of joining the stuck call.
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10), ct), "the release never reached the driver");
+            Assert.False(service.SetAuto());
+            Assert.Equal(1, driver.RestoreCalls);
+        }
+        finally
+        {
+            hold.Set();
+        }
     }
 
     [Fact]

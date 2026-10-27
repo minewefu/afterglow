@@ -434,6 +434,16 @@ public sealed class AppServices : IDisposable
     /// full or disconnected drive used to throw out of here before the fans
     /// were released, leaving a card pinned at a manual duty after exit with
     /// the session already stamped clean. Later calls return the first answer.
+    /// <para>
+    /// Every step that can wait is bounded, so a GPU driver that stops answering
+    /// cannot hold the exit (and the mutexes App.OnExit releases after it): about
+    /// 2 s for PresentMon, 3 s for the telemetry thread, up to 9 s per card for
+    /// the fan release (<see cref="FanControlService.ShutdownDriverBudget"/> plus
+    /// its 1 s release floor), 2 s for the driver library teardown or none when
+    /// it is skipped, and 3 s per flight recorder only when the disk is stuck.
+    /// Threads left inside the driver are background threads, which do not keep
+    /// the process alive.
+    /// </para>
     /// </summary>
     public bool Shutdown()
     {
@@ -482,7 +492,27 @@ public sealed class AppServices : IDisposable
 
         if (Manager is { } manager)
         {
-            steps.Run("GPU manager", manager.Dispose);
+            if (FanControl.Values.Any(fans => fans.DriverHung))
+            {
+                // nvmlShutdown and ctlClose are driver calls too. Under a fan
+                // call that never came back they could block behind it, or free
+                // library state it is still inside; process exit releases both.
+                Core.Diagnostics.Log.Warn("GPU driver teardown skipped: a fan call into the driver did not return at shutdown.");
+            }
+            else
+            {
+                // Still bounded: the driver can stop answering with no fan call
+                // in flight (a stuck telemetry poll outlives Telemetry.Dispose's
+                // 3 s join). The teardown frees only what process exit frees.
+                var teardownBudget = TimeSpan.FromSeconds(2);
+                steps.Run("GPU manager", () =>
+                {
+                    if (!BoundedCall.TryRun(manager.Dispose, teardownBudget, "Afterglow GPU teardown"))
+                    {
+                        Core.Diagnostics.Log.Warn($"GPU driver teardown did not finish within {teardownBudget.TotalSeconds:0} s; left to process exit.");
+                    }
+                });
+            }
         }
 
         _hardwareReleased = steps.EssentialSucceeded;

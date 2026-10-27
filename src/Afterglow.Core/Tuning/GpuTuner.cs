@@ -1233,30 +1233,82 @@ public sealed class GpuTuner : IGpuTuner
                 : rc.ToString()));
     }
 
-    /// <summary>Sets all fans to a duty; NVAPI preferred (supports 0%), NVML fallback.</summary>
-    public NvmlReturn SetAllFansRaw(uint dutyPct)
+    /// <summary>Sets all fans to a duty; NVAPI preferred (supports 0%), NVML fallback. See <see cref="SetAllFans"/>.</summary>
+    public NvmlReturn SetAllFansRaw(uint dutyPct) => SetAllFans(dutyPct).Result;
+
+    /// <summary>
+    /// <see cref="SetAllFansRaw"/> with what the write left on the card. NVAPI
+    /// writes every cooler in one call. NVML's fallback writes one fan per
+    /// call, so fan 0 could take a manual duty (even 0 %) while fan 1 refused
+    /// it, and the refusal was all the caller heard (R-06). The fallback is
+    /// all-or-nothing now: it stops at the first refusal and hands the fans
+    /// this call moved back to firmware control before returning, so a refusal
+    /// means no fan holds this duty. Rolling back to firmware control rather
+    /// than to a previous manual duty is deliberate: it is the one state that
+    /// is never unsafe, and NVML cannot read a fan's previous mode back.
+    /// When the hand-back is refused as well, this write is put on record here,
+    /// before returning (see <see cref="RollBackFans"/>).
+    /// </summary>
+    public FanWriteResult SetAllFans(uint dutyPct)
     {
         if (_nvapi is not null && _nvapi.TrySetAllFans(dutyPct) == NvapiStatus.Ok)
         {
-            return NvmlReturn.Success;
+            return new FanWriteResult(NvmlReturn.Success, FansMayBeManual: true);
         }
 
-        if (_nvml.TryGetNumFans(out uint fans) != NvmlReturn.Success)
+        // No fans to command is no fan interface, as RestoreAutoFansRaw reads
+        // it. Reporting success here claimed a fixed duty on a card with no
+        // fans, and its release's "nothing to release" at exit then counted as
+        // a failed hand-back, so the next launch warned about fans nobody moved.
+        if (_nvml.TryGetNumFans(out uint fans) != NvmlReturn.Success || fans == 0)
         {
-            return NvmlReturn.NotSupported;
+            return new FanWriteResult(NvmlReturn.NotSupported, FansMayBeManual: false);
         }
 
-        var worst = NvmlReturn.Success;
+        uint duty = dutyPct == 0 ? 0 : Math.Clamp(dutyPct, Capabilities.FanMinDutyPct, 100);
         for (uint f = 0; f < fans; f++)
         {
-            var rc = _nvml.TrySetFanSpeed(f, dutyPct == 0 ? 0 : Math.Clamp(dutyPct, Capabilities.FanMinDutyPct, 100));
+            var rc = _nvml.TrySetFanSpeed(f, duty);
             if (rc != NvmlReturn.Success)
             {
-                worst = rc;
+                // Fans before f took the duty; f refused it, and the rest are not tried.
+                return new FanWriteResult(rc, FansMayBeManual: f > 0 && !RollBackFans(f, duty, rc));
             }
         }
 
-        return worst;
+        return new FanWriteResult(NvmlReturn.Success, FansMayBeManual: true);
+    }
+
+    /// <summary>
+    /// Hands fans 0 to <paramref name="moved"/> - 1 back to firmware control
+    /// after fan <paramref name="moved"/> refused <paramref name="duty"/>, and
+    /// returns whether every one went back. A fan that did not is still at that
+    /// duty, possibly stopped, and the caller's own tracking of it (the fan
+    /// service's "possibly manual") lives in memory only. So the fan record is
+    /// written here, unclean, before the write returns: a hard crash at any
+    /// point after it leaves the evidence the next launch's banner needs.
+    /// </summary>
+    private bool RollBackFans(uint moved, uint duty, NvmlReturn refusal)
+    {
+        var stuck = new List<string>();
+        for (uint f = 0; f < moved; f++)
+        {
+            var rc = _nvml.TrySetDefaultFanSpeed(f);
+            if (rc != NvmlReturn.Success)
+            {
+                stuck.Add($"fan {f} ({rc})");
+            }
+        }
+
+        if (stuck.Count == 0)
+        {
+            Log.Warn($"Fan write {duty}%: fan {moved} refused it ({refusal}); the {moved} fan(s) it had already set were handed back to firmware control.");
+            return true;
+        }
+
+        Log.Warn($"Fan write {duty}%: fan {moved} refused it ({refusal}), and the hand-back failed for {string.Join(", ", stuck)}; recorded as manual fan control.");
+        AppliedStateStore.RecordFans("fixed", duty, _recordKey);
+        return false;
     }
 
     /// <summary>Sets one fan (by NVAPI cooler id) to a manual duty.</summary>

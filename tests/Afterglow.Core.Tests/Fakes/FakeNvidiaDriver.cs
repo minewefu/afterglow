@@ -16,8 +16,10 @@ namespace Afterglow.Core.Tests.Fakes;
 /// every slot reads it afterwards.</item>
 /// </list>
 /// Clock locks have no getter, as in NVML: the fake records the calls and the
-/// range in force so a test can see what the tuner wrote. Every failure a test
-/// needs is a settable return code.
+/// range in force so a test can see what the tuner wrote. Fans follow the two
+/// interfaces' shapes: NVAPI writes every cooler in one call, NVML one fan per
+/// call, so only NVML's fallback can leave some fans manual and others not
+/// (<see cref="ManualFans"/>). Every failure a test needs is a settable return code.
 /// </summary>
 internal sealed class FakeNvidiaDriver : INvmlTuningDevice, INvapiTuningGpu
 {
@@ -68,6 +70,22 @@ internal sealed class FakeNvidiaDriver : INvmlTuningDevice, INvapiTuningGpu
     public NvapiStatus RestoreAutoFansRc { get; set; } = NvapiStatus.Ok;
 
     public int NvmlFanReleases { get; private set; }
+
+    /// <summary>NVAPI's one-call all-fans write; anything but Ok sends the tuner to NVML's per-fan fallback.</summary>
+    public NvapiStatus SetAllFansRc { get; set; } = NvapiStatus.Ok;
+
+    /// <summary>NVML per-fan answers to a manual duty, by fan index; a fan not listed accepts it.</summary>
+    public Dictionary<uint, NvmlReturn> FanSetRcs { get; } = [];
+
+    /// <summary>
+    /// Each fan under manual control and its duty; a fan not listed is under
+    /// firmware (auto) control. A refused write leaves its fan as it was, and
+    /// does not undo the fans written before it — NVML commands one fan per call.
+    /// </summary>
+    public Dictionary<uint, uint> ManualFans { get; } = [];
+
+    /// <summary>Every NVML per-fan manual write, accepted or not, in order.</summary>
+    public List<(uint Fan, uint Percent)> FanSetCalls { get; } = [];
 
     /// <summary>The table's offsets in slot order.</summary>
     public IReadOnlyList<int> TableOffsets => [.. _table.Values];
@@ -151,11 +169,26 @@ internal sealed class FakeNvidiaDriver : INvmlTuningDevice, INvapiTuningGpu
         return NvmlReturn.Success;
     }
 
-    public NvmlReturn TrySetFanSpeed(uint fan, uint percent) => NvmlReturn.Success;
+    public NvmlReturn TrySetFanSpeed(uint fan, uint percent)
+    {
+        FanSetCalls.Add((fan, percent));
+        var rc = FanSetRcs.GetValueOrDefault(fan, NvmlReturn.Success);
+        if (rc == NvmlReturn.Success)
+        {
+            ManualFans[fan] = percent;
+        }
+
+        return rc;
+    }
 
     public NvmlReturn TrySetDefaultFanSpeed(uint fan)
     {
         NvmlFanReleases++;
+        if (DefaultFanSpeedRc == NvmlReturn.Success)
+        {
+            ManualFans.Remove(fan);
+        }
+
         return DefaultFanSpeedRc;
     }
 
@@ -232,9 +265,29 @@ internal sealed class FakeNvidiaDriver : INvmlTuningDevice, INvapiTuningGpu
         return NvapiStatus.Ok;
     }
 
-    public NvapiStatus TrySetAllFans(uint dutyPercent) => NvapiStatus.Ok;
+    public NvapiStatus TrySetAllFans(uint dutyPercent)
+    {
+        // One driver call for every cooler: it lands on all of them or on none.
+        if (SetAllFansRc == NvapiStatus.Ok)
+        {
+            for (uint fan = 0; fan < NumFans; fan++)
+            {
+                ManualFans[fan] = dutyPercent;
+            }
+        }
+
+        return SetAllFansRc;
+    }
 
     public NvapiStatus TrySetFan(uint coolerId, uint dutyPercent) => NvapiStatus.Ok;
 
-    public NvapiStatus TryRestoreAutoFans() => RestoreAutoFansRc;
+    public NvapiStatus TryRestoreAutoFans()
+    {
+        if (RestoreAutoFansRc == NvapiStatus.Ok)
+        {
+            ManualFans.Clear();
+        }
+
+        return RestoreAutoFansRc;
+    }
 }
