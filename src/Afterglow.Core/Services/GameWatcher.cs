@@ -121,17 +121,13 @@ public sealed class GameWatcher : IDisposable
                     }
                 }
 
-                // Newly started games.
-                foreach (string name in running)
-                {
-                    if (_activeGames.Add(name) && _activeGames.Count == 1)
-                    {
-                        ActiveRule = _rules[name];
-                        GameStarted?.Invoke(_rules[name]);
-                    }
-                }
-
-                // Exited games.
+                // Exited games first (R-22): when one game closes and another
+                // opens inside one poll interval, the ended session must close
+                // before the new game is counted — otherwise the newcomer joined
+                // the old session silently, kept the old profile, and the old
+                // restore waited for the newcomer's exit. The exit is raised
+                // before the start, so the handlers restore the old pre-game
+                // state before capturing the new one.
                 var exited = _activeGames.Where(g => !running.Contains(g)).ToList();
                 foreach (string name in exited)
                 {
@@ -144,6 +140,16 @@ public sealed class GameWatcher : IDisposable
                     if (rule.RevertOnExit)
                     {
                         GameExited?.Invoke(rule);
+                    }
+                }
+
+                // Newly started games.
+                foreach (string name in running)
+                {
+                    if (_activeGames.Add(name) && _activeGames.Count == 1)
+                    {
+                        ActiveRule = _rules[name];
+                        GameStarted?.Invoke(_rules[name]);
                     }
                 }
 

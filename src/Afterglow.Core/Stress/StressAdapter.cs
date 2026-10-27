@@ -197,32 +197,18 @@ public static partial class StressAdapter
         try
         {
             using var factory = DXGI.CreateDXGIFactory1<IDXGIFactory1>();
-            bool intelSeen = false;
-            bool otherHardwareSeen = false;
+            var adapters = new List<AdapterVendor>();
             for (uint i = 0; factory.EnumAdapters1(i, out IDXGIAdapter1 adapter).Success; i++)
             {
                 using (adapter)
                 {
                     var desc = adapter.Description1;
-                    if ((desc.Flags & AdapterFlags.Software) != 0)
-                    {
-                        continue; // WARP / Basic Render Driver
-                    }
-
-                    uint vendor = (uint)desc.VendorId;
-                    if (vendor == NvidiaVendorId)
-                    {
-                        return NvidiaVendorId;
-                    }
-
-                    intelSeen |= vendor == IntelVendorId;
-                    otherHardwareSeen |= vendor != IntelVendorId;
+                    adapters.Add(new AdapterVendor((uint)desc.VendorId, (desc.Flags & AdapterFlags.Software) != 0));
                 }
             }
 
-            return intelSeen && !otherHardwareSeen && !NvidiaPresentOnPciBus()
-                ? IntelVendorId
-                : NvidiaVendorId;
+            return ChooseDefaultVendor(
+                adapters, () => NvidiaPresentOnPciBus(CM_Get_Device_ID_List_SizeW, CM_Get_Device_ID_ListW));
         }
         catch (Exception ex) when (ex is SharpGen.Runtime.SharpGenException or DllNotFoundException)
         {
@@ -232,24 +218,78 @@ public static partial class StressAdapter
         }
     }
 
+    /// <summary>One DXGI adapter as the default-vendor policy sees it (Software = WARP / Basic Render Driver).</summary>
+    internal readonly record struct AdapterVendor(uint VendorId, bool Software);
+
+    /// <summary>
+    /// The default-vendor policy of <see cref="DetectDefaultVendor"/>, separated
+    /// from DXGI and the PnP query so it can be tested without this machine's
+    /// devices. <paramref name="nvidiaPresentOnPciBus"/> is only asked when
+    /// DXGI shows Intel as the sole hardware vendor.
+    /// </summary>
+    internal static uint ChooseDefaultVendor(IEnumerable<AdapterVendor> adapters, Func<bool> nvidiaPresentOnPciBus)
+    {
+        bool intelSeen = false;
+        bool otherHardwareSeen = false;
+        foreach (var adapter in adapters)
+        {
+            if (adapter.Software)
+            {
+                continue;
+            }
+
+            if (adapter.VendorId == NvidiaVendorId)
+            {
+                return NvidiaVendorId;
+            }
+
+            intelSeen |= adapter.VendorId == IntelVendorId;
+            otherHardwareSeen |= adapter.VendorId != IntelVendorId;
+        }
+
+        return intelSeen && !otherHardwareSeen && !nvidiaPresentOnPciBus()
+            ? IntelVendorId
+            : NvidiaVendorId;
+    }
+
+    // cfgmgr32.h (Windows SDK 10.0.26100): CM_GETIDLIST_FILTER_ENUMERATOR, CM_GETIDLIST_FILTER_PRESENT.
+    internal const uint CmGetIdListFilterEnumerator = 0x1;
+    internal const uint CmGetIdListFilterPresent = 0x100;
+
+    /// <summary>
+    /// The flags both configuration-manager calls pass: PCI-enumerated devices
+    /// that are present. Without FILTER_PRESENT the list includes device nodes
+    /// PnP only remembers — a card swapped out, an unplugged eGPU — and one old
+    /// NVIDIA node made an unbound run refuse the working Intel adapter (R-42).
+    /// A disabled or driver-failed card is still present, so it still counts.
+    /// The size and list calls must pass the same flags, or the size does not
+    /// describe the list.
+    /// </summary>
+    internal const uint PciDeviceListFlags = CmGetIdListFilterEnumerator | CmGetIdListFilterPresent;
+
+    /// <summary>CM_Get_Device_ID_List_SizeW's shape, so tests can stand in a device tree.</summary>
+    internal delegate int DeviceIdListSize(out uint length, string filter, uint flags);
+
+    /// <summary>CM_Get_Device_ID_ListW's shape, so tests can stand in a device tree.</summary>
+    internal delegate int DeviceIdList(string filter, char[] buffer, uint bufferLength, uint flags);
+
     /// <summary>
     /// True when any NVIDIA PCI device is present per the PnP device list —
     /// a disabled or driver-failed card is still listed there even when DXGI
     /// no longer enumerates it, and an unbound run must refuse loudly rather
     /// than silently retarget the iGPU in that state.
     /// </summary>
-    private static bool NvidiaPresentOnPciBus()
+    internal static bool NvidiaPresentOnPciBus(DeviceIdListSize getSize, DeviceIdList getList)
     {
         try
         {
-            const uint CmGetIdListFilterEnumerator = 0x1;
-            if (CM_Get_Device_ID_List_SizeW(out uint length, "PCI", CmGetIdListFilterEnumerator) != 0 || length == 0)
+            if (getSize(out uint length, "PCI", PciDeviceListFlags) != 0 || length == 0)
             {
                 return false;
             }
 
             var buffer = new char[length];
-            if (CM_Get_Device_ID_ListW("PCI", buffer, length, CmGetIdListFilterEnumerator) != 0)
+            if (getList("PCI", buffer, length, PciDeviceListFlags) != 0)
             {
                 return false;
             }
