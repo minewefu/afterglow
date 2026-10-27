@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Globalization;
+using System.Runtime.InteropServices;
 using SharpGen.Runtime;
 using Vortice.D3DCompiler;
 using Vortice.Direct3D;
@@ -129,12 +131,49 @@ public sealed record StressProgress(
 ///    a slice is read back periodically and compared byte-for-byte against the
 ///    first dispatch. Any difference means the GPU is miscalculating.
 /// A device-removed error (driver reset/TDR) is likewise caught and reported.
+/// <para>
+/// The comparison is only as good as the reference is a function of the work
+/// (R-01). The FMA storm is a bounded chaotic map, so every output is finite
+/// and an error grows instead of saturating; every fetched bit and every
+/// round's results also enter an integer chain that is folded into the output
+/// losslessly. The reference pass is checked for non-finite values before
+/// anything is compared against it.
+/// </para>
 /// </summary>
 public sealed class GpuStressTest : IProbeLoad
 {
-    private const int ThreadCount = 1 << 20;          // 1M threads → 16 MiB output
+    internal const int ThreadCount = 1 << 20;         // 1M threads → 16 MiB output
     private const int CheckElements = 16384;          // 256 KiB verify slice
-    private const int ThreadsPerGroup = 256;
+    internal const int ThreadsPerGroup = 256;
+
+    /// <summary>
+    /// Revision of the burn workload, for records that must say which burn
+    /// earned them. 1 is everything before R-01's fix: its FMA chains overflowed
+    /// to infinity, so its bit-exact checks could not see a miscalculation and
+    /// its passes prove little more than that the device was not lost. 2 is the
+    /// bounded workload below. Bump it whenever the shader's arithmetic changes.
+    /// </summary>
+    public const int WorkloadRevision = 2;
+
+    /// <summary>
+    /// Logistic-map rounds per gather — the compute half of the load (see
+    /// <see cref="FetchesFor"/>). 18, not the old 24 (R-01): a round is now 8 FP32
+    /// and 4 INT32 vector ops where it was 6 and 3, so 18 rounds carry exactly the
+    /// old 24 rounds' 576 FP32 and 288 INT32 scalar ops per gather, and a
+    /// dispatch keeps its size.
+    /// </summary>
+    internal const uint AluRounds = 18;
+
+    /// <summary>
+    /// Load knob → gathers per thread: the memory half of the load. Shared with
+    /// the WARP workload tests so they dispatch exactly what a real run does.
+    /// </summary>
+    internal static uint FetchesFor(uint iterationsPerDispatch) =>
+        Math.Clamp(Math.Clamp(iterationsPerDispatch, 512, 16384) / 64, 8, 256);
+
+    /// <summary>The burn shader's constant buffer, in its cbuffer order (seed 0.5).</summary>
+    internal static uint[] BurnParameters(uint fetches, uint srcCount) =>
+        [fetches, AluRounds, srcCount, BitConverter.SingleToUInt32Bits(0.5f)];
 
     /// <summary>
     /// How long a queued batch may go unretired before the run is called
@@ -164,7 +203,7 @@ public sealed class GpuStressTest : IProbeLoad
               $"cycle (60 s or more is recommended); {seconds} s cannot earn a verdict"
             : null;
 
-    private const string InitShaderSource = """
+    internal const string InitShaderSource = """
         RWStructuredBuffer<float4> src : register(u0);
         cbuffer Params : register(b0) { uint elementCount; uint pad0; uint pad1; uint pad2; };
 
@@ -191,54 +230,174 @@ public sealed class GpuStressTest : IProbeLoad
         }
         """;
 
-    private const string BurnShaderSource = """
+    internal const string BurnShaderSource = """
         StructuredBuffer<float4> src : register(t0);
         RWStructuredBuffer<float4> dst : register(u0);
         cbuffer Params : register(b0)
         {
             uint fetches;      // gathers per thread (memory-load knob)
-            uint aluRounds;    // FMA rounds per gather (compute-load knob)
+            uint aluRounds;    // map rounds per gather (compute-load knob)
             uint srcCount;
-            float seed;
+            float seed;        // scales the starting state; must lie in (0, 1) (the engine uses 0.5)
         };
+
+        // Integer mixing for the seed and the final fold: an odd-multiplier LCG
+        // step, then an xorshift. Both are bijections on uint, so a difference
+        // that goes in always comes out.
+        uint4 scramble(uint4 h)
+        {
+            h = h * 1664525u + 1013904223u;
+            return h ^ (h >> 13);
+        }
 
         [numthreads(256, 1, 1)]
         void main(uint3 id : SV_DispatchThreadID)
         {
-            // Four independent accumulator chains keep the FMA pipes issue-saturated
-            // (a single chain is latency-bound and leaves execution width idle).
-            float4 a0 = float4(seed, seed * 1.7f, seed * 2.3f, seed * 3.1f) + (float)id.x * 0.001f;
-            float4 a1 = a0.wzyx + 0.25f;
-            float4 a2 = a0.yxwz + 0.50f;
-            float4 a3 = a0.zwxy + 0.75f;
-            const float4 m0 = float4(1.0001f, 0.9999f, 1.0002f, 0.9998f);
-            const float4 m1 = float4(0.9997f, 1.0003f, 0.9996f, 1.0004f);
+            // Four independent FP32 chains of the logistic map x -> r*x*(1 - x) keep
+            // the FMA pipes issue-saturated (a single chain is latency-bound and
+            // leaves execution width idle).
+            //
+            // Bounded: for 0 < x < 1 and r < 4 the map stays inside (0, r/4], so
+            // nothing here can overflow. The chains this replaced multiplied by
+            // values that grew from their own output, and every result was
+            // infinity — which a corrupted rerun reproduced bit for bit (R-01).
+            //
+            // Chaotic: every r sits where the map's Lyapunov exponent is above 0.5
+            // per round (and stays above 0.5 within +/-0.003 of it, clear of the
+            // periodic windows near 3.90 and 3.96), so an error that survives
+            // rounding grows until it reaches the output instead of decaying, as
+            // it would in a contraction, or vanishing into a saturated value.
+            // Unlike x*x + c, whose squaring erases a flipped sign bit, the map's
+            // two preimages x and 1 - x are never one bit apart.
+            const float4 r0 = float4(3.92f, 3.95f, 3.98f, 3.93f);
+            const float4 r1 = float4(3.99f, 3.94f, 3.97f, 3.92f);
+
+            // Integer chain: seeded from the thread id, then fed every fetched
+            // element and every round's results.
+            uint4 h = scramble(scramble(uint4(id.x, id.x * 747796405u, id.x ^ 0x9E3779B9u, id.x + 0x85EBCA6Bu)));
+
+            // Starting state: 24 hash bits with the top one set (a full-precision
+            // value in [0.5, 1)) times seed, so [0.25, 0.5) for the engine's 0.5.
+            // Scaled, never offset: adding a constant would round a one-ulp change
+            // of seed away in small lanes.
+            float4 s = (float4)((h >> 8) | 0x800000u) * (seed / 16777216.0f);
+            float4 a0 = s;
+            float4 a1 = s.wzyx;
+            float4 a2 = s.yxwz;
+            float4 a3 = s.zwxy;
+
             uint idx = id.x;
-            // Integer chain rides the INT pipe concurrently with the FP32 FMA chains.
-            uint4 h = uint4(id.x, id.x * 747796405u, id.x ^ 0x9E3779B9u, id.x + 0x85EBCA6Bu);
             [loop]
             for (uint j = 0; j < fetches; j++)
             {
                 // LCG scramble → pseudo-random stride across the whole buffer.
                 idx = idx * 1664525u + 1013904223u;
                 float4 v = src[idx % srcCount];
+
+                // Every bit of the element enters the integer chain losslessly, so
+                // even a flip the FP32 path would round away (the low mantissa bits
+                // of everything the init shader writes are zero) reaches the output.
+                h ^= asuint(v);
+
+                // Its value enters every FP32 chain. For data in [0, 1] (all the
+                // init shader writes) this mix lands in [0.125, 0.875), inside (0, 1)
+                // with margin. A corrupted element far outside that range may drive
+                // its threads to inf/NaN, which differs from the finite reference
+                // and is reported as a mismatch.
+                float4 u = mad(v, 0.25f, 0.125f);
+                a0 = mad(a0, 0.5f, u);
+                a1 = mad(a1, 0.5f, u.wzyx);
+                a2 = mad(a2, 0.5f, u.yxwz);
+                a3 = mad(a3, 0.5f, u.zwxy);
+
                 [loop]
                 for (uint k = 0; k < aluRounds; k++)
                 {
-                    a0 = mad(a0, m0, v * 0.000001f);
-                    a1 = mad(a1, m1, v.wzyx * 0.000001f);
-                    a2 = mad(a2, m0.wzyx, v.yxwz * 0.000001f);
-                    a3 = mad(a3, m1.wzyx, v.zwxy * 0.000001f);
-                    h = h * 1664525u + 1013904223u;
-                    h ^= h >> 13;
-                    v = mad(v, a0.wzyx, float4(0.0001f, -0.0001f, 0.0002f, -0.0002f));
+                    float4 t0 = a0 * r0;
+                    float4 t1 = a1 * r1;
+                    float4 t2 = a2 * r0.wzyx;
+                    float4 t3 = a3 * r1.wzyx;
+                    a0 = mad(-t0, a0, t0);
+                    a1 = mad(-t1, a1, t1);
+                    a2 = mad(-t2, a2, t2);
+                    a3 = mad(-t3, a3, t3);
+
+                    // Integer chain rides the INT pipe concurrently with the FP32
+                    // chains, and absorbs each round's FMA results as they are
+                    // produced. FP32 rounding can swallow a one-ulp error before
+                    // the chaos has amplified it (fault injection on WARP: about
+                    // half of the mantissa-LSB flips made mid-run); each step here
+                    // is a bijection in h and injective in the value it takes in,
+                    // so it cannot. Four integer ops a lane (the LCG's addend is the
+                    // first chain itself) against the old round's three.
+                    h = h * 1664525u + asuint(a0);
+                    h ^= asuint(a1);
+                    h += asuint(a2);
+                    h ^= asuint(a3);
                 }
-                a0 += v * 0.001f;
             }
-            a0 += (float4)(h & 1u) * 0.0000001f;
-            dst[id.x] = a0 + a1 * 0.5f + a2 * 0.25f + a3 * 0.125f;
+
+            // x, y: the FP32 chains. Each lane is in (0, 1), so both are in (0, 8):
+            // finite by construction.
+            // z, w: a 32-bit digest of the integer chain — which has absorbed every
+            // fetched bit and every round's results, the final state included — as
+            // two 16-bit integers a float holds exactly. A difference confined to one
+            // lane of g always survives the fold (each step is a bijection in the
+            // lane it absorbs); differences in several lanes cancel only by a 2^-32
+            // coincidence.
+            float4 f = (a0 + a1) + (a2 + a3);
+            uint4 g = scramble(scramble(h));
+            uint digest = g.x;
+            digest = digest * 1664525u + g.y;
+            digest ^= digest >> 13;
+            digest = digest * 1664525u + g.z;
+            digest ^= digest >> 13;
+            digest = digest * 1664525u + g.w;
+            digest ^= digest >> 13;
+            dst[id.x] = float4(f.x + f.z, f.y + f.w, (float)(digest >> 16), (float)(digest & 0xFFFFu));
         }
         """;
+
+    /// <summary>
+    /// The workload's own check on its reference pass: null when every value is
+    /// finite, otherwise why the run must end without a verdict.
+    /// <para>
+    /// Every later check compares bit for bit against this reference, and a
+    /// non-finite reference makes that comparison blind: an infinity computed
+    /// from corrupted inputs is the same infinity (R-01 — every output was
+    /// infinite, and every rerun matched). With valid inputs the arithmetic is
+    /// bounded, so a non-finite value means the reference pass itself went wrong
+    /// — the GPU miscalculated it or its source data, or the shader is defective.
+    /// Either way nothing can be verified against it. That is a workload failure,
+    /// not a hardware verdict, and never a pass.
+    /// </para>
+    /// </summary>
+    internal static string? ReferenceSelfCheck(ReadOnlySpan<byte> reference)
+    {
+        var values = MemoryMarshal.Cast<byte, float>(reference);
+        int bad = 0;
+        int first = -1;
+        for (int i = 0; i < values.Length; i++)
+        {
+            if (!float.IsFinite(values[i]))
+            {
+                bad++;
+                if (first < 0)
+                {
+                    first = i;
+                }
+            }
+        }
+
+        static string Count(int n) => n.ToString("N0", CultureInfo.InvariantCulture);
+
+        return bad == 0
+            ? null
+            : $"Burn self-check failed: {Count(bad)} of {Count(values.Length)} reference values are not finite " +
+              $"(first: thread {Count(first / 4)}, component {"xyzw"[first % 4]}). Results compared against such a " +
+              "reference cannot reveal errors, so this run tested nothing and earns no verdict. The workload's " +
+              "arithmetic is bounded, so either the GPU miscalculated the reference pass or the workload is defective.";
+    }
 
     private readonly Lock _lock = new();
     private Thread? _thread;
@@ -434,9 +593,7 @@ public sealed class GpuStressTest : IProbeLoad
                 uint srcCount = srcBytes / 16;
 
                 // Load knob → gathers (memory) + FMA rounds (compute).
-                uint intensity = Math.Clamp(IterationsPerDispatch, 512, 16384);
-                uint fetches = Math.Clamp(intensity / 64, 8, 256);
-                const uint aluRounds = 24;
+                uint fetches = FetchesFor(IterationsPerDispatch);
 
                 using var initShader = device.CreateComputeShader(
                     Compiler.Compile(InitShaderSource, "main", "stress-init", "cs_5_0").Span);
@@ -488,12 +645,8 @@ public sealed class GpuStressTest : IProbeLoad
                     context.CSSetUnorderedAccessView(0, null);
                 }
 
-                var burnParams = new uint[4];
-                burnParams[0] = fetches;
-                burnParams[1] = aluRounds;
-                burnParams[2] = srcCount;
-                burnParams[3] = BitConverter.SingleToUInt32Bits(0.5f);
-                using var burnConstants = device.CreateBuffer<uint>(burnParams, BindFlags.ConstantBuffer);
+                using var burnConstants = device.CreateBuffer<uint>(
+                    BurnParameters(fetches, srcCount), BindFlags.ConstantBuffer);
 
                 context.CSSetShader(burnShader);
                 context.CSSetShaderResource(0, srcSrv);
@@ -538,6 +691,16 @@ public sealed class GpuStressTest : IProbeLoad
                 }
 
                 dispatches++;
+
+                // Refuse a reference nothing can be verified against (R-01). Failed,
+                // not ArtifactDetected: the run never reached a comparison, so it
+                // has no hardware verdict either way — and it can never pass.
+                if (ReferenceSelfCheck(reference) is { } selfCheckFailure)
+                {
+                    Report(StressState.Failed, stopwatch.Elapsed, 0, dispatches, errors, burnDispatches,
+                        selfCheckFailure);
+                    return;
+                }
 
                 var lastReport = TimeSpan.Zero;
                 var lastCheck = TimeSpan.Zero;
