@@ -189,13 +189,26 @@ public static class HotkeyPlanner
         // The fallback stays behind a usable primary as well, for when another
         // app already holds the primary and Windows refuses it.
         var candidates = new List<HotkeyChord>(2);
+        string? fallbackLost = null;
         foreach (var chord in reason is null ? [primary, fallback] : new[] { fallback })
         {
-            if (Check(chord, typedOn) is null && !taken.ContainsKey(chord))
+            string? refused = Check(chord, typedOn) ??
+                              (taken.TryGetValue(chord, out var holder) ? $"{chord} is set for \"{HotkeyActions.Describe(holder)}\"" : null);
+            if (refused is null)
             {
                 candidates.Add(chord);
                 taken[chord] = action;
             }
+            else if (chord == fallback)
+            {
+                fallbackLost = refused;
+            }
+        }
+
+        // With no shortcut left, say why the stand-in didn't take over either.
+        if (candidates.Count == 0 && fallbackLost is not null)
+        {
+            reason = $"{reason}; {fallbackLost}";
         }
 
         return new HotkeyAssignment(action, primary, candidates, reason, IsDefault: true);

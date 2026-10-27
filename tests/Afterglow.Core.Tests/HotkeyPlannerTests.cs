@@ -162,6 +162,20 @@ public sealed class HotkeyPlannerTests
     }
 
     [Fact]
+    public void With_both_its_keys_refused_a_default_says_why_for_each()
+    {
+        // UK: Ctrl+Alt+O is "ó", and the panic key was moved onto the overlay's stand-in.
+        var plan = Plan(new HotkeySettings().With(HotkeyAction.PanicReset, "Ctrl+Alt+F10"), UnitedKingdom);
+        var overlay = plan[HotkeyAction.ToggleOverlay];
+
+        Assert.Empty(overlay.Candidates);
+        Assert.Equal(
+            "Ctrl+Alt+O types \"ó\" on your United Kingdom keyboard layout; " +
+            "Ctrl+Alt+F10 is set for \"Panic: reset the GPU to driver defaults\"",
+            overlay.Reason);
+    }
+
+    [Fact]
     public void The_same_chosen_shortcut_twice_keeps_the_first()
     {
         var settings = new HotkeySettings()

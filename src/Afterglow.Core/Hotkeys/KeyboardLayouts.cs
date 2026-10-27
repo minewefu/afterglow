@@ -27,7 +27,9 @@ public static unsafe partial class KeyboardLayouts
     private const int VkLControl = 0xA2;
     private const int VkLMenu = 0xA4;
     private const int VkRMenu = 0xA5;
+    private const int VkCapital = 0x14;
     private const byte KeyDown = 0x80;
+    private const byte Toggled = 0x01;
     private const uint MapVkToScanCode = 0;
 
     /// <summary>
@@ -98,7 +100,9 @@ public static unsafe partial class KeyboardLayouts
 
         // Alt is asked as both keys: the left one (what Ctrl+Alt is pressed with)
         // and the right one (AltGr, together with the left Ctrl Windows adds).
-        for (int pass = 0; pass < (hasAlt ? 2 : 1); pass++)
+        // Each with Caps Lock off and on: a hotkey ignores Caps Lock, but on keys
+        // a layout marks CAPLOKALTGR it turns AltGr into AltGr+Shift.
+        for (int pass = 0; pass < (hasAlt ? 4 : 2); pass++)
         {
             new Span<byte>(state, 256).Clear();
             if (chord.Modifiers.HasFlag(HotkeyModifiers.Control))
@@ -110,7 +114,12 @@ public static unsafe partial class KeyboardLayouts
             if (hasAlt)
             {
                 state[VkMenu] = KeyDown;
-                state[pass == 0 ? VkLMenu : VkRMenu] = KeyDown;
+                state[(pass & 1) == 0 ? VkLMenu : VkRMenu] = KeyDown;
+            }
+
+            if (pass >= (hasAlt ? 2 : 1))
+            {
+                state[VkCapital] = Toggled;
             }
 
             if (chord.Modifiers.HasFlag(HotkeyModifiers.Shift))

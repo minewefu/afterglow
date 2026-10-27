@@ -34,7 +34,7 @@ public sealed partial class HotkeyRowViewModel : ObservableObject
     /// <summary>Information, e.g. which stand-in a default uses on this keyboard.</summary>
     [ObservableProperty] public partial string Note { get; set; } = string.Empty;
 
-    /// <summary>Why the shortcut doesn't work, or why a just-pressed one was refused.</summary>
+    /// <summary>Why the shortcut doesn't work, or (until the next refresh) why a just-pressed one was refused.</summary>
     [ObservableProperty] public partial string Warning { get; set; } = string.Empty;
 
     [ObservableProperty]
@@ -43,9 +43,6 @@ public sealed partial class HotkeyRowViewModel : ObservableObject
     public partial bool IsRecording { get; set; }
 
     public string ChangeLabel => IsRecording ? "Cancel" : "Change";
-
-    /// <summary>A refusal from the last recording; kept until the next edit so a status refresh doesn't hide it.</summary>
-    internal string RecordingError { get; set; } = string.Empty;
 
     [RelayCommand]
     private void Change() => _owner.BeginRecording(this);
@@ -59,8 +56,6 @@ public sealed partial class HotkeyRowViewModel : ObservableObject
 
         // "Turned off" would repeat on every row under the switch that says so.
         Note = status is { IsProblem: false } && status.Note != HotkeyPlanner.TurnedOff ? status.Note : string.Empty;
-        Warning = RecordingError.Length > 0 ? RecordingError
-            : status is { IsProblem: true } ? status.Note
-            : string.Empty;
+        Warning = status is { IsProblem: true } ? status.Note : string.Empty;
     }
 }

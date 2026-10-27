@@ -113,6 +113,11 @@ defaults take on common layouts:
 | Greek | — | `®` | 2–5 `² ³ £ §` |
 | Dutch | — | `¶` | `¹ ² ³ ¼ ½` |
 
+Caps Lock is asked both ways, because on keys a layout marks `CAPLOKALTGR` it
+turns AltGr into AltGr+Shift while a hotkey ignores it. Measured: it adds no
+character to any Ctrl chord on these 218 layouts, but the probe keeps the pass
+for layouts that might.
+
 Limits of the survey: punctuation keys aren't surveyed (shortcuts can't use
 them); layout-specific extra modifiers (Canadian Multilingual's right Ctrl,
 Kana) aren't modelled; ADLaM and Osage return private-use code points for some

@@ -101,7 +101,9 @@ public sealed partial class HotkeyService : IDisposable
     /// </summary>
     public void RefreshIfLayoutsChanged()
     {
-        if (_source is not null && !KeyboardLayouts.Installed().AsSpan().SequenceEqual(_layouts))
+        // As a set: switching layouts can reorder Windows' list (KLF_REORDER),
+        // which changes nothing here.
+        if (_source is not null && !KeyboardLayouts.Installed().ToHashSet().SetEquals(_layouts))
         {
             Reregister();
         }

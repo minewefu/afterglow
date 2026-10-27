@@ -218,6 +218,14 @@ try {
     Invoke $r 'Restore default shortcuts'
     Check ($null -eq (Saved $data).toggleOverlay) 'Restore default shortcuts clears the chosen one'
     Check (-not (Free $ctrlAlt 0x4F)) 'and Ctrl+Alt+O is registered again'
+
+    # Pressing the default's own keys keeps it the default (free to move to its stand-in later).
+    $change = Find $r 'Change shortcut: Panic: reset the GPU to driver defaults'
+    $change.SetFocus(); $change.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    Start-Sleep -Milliseconds 500
+    Press @(0x11, 0x12, 0x52)                      # Ctrl+Alt+R
+    Check ($null -eq (Saved $data).panicReset) 'pressing the default''s own keys keeps the default'
+    Check (-not (Free $ctrlAlt 0x52)) 'and Ctrl+Alt+R is registered'
 } finally {
     Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
     if ($layoutsBefore -notcontains $spanish) { [void][UiTest.K]::UnloadKeyboardLayout($spanish) }

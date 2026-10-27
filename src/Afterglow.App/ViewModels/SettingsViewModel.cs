@@ -78,7 +78,6 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
         }
 
         CancelRecording();
-        row.RecordingError = string.Empty;
         row.Warning = string.Empty;
         _recording = row;
         row.IsRecording = true;
@@ -117,7 +116,9 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
                 : Services.HotkeyService.Check(chord);
 
         // Resume first: while recording nothing is registered, so only now does
-        // the status say which shortcut another action really holds.
+        // the status say which shortcut another action really holds. Stricter
+        // than the planner, which lets a chosen shortcut push a default to its
+        // stand-in: here that would move, say, the panic key without a word.
         CancelRecording();
         if (problem is null &&
             _services.Hotkeys.Status.FirstOrDefault(s => s.Action != row.Action && s.IsActive && s.Chord == chord) is { } owner)
@@ -127,19 +128,20 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
 
         if (problem is not null)
         {
-            row.RecordingError = problem + ". The shortcut wasn't changed.";
-            row.Warning = row.RecordingError;
+            // Shown until the next status refresh, which then says what's current.
+            row.Warning = problem + ". The shortcut wasn't changed.";
             return;
         }
 
-        SetShortcut(row, chord.ToString());
+        // Pressing the default's own keys keeps the default, so it can still move
+        // to its stand-in if a layout or another app later takes those keys.
+        SetShortcut(row, chord == HotkeyDefaults.Primary(row.Action) ? null : chord.ToString());
     }
 
     /// <param name="text">The new shortcut; empty for none, null for the default.</param>
     internal void SetShortcut(HotkeyRowViewModel row, string? text)
     {
         CancelRecording();
-        row.RecordingError = string.Empty;
         _services.UpdateSettings(s => s with { Hotkeys = s.Hotkeys.With(row.Action, text) });
     }
 
@@ -147,11 +149,6 @@ public partial class SettingsViewModel : ObservableObject, ILivePage
     private void RestoreDefaultShortcuts()
     {
         CancelRecording();
-        foreach (var row in HotkeyRows)
-        {
-            row.RecordingError = string.Empty;
-        }
-
         _services.UpdateSettings(s => s with { Hotkeys = new HotkeySettings { Enabled = s.Hotkeys.Enabled } });
     }
 
