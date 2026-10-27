@@ -141,6 +141,8 @@ public partial class MainViewModel : ObservableObject
 
         services.GameWatcher.GameStarted += rule =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnGameStarted(rule));
+        services.GameWatcher.GameHandedOff += (exited, next) =>
+            Application.Current?.Dispatcher.BeginInvoke(() => OnGameHandedOff(exited, next));
         services.GameWatcher.GameExited += rule =>
             Application.Current?.Dispatcher.BeginInvoke(() => OnGameExited(rule));
         services.TdrWatchdog.DriverResetDetected += description =>
@@ -418,6 +420,104 @@ public partial class MainViewModel : ObservableObject
             (result.AllSucceeded ? string.Empty : " (some knobs failed)"));
     }
 
+    /// <summary>
+    /// The game whose profile was active exited while <paramref name="next"/>,
+    /// another configured game, still runs (R1). Its profile used to stay on
+    /// until the last game closed. Now <paramref name="next"/>'s profile takes
+    /// over, and the snapshot taken before the first game stays the restore
+    /// target; see <see cref="GameHandoff"/> for the three ways this goes.
+    /// </summary>
+    private void OnGameHandedOff(GameRule exited, GameRule next)
+    {
+        var pre = _preGame;
+        var profile = _services.Profiles.Load(next.ProfileName);
+        var gpu = profile is null ? null : TargetGpuFor(profile);
+        switch (GameSessionRestore.PlanHandoff(pre, profile, gpu?.Index, gpu?.Tuner.GpuUuid))
+        {
+            case GameHandoff.Swap when pre is not null && profile is not null && gpu is not null:
+                SwapGameProfile(pre, exited, next, profile, gpu);
+                break;
+            case GameHandoff.EndThenStart:
+                // The exited game's part ends as its own exit would — restored
+                // if its rule says so, otherwise left as it is with the snapshot
+                // dropped — and the remaining game starts as if alone.
+                if (exited.RevertOnExit)
+                {
+                    OnGameExited(exited);
+                }
+                else
+                {
+                    _preGame = null;
+                }
+
+                OnGameStarted(next);
+                break;
+            default:
+                OnGameStarted(next);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// A same-card hand-off: the pre-game state goes back first, without being
+    /// consumed, then the next game's profile is applied on top — exactly what
+    /// that game gets when it starts alone, and nothing of the exited game's
+    /// profile survives where the next one has no value of its own. No new
+    /// snapshot is captured: one taken now would make the exited game's
+    /// leftovers "the state before the game".
+    /// </summary>
+    private void SwapGameProfile(
+        PreGameSnapshot pre, GameRule exited, GameRule next, Core.Profiles.TuningProfile profile,
+        Core.Hardware.GpuContext gpu)
+    {
+        var (restore, fansRestored, plan) = RestorePreGame(pre, gpu);
+        var applied = ApplyProfileFull(profile, gameContext: true, target: gpu);
+        _preGame = GameSessionRestore.HandedOff(pre, next.ExecutableName, profile);
+
+        string message = GameSessionRestore.DescribeHandoff(
+            exited.ExecutableName, next, restore, fansRestored, plan.NotRestored, applied);
+        Core.Diagnostics.Log.Info(
+            $"Game hand-off on GPU {gpu.Index}: {message} Restore: {restore.Summary} Apply: {applied.Summary}");
+        TrayAlert?.Invoke("Afterglow profile applied", message);
+
+        // A refused apply returns before ApplyProfileFull refreshes the sliders,
+        // and the restore half did change the card.
+        if (applied.Results.Any(r => r.Knob == "profile" && !r.Applied) && gpu.Index == _services.SelectedGpu?.Index)
+        {
+            Tuning.RefreshFromHardware();
+        }
+    }
+
+    /// <summary>
+    /// Puts a session's pre-game state back on its card: the tuning, and the
+    /// fans when the game profile changed them. Does not consume the snapshot.
+    /// </summary>
+    private (ApplyResult Result, bool? FansRestored, GameRestorePlan Plan) RestorePreGame(
+        PreGameSnapshot pre, Core.Hardware.GpuContext gpu)
+    {
+        var plan = GameSessionRestore.Plan(pre);
+
+        // The plan carries the V/F table itself when the game could have
+        // changed it; otherwise it has no opinion on the curve, and must not be
+        // read as "the user wants no curve".
+        var result = gpu.Tuner.Apply(plan.Profile, reconcileVfPoints: false);
+
+        // Fans only when the game profile changed them, and only this card's.
+        bool? fansRestored = null;
+        if (plan.Fans is { } fans && _services.FanControl.TryGetValue(gpu.Index, out var fanService))
+        {
+            fansRestored = GameSessionRestore.ApplyFans(fanService, fans);
+            if (fansRestored == true)
+            {
+                // Persisted for this card whichever card is selected (R-23):
+                // otherwise its saved fans kept describing the game's.
+                Fans.RecordApplied(gpu, fans.Mode, fans.FixedPct, fans.Curve);
+            }
+        }
+
+        return (result, fansRestored, plan);
+    }
+
     private void OnGameExited(GameRule rule)
     {
         // Consumed exactly once: a session's snapshot is never applied twice,
@@ -440,26 +540,7 @@ public partial class MainViewModel : ObservableObject
             return;
         }
 
-        var plan = GameSessionRestore.Plan(pre);
-
-        // The plan carries the V/F table itself when the game could have
-        // changed it; otherwise it has no opinion on the curve, and must not be
-        // read as "the user wants no curve".
-        var result = gpu.Tuner.Apply(plan.Profile, reconcileVfPoints: false);
-
-        // Fans only when the game profile changed them, and only this card's.
-        bool? fansRestored = null;
-        if (plan.Fans is { } fans && _services.FanControl.TryGetValue(gpu.Index, out var fanService))
-        {
-            fansRestored = GameSessionRestore.ApplyFans(fanService, fans);
-            if (fansRestored == true)
-            {
-                // Persisted for this card whichever card is selected (R-23):
-                // otherwise its saved fans kept describing the game's.
-                Fans.RecordApplied(gpu, fans.Mode, fans.FixedPct, fans.Curve);
-            }
-        }
-
+        var (result, fansRestored, plan) = RestorePreGame(pre, gpu);
         string message = GameSessionRestore.Describe(rule.ExecutableName, result, fansRestored, plan.NotRestored);
         Core.Diagnostics.Log.Info($"Game exit restore on GPU {gpu.Index}: {message} {result.Summary}");
         TrayAlert?.Invoke("Afterglow", message);

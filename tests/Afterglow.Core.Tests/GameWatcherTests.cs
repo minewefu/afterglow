@@ -123,4 +123,173 @@ public sealed class GameWatcherTests
         Assert.Equal(expectedStarts, started);
         Assert.Equal(expectedExits, exited);
     }
+
+    // ---- R1: overlapping games ----
+
+    /// <summary>A watcher over <paramref name="running"/> that records every event as text.</summary>
+    private static GameWatcher Recording(List<string> running, List<string> events, params GameRule[] rules)
+    {
+        var watcher = new GameWatcher { RunningProcessNames = () => running };
+        watcher.GameStarted += r => events.Add("start " + r.ExecutableName);
+        watcher.GameHandedOff += (from, to) => events.Add($"handoff {from.ExecutableName} -> {to.ExecutableName}");
+        watcher.GameExited += r => events.Add("exit " + r.ExecutableName);
+        watcher.Start();
+        watcher.UpdateRules(rules);
+        return watcher;
+    }
+
+    [Fact]
+    public void A_game_started_during_another_joins_its_session_and_the_first_profile_stays()
+    {
+        var running = new List<string> { "a" };
+        var events = new List<string>();
+        using var watcher = Recording(running, events, Rule("a.exe"), Rule("b.exe"));
+
+        watcher.Scan();
+        running.Add("b");
+        watcher.Scan();
+
+        Assert.Equal(["start a.exe"], events);
+        Assert.Equal("a.exe", watcher.ActiveRule?.ExecutableName);
+    }
+
+    [Fact]
+    public void When_the_active_game_exits_the_game_still_running_takes_over()
+    {
+        // The user's report: A's profile stayed applied while only B ran, and
+        // nothing changed until B closed too.
+        var running = new List<string> { "a" };
+        var events = new List<string>();
+        using var watcher = Recording(running, events, Rule("a.exe"), Rule("b.exe"));
+        watcher.Scan();
+        running.Add("b");
+        watcher.Scan();
+
+        running.Remove("a");
+        watcher.Scan();
+
+        Assert.Equal(["start a.exe", "handoff a.exe -> b.exe"], events);
+        Assert.Equal("b.exe", watcher.ActiveRule?.ExecutableName);
+
+        // One session, one restore: the end comes when the last game closes.
+        running.Remove("b");
+        watcher.Scan();
+
+        Assert.Equal(["start a.exe", "handoff a.exe -> b.exe", "exit b.exe"], events);
+        Assert.Null(watcher.ActiveRule);
+    }
+
+    [Fact]
+    public void A_joined_game_that_exits_first_changes_nothing()
+    {
+        var running = new List<string> { "a", "b" };
+        var events = new List<string>();
+        using var watcher = Recording(running, events, Rule("a.exe"), Rule("b.exe"));
+        watcher.Scan();
+
+        running.Remove("b");
+        watcher.Scan();
+        Assert.Equal(["start a.exe"], events);
+        Assert.Equal("a.exe", watcher.ActiveRule?.ExecutableName);
+
+        running.Remove("a");
+        watcher.Scan();
+        Assert.Equal(["start a.exe", "exit a.exe"], events);
+    }
+
+    [Fact]
+    public void The_earliest_started_game_still_running_takes_over()
+    {
+        var running = new List<string> { "a" };
+        var events = new List<string>();
+        using var watcher = Recording(running, events, Rule("a.exe"), Rule("b.exe"), Rule("c.exe"));
+        watcher.Scan();
+        running.Add("b");
+        watcher.Scan();
+        running.Add("c");
+        watcher.Scan();
+
+        running.Remove("a");
+        watcher.Scan();
+        running.Remove("b");
+        watcher.Scan();
+
+        Assert.Equal(["start a.exe", "handoff a.exe -> b.exe", "handoff b.exe -> c.exe"], events);
+        Assert.Equal("c.exe", watcher.ActiveRule?.ExecutableName);
+    }
+
+    [Fact]
+    public void Games_that_all_exit_in_one_scan_end_the_session_without_a_handoff()
+    {
+        var running = new List<string> { "a" };
+        var events = new List<string>();
+        using var watcher = Recording(running, events, Rule("a.exe"), Rule("b.exe"));
+        watcher.Scan();
+        running.Add("b");
+        watcher.Scan();
+
+        running.Clear();
+        watcher.Scan();
+
+        Assert.Equal(["start a.exe", "exit a.exe"], events);
+    }
+
+    [Fact]
+    public void A_game_starting_as_the_active_one_exits_joins_the_game_taking_over()
+    {
+        // A exits and C starts inside one poll while B runs: B (already running)
+        // takes over, and C joins B's session rather than opening its own.
+        var running = new List<string> { "a" };
+        var events = new List<string>();
+        using var watcher = Recording(running, events, Rule("a.exe"), Rule("b.exe"), Rule("c.exe"));
+        watcher.Scan();
+        running.Add("b");
+        watcher.Scan();
+
+        running[0] = "c";
+        watcher.Scan();
+
+        Assert.Equal(["start a.exe", "handoff a.exe -> b.exe"], events);
+        Assert.Equal("b.exe", watcher.ActiveRule?.ExecutableName);
+    }
+
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public void The_rule_active_when_the_last_game_exits_decides_the_revert(bool firstReverts, bool lastReverts)
+    {
+        // The exited rule's RevertOnExit plays no part in a hand-off: its profile
+        // is replaced either way, and nothing is restored while a game runs.
+        var running = new List<string> { "a" };
+        var events = new List<string>();
+        using var watcher = Recording(running, events,
+            Rule("a.exe") with { RevertOnExit = firstReverts }, Rule("b.exe") with { RevertOnExit = lastReverts });
+        watcher.Scan();
+        running.Add("b");
+        watcher.Scan();
+        running.Remove("a");
+        watcher.Scan();
+
+        running.Clear();
+        watcher.Scan();
+
+        string[] expected = lastReverts
+            ? ["start a.exe", "handoff a.exe -> b.exe", "exit b.exe"]
+            : ["start a.exe", "handoff a.exe -> b.exe"];
+        Assert.Equal(expected, events);
+    }
+
+    [Fact]
+    public void Deleting_the_active_games_rule_hands_off_to_the_other_running_game()
+    {
+        var running = new List<string> { "a", "b" };
+        var events = new List<string>();
+        using var watcher = Recording(running, events, Rule("a.exe"), Rule("b.exe"));
+        watcher.Scan();
+
+        watcher.UpdateRules([Rule("b.exe")]);
+        watcher.Scan();
+
+        Assert.Equal(["start a.exe", "handoff a.exe -> b.exe"], events);
+    }
 }

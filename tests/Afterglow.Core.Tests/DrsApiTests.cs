@@ -98,6 +98,220 @@ public class DrsApiTests
         Assert.Equal(141u, stored.Settings[DrsApi.FrameRateLimiterId].Value);
     }
 
+    // ---- R1: an empty cap leaves the cap to the driver ----
+
+    [Fact]
+    public void An_empty_cap_writes_nothing_so_a_global_cap_still_applies()
+    {
+        Global[DrsApi.FrameRateLimiterId] = 60;
+        var drs = Create();
+
+        var rc = drs.ApplySettings(Exe, new GameDriverSettings { FrameCapFps = null, Vsync = "on" }, out string note);
+
+        Assert.Equal(NvapiStatus.Ok, rc);
+        Assert.Equal("verified", note);
+        Assert.False(StoredProfile(OwnProfile)!.Settings.ContainsKey(DrsApi.FrameRateLimiterId));
+    }
+
+    [Fact]
+    public void Read_back_reports_an_inherited_global_cap_as_not_the_games_own()
+    {
+        // Reading the global 60 as this game's cap is what made the CLI copy it
+        // into the game's profile on an unrelated `--vsync` change.
+        Global[DrsApi.FrameRateLimiterId] = 60;
+        Seed(new Profile { Name = "Some Game", Apps = [Exe] });
+        var drs = Create();
+
+        Assert.Equal(NvapiStatus.Ok, drs.ReadSettings(Exe, out var settings));
+
+        int? cap = settings.FrameCapFps;
+        Assert.Null(cap);
+    }
+
+    [Fact]
+    public void An_empty_cap_leaves_a_cap_set_in_another_profile_alone()
+    {
+        Seed(UserProfileWithOverrides());   // "Some Game", a 60 fps cap from NVIDIA Control Panel
+        var drs = Create();
+
+        var rc = drs.ApplySettings(Exe, new GameDriverSettings { Vsync = "on" }, out string note);
+
+        Assert.Equal(NvapiStatus.Ok, rc);
+        Assert.Equal("verified", note);
+        Assert.Equal(new Setting(60, IsPredefined: false), StoredProfile("Some Game")!.Settings[DrsApi.FrameRateLimiterId]);
+    }
+
+    [Fact]
+    public void Without_a_cap_written_before_an_empty_cap_removes_nothing_even_in_afterglows_profile()
+    {
+        // The CLI without --cap: "leave the cap as it is", whoever set it.
+        var drs = Create();
+        Assert.Equal(NvapiStatus.Ok, drs.ApplySettings(Exe, new GameDriverSettings { FrameCapFps = 90 }, out _));
+
+        var rc = drs.ApplySettings(Exe, new GameDriverSettings { Vsync = "on" }, out string note);
+
+        Assert.Equal(NvapiStatus.Ok, rc);
+        Assert.Equal("verified", note);
+        Assert.Equal(90u, StoredProfile(OwnProfile)!.Settings[DrsApi.FrameRateLimiterId].Value);
+    }
+
+    [Fact]
+    public void Emptying_a_cap_removes_the_one_afterglow_wrote_in_its_own_profile()
+    {
+        Global[DrsApi.FrameRateLimiterId] = 60;
+        var drs = Create();
+        var before = new GameDriverSettings { FrameCapFps = 90 };
+        Assert.Equal(NvapiStatus.Ok, drs.ApplySettings(Exe, before, out _));
+
+        var rc = drs.ApplySettings(Exe, new GameDriverSettings { Vsync = "on" }, replacing: before, out string note);
+
+        Assert.Equal(NvapiStatus.Ok, rc);
+        Assert.StartsWith("verified; the frame cap Afterglow wrote before (90 fps) was removed", note, StringComparison.Ordinal);
+        Assert.False(StoredProfile(OwnProfile)!.Settings.ContainsKey(DrsApi.FrameRateLimiterId));
+    }
+
+    [Fact]
+    public void Emptying_a_cap_removes_afterglows_value_from_another_profile_while_it_is_unchanged()
+    {
+        // Most games have a profile the driver shipped or the user made, so this
+        // is where Afterglow usually writes; its own value is provable only by
+        // still being exactly what it wrote.
+        Seed(new Profile { Name = "Some Game", Apps = [Exe] });
+        var drs = Create();
+        var before = new GameDriverSettings { FrameCapFps = 0 };
+        Assert.Equal(NvapiStatus.Ok, drs.ApplySettings(Exe, before, out _));
+
+        var rc = drs.ApplySettings(Exe, new GameDriverSettings { LowLatency = true }, replacing: before, out string note);
+
+        Assert.Equal(NvapiStatus.Ok, rc);
+        Assert.Contains("(off) was removed", note, StringComparison.Ordinal);
+        Assert.False(StoredProfile("Some Game")!.Settings.ContainsKey(DrsApi.FrameRateLimiterId));
+    }
+
+    [Fact]
+    public void Emptying_a_cap_keeps_a_cap_changed_since_in_nvidia_control_panel()
+    {
+        Seed(new Profile { Name = "Some Game", Apps = [Exe] });
+        var drs = Create();
+        var before = new GameDriverSettings { FrameCapFps = 90 };
+        Assert.Equal(NvapiStatus.Ok, drs.ApplySettings(Exe, before, out _));
+        StoredProfile("Some Game")!.Settings[DrsApi.FrameRateLimiterId] = new Setting(60, IsPredefined: false);
+
+        var rc = drs.ApplySettings(Exe, new GameDriverSettings { Vsync = "on" }, replacing: before, out string note);
+
+        Assert.Equal(NvapiStatus.Ok, rc);
+        Assert.Equal(
+            "verified; the frame cap in \"Some Game\" (60 fps) was kept: it is no longer the 90 fps Afterglow wrote, " +
+            "so it may be yours (NVIDIA Control Panel can remove it)", note);
+        Assert.Equal(60u, StoredProfile("Some Game")!.Settings[DrsApi.FrameRateLimiterId].Value);
+    }
+
+    [Fact]
+    public void Emptying_a_cap_never_touches_the_drivers_own_predefined_value()
+    {
+        Seed(new Profile
+        {
+            Name = "Shipped Game Profile",
+            IsPredefined = true,
+            Apps = [Exe],
+            Settings = { [DrsApi.FrameRateLimiterId] = new Setting(90, IsPredefined: true) },
+            PredefinedValues = { [DrsApi.FrameRateLimiterId] = 90 },
+        });
+        var drs = Create();
+
+        var rc = drs.ApplySettings(
+            Exe, new GameDriverSettings { Vsync = "on" }, replacing: new GameDriverSettings { FrameCapFps = 90 }, out string note);
+
+        Assert.Equal(NvapiStatus.Ok, rc);
+        Assert.Equal("verified", note);
+        Assert.Equal(new Setting(90, IsPredefined: true),
+            StoredProfile("Shipped Game Profile")!.Settings[DrsApi.FrameRateLimiterId]);
+    }
+
+    [Fact]
+    public void Removing_a_rule_whose_cap_was_empty_keeps_a_users_cap()
+    {
+        // The rule set vsync and left the cap to the driver; removing it used to
+        // strip all three managed settings, the user's own 60 fps cap included.
+        Seed(UserProfileWithOverrides());
+        var drs = Create();
+
+        var rc = drs.ClearSettings(Exe, new GameDriverSettings { Vsync = "off" }, out string note);
+
+        Assert.Equal(NvapiStatus.Ok, rc);
+        Assert.Equal("removed Afterglow's settings from \"Some Game\", saved and verified", note);
+        var stored = StoredProfile("Some Game")!;
+        Assert.Equal(60u, stored.Settings[DrsApi.FrameRateLimiterId].Value);
+        Assert.False(stored.Settings.ContainsKey(DrsApi.VsyncModeId));
+    }
+
+    [Fact]
+    public void Removing_a_rule_takes_back_the_cap_it_wrote()
+    {
+        Seed(new Profile { Name = "Some Game", Apps = [Exe] });
+        var drs = Create();
+        var written = new GameDriverSettings { FrameCapFps = 90, Vsync = "on" };
+        Assert.Equal(NvapiStatus.Ok, drs.ApplySettings(Exe, written, out _));
+
+        var rc = drs.ClearSettings(Exe, written, out _);
+
+        Assert.Equal(NvapiStatus.Ok, rc);
+        Assert.Empty(StoredProfile("Some Game")!.Settings);
+    }
+
+    [Fact]
+    public void Removing_a_rule_keeps_a_cap_changed_since_and_says_so()
+    {
+        Seed(new Profile { Name = "Some Game", Apps = [Exe] });
+        var drs = Create();
+        var written = new GameDriverSettings { FrameCapFps = 90, Vsync = "on" };
+        Assert.Equal(NvapiStatus.Ok, drs.ApplySettings(Exe, written, out _));
+        StoredProfile("Some Game")!.Settings[DrsApi.FrameRateLimiterId] = new Setting(60, IsPredefined: false);
+
+        var rc = drs.ClearSettings(Exe, written, out string note);
+
+        // Ok: the kept cap is meant to stay, so the verification does not count it.
+        Assert.Equal(NvapiStatus.Ok, rc);
+        Assert.Equal(
+            "removed Afterglow's settings from \"Some Game\"; kept its frame cap (60 fps): it is no longer the " +
+            "90 fps Afterglow wrote, so it may be yours, saved and verified", note);
+        Assert.Equal(60u, StoredProfile("Some Game")!.Settings[DrsApi.FrameRateLimiterId].Value);
+    }
+
+    [Fact]
+    public void Removing_a_rule_still_deletes_afterglows_own_profile_outright()
+    {
+        var drs = Create();
+        var written = new GameDriverSettings { Vsync = "on" };
+        Assert.Equal(NvapiStatus.Ok, drs.ApplySettings(Exe, written, out _));
+
+        Assert.Equal(NvapiStatus.Ok, drs.ClearSettings(Exe, written, out _));
+
+        Assert.Null(StoredProfile(OwnProfile));
+    }
+
+    [Theory]
+    [InlineData("drs --exe g.exe --vsync on", null)]
+    [InlineData("drs --exe g.exe --cap 0", 0)]
+    [InlineData("drs --exe g.exe --cap off", 0)]
+    [InlineData("drs --exe g.exe --cap 144", 144)]
+    public void Cli_cap_is_absent_off_or_a_cap(string commandLine, int? expected)
+    {
+        Assert.Null(Afterglow.Cli.DrsCommand.ParseCap(commandLine.Split(' '), out int? cap));
+        Assert.Equal(expected, cap);
+    }
+
+    [Theory]
+    [InlineData("drs --exe g.exe --cap")]
+    [InlineData("drs --exe g.exe --cap --vsync on")]
+    [InlineData("drs --exe g.exe --cap 1001")]
+    [InlineData("drs --exe g.exe --cap -1")]
+    public void Cli_cap_refuses_a_missing_or_bad_value(string commandLine)
+    {
+        Assert.NotNull(Afterglow.Cli.DrsCommand.ParseCap(commandLine.Split(' '), out int? cap));
+        Assert.Null(cap);
+    }
+
     // ---- R-32: ClearSettings reports what it could not do ----
 
     [Fact]

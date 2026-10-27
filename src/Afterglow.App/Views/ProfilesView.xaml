@@ -200,7 +200,7 @@
                     <StackPanel>
                         <TextBlock Text="Per-game profiles and driver settings" Style="{StaticResource SectionTitle}" />
                         <TextBlock Style="{StaticResource SectionDescription}"
-                                   Text="When the game starts, the profile selected above is applied; your previous tuning comes back when it exits. You can also set the NVIDIA driver's own per-game options (frame cap, vsync, low latency). Those are written to the same store the NVIDIA Control Panel edits, so they stay in effect even when Afterglow isn't running." />
+                                   Text="When the game starts, the profile selected above is applied; your previous tuning comes back when it exits. If two of these games run at once, the first one's profile stays; when it exits the other's takes over, and your tuning comes back after the last one closes. You can also set the NVIDIA driver's own per-game options (frame cap, vsync, low latency). Those are written to the same store the NVIDIA Control Panel edits, so they stay in effect even when Afterglow isn't running." />
 
                         <Grid Margin="0,12,0,0">
                             <Grid.ColumnDefinitions>
@@ -211,14 +211,15 @@
                                      views:Hint.Placeholder="Game executable, e.g. cyberpunk2077.exe"
                                      AutomationProperties.Name="Game executable" />
                             <Button Grid.Column="1" Style="{StaticResource GhostButton}" Content="Add rule"
-                                    Command="{Binding AddRuleCommand}" Margin="8,0,0,0" />
+                                    Command="{Binding AddRuleCommand}" Margin="8,0,0,0"
+                                    ToolTip="Adds a rule for this game. A game that already has a rule gets this one instead." />
                         </Grid>
                         <WrapPanel Margin="0,12,0,0">
                             <TextBlock Text="Frame cap" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,8,0" />
                             <TextBox Text="{Binding NewRuleCapFps, UpdateSourceTrigger=PropertyChanged}" Width="72"
-                                     TextAlignment="Center" views:Hint.Placeholder="off" Margin="0,0,20,0"
+                                     TextAlignment="Center" views:Hint.Placeholder="not set" Margin="0,0,20,0"
                                      AutomationProperties.Name="Frame cap, frames per second"
-                                     ToolTip="The driver's frame-rate limiter; empty or 0 = no cap. With another driver option set, 0 is written as off for this game, which overrides a global cap; otherwise the driver's own settings stay in charge." />
+                                     ToolTip="The driver's frame-rate limiter for this game. Empty: Afterglow leaves the cap to the driver, so a global cap set in NVIDIA Control Panel still applies. 0 or off: no cap for this game, even with a global cap. 1–1000: a cap at that many fps." />
                             <TextBlock Text="Vsync" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,8,0" />
                             <ComboBox SelectedIndex="{Binding NewRuleVsyncIndex}" MinWidth="150" Margin="0,0,20,0"
                                       AutomationProperties.Name="Vsync">

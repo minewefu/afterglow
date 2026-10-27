@@ -45,13 +45,6 @@ public partial class ProfilesViewModel : ObservableObject
         }
     }
 
-    private static Core.Interop.Nvapi.GameDriverSettings ToDriverSettings(GameRule rule) => new()
-    {
-        FrameCapFps = rule.FrameCapFps,
-        Vsync = rule.DriverVsync,
-        LowLatency = rule.LowLatency,
-    };
-
     [ObservableProperty]
     public partial GameRule? SelectedRule { get; set; }
 
@@ -234,11 +227,16 @@ public partial class ProfilesViewModel : ObservableObject
             exe += ".exe";
         }
 
-        int capFps = int.TryParse(NewRuleCapFps.Trim(),
-            System.Globalization.NumberStyles.Integer,
-            System.Globalization.CultureInfo.InvariantCulture, out int cap)
-            ? Math.Clamp(cap, 0, 1000)
-            : 0;
+        // Empty, 0 / off, or 1–1000 (R1). Text that is none of those used to be
+        // saved as 0 and an out-of-range number clamped, both silently; empty
+        // was saved as 0 too, so "leave the cap to the driver" and "off" could
+        // not be told apart.
+        if (GameRule.ParseFrameCap(NewRuleCapFps, out int? capFps) is string capError)
+        {
+            StatusText = $"{capError} The rule was not added.";
+            return;
+        }
+
         var rule = new GameRule
         {
             ExecutableName = exe,
@@ -247,6 +245,19 @@ public partial class ProfilesViewModel : ObservableObject
             DriverVsync = NewRuleVsyncIndex switch { 1 => "on", 2 => "off", _ => "default" },
             LowLatency = NewRuleLowLatency,
         };
+
+        // One rule per game: the watcher keys rules by executable, so a second
+        // rule for the same exe silently overrode the first while both showed,
+        // and removing either cleared the driver settings of both. Adding a rule
+        // for a game that has one replaces it — the way a rule is edited.
+        var replaced = GameRules
+            .Where(r => string.Equals(r.ExecutableName, exe, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        foreach (var old in replaced)
+        {
+            GameRules.Remove(old);
+        }
+
         GameRules.Add(rule);
         PersistRules();
         NewRuleExe = string.Empty;
@@ -254,23 +265,37 @@ public partial class ProfilesViewModel : ObservableObject
         NewRuleVsyncIndex = 0;
         NewRuleLowLatency = false;
 
-        string drsNote = string.Empty;
-        if (ToDriverSettings(rule).AnythingSet)
+        // What the replaced rule wrote, so an emptied cap takes back the cap it
+        // wrote (DrsApi.ReleaseCap). The last one is the one the watcher used.
+        var before = replaced.LastOrDefault()?.ToDriverSettings();
+        if (before is { AnythingSet: false })
         {
-            drsNote = ApplyRuleDriverSettings(rule);
+            before = null;
         }
 
-        StatusText = $"When {exe} runs, '{rule.ProfileName}' will be applied automatically (reverted on exit).{drsNote}";
+        string drsNote = string.Empty;
+        if (rule.ToDriverSettings().AnythingSet)
+        {
+            drsNote = ApplyRuleDriverSettings(rule, before);
+        }
+        else if (before is not null)
+        {
+            // The new rule writes nothing; the old one's settings would outlive it.
+            drsNote = ClearRuleDriverSettings(replaced[^1]);
+        }
+
+        StatusText = $"{(replaced.Count > 0 ? "Rule replaced. " : string.Empty)}" +
+                     $"When {exe} runs, '{rule.ProfileName}' will be applied automatically (reverted on exit).{drsNote}";
     }
 
-    private string ApplyRuleDriverSettings(GameRule rule)
+    private string ApplyRuleDriverSettings(GameRule rule, Core.Interop.Nvapi.GameDriverSettings? replacing)
     {
         if (Drs is not { } drs)
         {
             return " Driver settings NOT applied — DRS unavailable on this system.";
         }
 
-        var rc = drs.ApplySettings(rule.ExecutableName, ToDriverSettings(rule), out string note);
+        var rc = drs.ApplySettings(rule.ExecutableName, rule.ToDriverSettings(), replacing, out string note);
         if (rc == Core.Interop.Nvapi.NvapiStatus.Ok)
         {
             return $" Driver settings applied and {note} (persist in the driver, active whenever the game runs).";
@@ -301,14 +326,30 @@ public partial class ProfilesViewModel : ObservableObject
 
         PersistRules();
         string drsNote = string.Empty;
-        if (ToDriverSettings(rule).AnythingSet && Drs is { } drs)
+        if (rule.ToDriverSettings().AnythingSet)
         {
-            drsNote = drs.ClearSettings(rule.ExecutableName) == Core.Interop.Nvapi.NvapiStatus.Ok
-                ? " Driver settings cleared."
-                : " Driver settings could not be cleared.";
+            drsNote = ClearRuleDriverSettings(rule);
         }
 
         StatusText = $"Rule removed.{drsNote}";
+    }
+
+    /// <summary>
+    /// Takes back what one rule wrote to the driver store. Scoped to that rule
+    /// (R1): a rule whose cap was empty never removes a cap, and a cap changed
+    /// since Afterglow wrote it (in NVIDIA Control Panel, say) is kept and named.
+    /// </summary>
+    private string ClearRuleDriverSettings(GameRule rule)
+    {
+        if (Drs is not { } drs)
+        {
+            return string.Empty;
+        }
+
+        return drs.ClearSettings(rule.ExecutableName, rule.ToDriverSettings(), out string note) ==
+               Core.Interop.Nvapi.NvapiStatus.Ok
+            ? $" Driver settings cleared ({note})."
+            : $" Driver settings could not be cleared ({note}).";
     }
 
     private void PersistRules()

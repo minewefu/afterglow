@@ -10,12 +10,35 @@ namespace Afterglow.Core.Services;
 /// and the poll only runs while there is something to watch: with no rules and
 /// no game in flight there is no timer at all, so a resident Afterglow without
 /// game rules never wakes up for this.
+/// <para>
+/// Configured games that overlap share one session, so there is one pre-game
+/// state to restore (R1):
+/// <list type="bullet">
+/// <item>the first configured game to start opens the session (<see cref="GameStarted"/>);</item>
+/// <item>a game that starts while another configured game runs joins it, and
+/// the first game's profile stays — one card can run one profile, and the
+/// first game is the one that asked;</item>
+/// <item>when the game whose profile is active exits while another configured
+/// game still runs, the earliest-started of those takes over
+/// (<see cref="GameHandedOff"/>): its profile is applied, and the session's
+/// pre-game state stays the restore target. It used to keep the exited game's
+/// profile until the last game closed;</item>
+/// <item>when the last one exits, the session ends (<see cref="GameExited"/>),
+/// and the rule active at that moment decides by its RevertOnExit whether
+/// the pre-game state comes back.</item>
+/// </list>
+/// </para>
 /// </summary>
 public sealed class GameWatcher : IDisposable
 {
     private readonly Lock _lock = new();
     private readonly Dictionary<string, GameRule> _rules = new(StringComparer.OrdinalIgnoreCase);
-    private readonly HashSet<string> _activeGames = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Configured games running in this session, in the order they were seen to start.</summary>
+    private readonly List<string> _activeGames = [];
+
+    /// <summary>The game whose rule is <see cref="ActiveRule"/>.</summary>
+    private string? _activeGame;
     private Timer? _timer;
     private bool _started;
 
@@ -49,10 +72,27 @@ public sealed class GameWatcher : IDisposable
         }
     }
 
-    /// <summary>Raised when a configured game starts (rule) — apply its profile.</summary>
+    /// <summary>
+    /// Raised when a configured game starts with no other configured game
+    /// running: a session opens. Capture the pre-game state, apply its profile.
+    /// </summary>
     public event Action<GameRule>? GameStarted;
 
-    /// <summary>Raised when the last configured game exits and its rule wants a revert.</summary>
+    /// <summary>
+    /// Raised when the game whose profile is active exits while other configured
+    /// games still run: (the exited game's rule, the rule taking over). Apply the
+    /// new rule's profile; keep the pre-game state captured at
+    /// <see cref="GameStarted"/> as the restore target, since it is what the card
+    /// ran before any of these games. The exited rule's RevertOnExit does not
+    /// apply here: its profile is replaced, not kept, and nothing is restored
+    /// while a configured game still runs.
+    /// </summary>
+    public event Action<GameRule, GameRule>? GameHandedOff;
+
+    /// <summary>
+    /// Raised when the last configured game exits and the session's active rule
+    /// (the one that started it, or the last to take over) wants a revert.
+    /// </summary>
     public event Action<GameRule>? GameExited;
 
     /// <summary>The rule whose profile is currently active, if any.</summary>
@@ -128,28 +168,51 @@ public sealed class GameWatcher : IDisposable
                 // restore waited for the newcomer's exit. The exit is raised
                 // before the start, so the handlers restore the old pre-game
                 // state before capturing the new one.
-                var exited = _activeGames.Where(g => !running.Contains(g)).ToList();
-                foreach (string name in exited)
+                int before = _activeGames.Count;
+                _activeGames.RemoveAll(g => !running.Contains(g));
+                if (_activeGames.Count < before && ActiveRule is { } rule && _activeGame is { } activeGame &&
+                    !_activeGames.Contains(activeGame, StringComparer.OrdinalIgnoreCase))
                 {
-                    _activeGames.Remove(name);
-                }
-
-                if (exited.Count > 0 && _activeGames.Count == 0 && ActiveRule is { } rule)
-                {
-                    ActiveRule = null;
-                    if (rule.RevertOnExit)
+                    if (_activeGames.Count > 0)
                     {
-                        GameExited?.Invoke(rule);
+                        // R1: the active game left while another configured game
+                        // runs. The earliest-started one still running takes over
+                        // — the same "first game's profile" rule, applied to the
+                        // games that remain — rather than the exited game's
+                        // profile staying on until the last one closes. Games that
+                        // exited in this same scan are already gone, so the
+                        // hand-off never goes to one of them.
+                        _activeGame = _activeGames[0];
+                        ActiveRule = _rules[_activeGame];
+                        GameHandedOff?.Invoke(rule, ActiveRule);
+                    }
+                    else
+                    {
+                        _activeGame = null;
+                        ActiveRule = null;
+                        if (rule.RevertOnExit)
+                        {
+                            GameExited?.Invoke(rule);
+                        }
                     }
                 }
 
-                // Newly started games.
+                // Newly started games. Two seen in the same scan have no start
+                // order to go by; the first one enumerated opens the session.
                 foreach (string name in running)
                 {
-                    if (_activeGames.Add(name) && _activeGames.Count == 1)
+                    if (_activeGames.Contains(name, StringComparer.OrdinalIgnoreCase))
                     {
+                        continue;
+                    }
+
+                    _activeGames.Add(name);
+                    if (ActiveRule is null)
+                    {
+                        // No session: this game opens one. Any later game joins it.
+                        _activeGame = name;
                         ActiveRule = _rules[name];
-                        GameStarted?.Invoke(_rules[name]);
+                        GameStarted?.Invoke(ActiveRule);
                     }
                 }
 

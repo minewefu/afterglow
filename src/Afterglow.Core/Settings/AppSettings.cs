@@ -61,23 +61,109 @@ public sealed record GameRule
 
     public required string ProfileName { get; init; }
 
-    /// <summary>Restore the previous tuning when the game exits.</summary>
+    /// <summary>
+    /// Restore the pre-game tuning when this game ends a game session: when it
+    /// exits and no other configured game is still running. When it exits while
+    /// another configured game runs, that game's rule takes over instead, and
+    /// its own RevertOnExit decides at the end (<see cref="Services.GameWatcher"/>).
+    /// </summary>
     public bool RevertOnExit { get; init; } = true;
 
     /// <summary>
-    /// Driver frame-rate limiter for this game (DRS), 0–1000; 0 = no cap. When
-    /// the rule writes driver settings (another option set), 0 is stored as the
-    /// driver's explicit "off" for this game, which overrides a global cap set in
-    /// NVIDIA Control Panel. A rule with no driver option set writes nothing, so
-    /// the driver's own settings, a global cap included, stay in charge.
+    /// Driver frame-rate limiter for this game (DRS):
+    /// <list type="bullet">
+    /// <item>null (the editor's empty field): Afterglow leaves the game's cap
+    /// alone, so the driver's own settings, a global cap set in NVIDIA Control
+    /// Panel included, stay in charge;</item>
+    /// <item>0: off for this game, written as the driver's explicit "disabled"
+    /// value, which overrides a global cap;</item>
+    /// <item>1–1000: a cap of that many fps.</item>
+    /// </list>
+    /// Written to the driver store when the rule is added, with the vsync and
+    /// low-latency options (<see cref="ToDriverSettings"/>). It used to be a plain
+    /// int whose 0 meant "off" when another driver option was set and "leave it"
+    /// otherwise, and the editor stored an empty field as 0 too; files from then
+    /// read a 0 as empty, which is what those rules actually did in 1.5.0.
     /// </summary>
-    public int FrameCapFps { get; init; }
+    [JsonIgnore]
+    public int? FrameCapFps
+    {
+        get => FrameCapFpsStored > 0 ? FrameCapFpsStored : FrameCapOffStored ? 0 : null;
+        init
+        {
+            FrameCapFpsStored = value ?? 0;
+            FrameCapOffStored = value == 0;
+        }
+    }
+
+    /// <summary>
+    /// The cap as the settings file carries it, under the name 1.5.0 used: N for
+    /// a cap, 0 for both empty and off. Keeping the old name and meaning is what
+    /// lets an older build read a newer file: it gets every cap, and its own
+    /// "0 = no cap" for the rest. An extra name for the number would have read
+    /// as 0 everywhere, and a rule saved by the older build would lose its cap.
+    /// </summary>
+    [JsonInclude]
+    [JsonPropertyName("frameCapFps")]
+    internal int FrameCapFpsStored { get; init; }
+
+    /// <summary>
+    /// True when a stored 0 means "off for this game" rather than empty. Files
+    /// from before this flag lack it, so their 0 reads as empty; an older build
+    /// ignores it and drops it when it saves, so "off" degrades to empty, never
+    /// the other way.
+    /// </summary>
+    [JsonInclude]
+    [JsonPropertyName("frameCapOff")]
+    internal bool FrameCapOffStored { get; init; }
 
     /// <summary>Driver vsync for this game: "default", "on", or "off".</summary>
     public string DriverVsync { get; init; } = "default";
 
     /// <summary>Cap the game's pre-rendered frames at 1 (driver low-latency).</summary>
     public bool LowLatency { get; init; }
+
+    /// <summary>The driver options this rule writes through DRS.</summary>
+    public Interop.Nvapi.GameDriverSettings ToDriverSettings() => new()
+    {
+        FrameCapFps = FrameCapFps,
+        Vsync = DriverVsync,
+        LowLatency = LowLatency,
+    };
+
+    /// <summary>
+    /// The rule editor's frame-cap field: empty or blank = leave the cap alone
+    /// (null), "0" or "off" = off for this game, 1–1000 = a cap. Returns null
+    /// when <paramref name="text"/> is one of those, else what is wrong with it.
+    /// Anything else used to be stored silently: unparsable text as 0, and an
+    /// out-of-range number clamped.
+    /// </summary>
+    public static string? ParseFrameCap(string? text, out int? fps)
+    {
+        fps = null;
+        string trimmed = text?.Trim() ?? string.Empty;
+        if (trimmed.Length == 0)
+        {
+            return null;
+        }
+
+        if (string.Equals(trimmed, "off", StringComparison.OrdinalIgnoreCase))
+        {
+            fps = 0;
+            return null;
+        }
+
+        if (!int.TryParse(trimmed, System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out int value) ||
+            value > Interop.Nvapi.DrsApi.MaxFrameCapFps)
+        {
+            return $"The frame cap must be empty, 0 (off) or a whole number from 1 to " +
+                   $"{Interop.Nvapi.DrsApi.MaxFrameCapFps} fps, not '{trimmed}'.";
+        }
+
+        fps = value;
+        return null;
+    }
 }
 
 /// <summary>

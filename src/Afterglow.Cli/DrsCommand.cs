@@ -5,12 +5,13 @@ using Afterglow.Core.Interop.Nvapi;
 namespace Afterglow.Cli;
 
 /// <summary>
-/// `drs --exe NAME [--cap FPS] [--vsync default|on|off] [--low-latency on|off] [--clear]`
+/// `drs --exe NAME [--cap FPS|off] [--vsync default|on|off] [--low-latency on|off] [--clear]`
 /// — per-game NVIDIA driver settings (the same store the NVIDIA Control Panel
-/// edits). With only --exe, prints the current values. `--cap 0` turns the
-/// limiter off for this game (stored as the driver's explicit "disabled", so a
-/// global cap does not apply); --clear removes Afterglow's settings so the game
-/// inherits the global ones again.
+/// edits). With only --exe, prints the current values. `--cap 1..1000` caps the
+/// game; `--cap 0` (or `off`) turns the limiter off for this game (stored as the
+/// driver's explicit "disabled", so a global cap does not apply); without --cap
+/// the game's cap is left as it is. --clear removes Afterglow's settings so the
+/// game inherits the global ones again.
 ///   --cleanup [--apply]   find the profile "A" that 1.2.0-beta.4 and earlier left
 ///                         (names truncated to one letter); a dry run unless
 ///                         --apply, which deletes exact matches only (admin)
@@ -20,9 +21,10 @@ namespace Afterglow.Cli;
 internal static class DrsCommand
 {
     private const string Usage =
-        "Usage: afterglow-cli drs --exe game.exe [--cap FPS] [--vsync default|on|off] " +
+        "Usage: afterglow-cli drs --exe game.exe [--cap FPS|off] [--vsync default|on|off] " +
         "[--low-latency on|off] [--clear]\n" +
-        "         --cap 0 = limiter off for this game (overrides a global cap); --clear = back to the global settings\n" +
+        "         --cap 1..1000 = cap; --cap 0 or off = limiter off for this game (overrides a global cap)\n" +
+        "         no --cap = the game's cap is left as it is; --clear = back to the global settings\n" +
         "       afterglow-cli drs --cleanup [--apply]\n" +
         "       afterglow-cli drs --selftest";
 
@@ -40,7 +42,6 @@ internal static class DrsCommand
         }
 
         string? exe = null;
-        int cap = -1;
         string? vsync = null;
         bool? lowLatency = null;
         bool clear = false;
@@ -59,7 +60,7 @@ internal static class DrsCommand
         // out of range, is an error — not a silent fall-through to the read-only
         // branch (nothing written, exit 0), and not a silent clamp that turned
         // `--cap -5` into cap=0 (uncapped) and reported it as applied.
-        if (CliArgs.TryInt(args, "--cap", 0, 1000, ref cap) is string capError)
+        if (ParseCap(args, out int? cap) is string capError)
         {
             Console.Error.WriteLine($"{capError} Nothing was written.");
             return 2;
@@ -173,33 +174,69 @@ internal static class DrsCommand
             return rc == NvapiStatus.Ok ? 0 : 1;
         }
 
-        if (cap >= 0 || vsync is not null || lowLatency is not null)
+        if (cap is not null || vsync is not null || lowLatency is not null)
         {
-            // Start from what's stored so unspecified knobs are preserved. These
-            // are the values the game currently gets, inherited ones included, and
-            // all three are written: without --cap, a game running uncapped gets
-            // an explicit "off" (R-31), which a global cap set later won't override.
+            // Start from what's stored so unspecified knobs are preserved: vsync
+            // and low latency as the game currently gets them, inherited values
+            // included. Not the cap (R1): without --cap it is not written at all,
+            // so it stays whatever the game's profile holds, or the global
+            // setting. It used to be written as read, which stored an explicit
+            // "off" for a game running uncapped (a global cap set later then
+            // didn't reach it) and copied an inherited global cap into the game's
+            // own profile.
             _ = drs.ReadSettings(exe, out var current);
             var settings = new GameDriverSettings
             {
-                FrameCapFps = cap >= 0 ? cap : current.FrameCapFps,
+                FrameCapFps = cap,
                 Vsync = vsync ?? current.Vsync,
                 LowLatency = lowLatency ?? current.LowLatency,
             };
             var rc = drs.ApplySettings(exe, settings, out string note);
             Console.WriteLine(rc == NvapiStatus.Ok
-                ? $"Applied to {exe}: cap={settings.FrameCapFps} vsync={settings.Vsync} " +
-                  $"low-latency={settings.LowLatency} ({note})"
+                ? $"Applied to {exe}: cap={(cap is null ? "unchanged" : DrsApi.CapText(cap))} " +
+                  $"vsync={settings.Vsync} low-latency={settings.LowLatency} ({note})"
                 : $"Apply failed: {rc} {note}");
             return rc == NvapiStatus.Ok ? 0 : 1;
         }
 
         var read = drs.ReadSettings(exe, out var stored);
         Console.WriteLine(read == NvapiStatus.Ok
-            ? $"{exe}: cap={stored.FrameCapFps} (0=off) vsync={stored.Vsync} low-latency={stored.LowLatency}"
+            ? $"{exe}: cap={DescribeStoredCap(stored.FrameCapFps)} vsync={stored.Vsync} low-latency={stored.LowLatency}"
             : $"{exe}: no driver profile found ({read})");
         return 0;
     }
+
+    /// <summary>
+    /// `--cap`'s value, parsed as the Profiles page parses its field
+    /// (<see cref="Core.Settings.GameRule.ParseFrameCap"/>): 1–1000, or 0 / off.
+    /// <paramref name="cap"/> is null when --cap is absent: leave the cap alone.
+    /// Unlike the page's field an empty value is refused; leaving --cap out says that.
+    /// </summary>
+    internal static string? ParseCap(string[] args, out int? cap)
+    {
+        cap = null;
+        int at = Array.IndexOf(args, "--cap");
+        if (at < 0)
+        {
+            return null;
+        }
+
+        string? value = at + 1 < args.Length ? args[at + 1] : null;
+        if (string.IsNullOrWhiteSpace(value) || value.StartsWith("--", StringComparison.Ordinal))
+        {
+            return "'--cap' needs a value: 1 to 1000 fps, or 0 / off for no cap (leave --cap out to keep the game's cap).";
+        }
+
+        return Core.Settings.GameRule.ParseFrameCap(value, out cap) is string error ? $"'--cap': {error}" : null;
+    }
+
+    /// <summary>The cap <see cref="DrsApi.ReadSettings"/> found, in words.</summary>
+    internal static string DescribeStoredCap(int? cap) => cap switch
+    {
+        null => "not set for this game (the global setting applies)",
+        0 => "off (overrides a global cap)",
+        _ => DrsApi.CapText(cap),
+    };
 
     /// <summary>
     /// The hidden --probe-create's two profile names: a bare one, and one shaped
