@@ -52,6 +52,7 @@ public sealed class CertificationRunTests : IDisposable
         CoreOffsetMHz = core,
         MemOffsetMHz = mem,
         GpuUuid = "GPU-TEST-0000",
+        WorkloadRevision = mode == CertificationModes.Vram ? null : GpuStressTest.WorkloadRevision,
     };
 
     /// <summary>
@@ -124,6 +125,36 @@ public sealed class CertificationRunTests : IDisposable
         var stored = store.Load(profile.Name)!;
         Assert.True(stored.MarkedStable);
         Assert.Equal(CertificationModes.All.Order(), stored.Certifications.Select(c => c.Mode).Order());
+    }
+
+    [Fact]
+    public void A_run_stamps_the_burn_revision_and_replaces_passes_the_older_burn_earned()
+    {
+        // A profile certified by the burn before R-01's fix: its three burn
+        // passes are stored without a revision and no longer count. A new run
+        // says so, then stamps the burn modes with this build's revision — and
+        // only them: the VRAM test is not the burn.
+        var store = Store();
+        var profile = Daily() with
+        {
+            MarkedStable = true,
+            Certifications = [.. CertificationModes.All.Select(mode => Cert(mode, 100, 500) with { WorkloadRevision = null })],
+        };
+        store.Save(profile);
+        Assert.True(store.Load(profile.Name)!.CertifiedWithOlderStressTest);
+        var tuner = new WriteTrackingTuner();
+
+        var final = Run(Certifier(tuner, store), profile);
+
+        Assert.Equal("done", final.Phase);
+        Assert.Contains(final.Log, line => line.Contains(
+            "sustained, transitions, excursions passes were earned with an older stress test", StringComparison.Ordinal));
+
+        var stored = store.Load(profile.Name)!;
+        Assert.Equal(CertificationModes.All.Order(), stored.Certifications.Select(c => c.Mode).Order());
+        Assert.All(stored.Certifications, c => Assert.Equal(
+            c.Mode == CertificationModes.Vram ? null : (int?)GpuStressTest.WorkloadRevision, c.WorkloadRevision));
+        Assert.False(stored.CertifiedWithOlderStressTest);
     }
 
     [Fact]

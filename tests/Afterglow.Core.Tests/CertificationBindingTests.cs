@@ -1,5 +1,6 @@
 using Afterglow.Core.Fans;
 using Afterglow.Core.Profiles;
+using Afterglow.Core.Stress;
 
 namespace Afterglow.Core.Tests;
 
@@ -47,6 +48,7 @@ public sealed class CertificationBindingTests : IDisposable
         CoreOffsetMHz = profile.CoreOffsetMHz,
         MemOffsetMHz = profile.MemOffsetMHz,
         TuningFingerprint = profile.TuningFingerprint(),
+        WorkloadRevision = mode == CertificationModes.Vram ? null : GpuStressTest.WorkloadRevision,
     };
 
     private static TuningProfile Changed(string knob) => knob switch

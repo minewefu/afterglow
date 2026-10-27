@@ -129,8 +129,26 @@ internal static class CertifyCommand
         done.Wait();
         Console.WriteLine();
 
+        // Where every mode stands now, from the saved profile — a cancelled or
+        // failed run leaves passes it never reached, and one earned by the burn
+        // before R-01's fix is still stored but no longer counts.
+        if (store.Load(name) is { } after)
+        {
+            foreach (string line in StatusLines(after))
+            {
+                Console.WriteLine(line);
+            }
+        }
+
         return final?.Passed == true ? 0 : 1;
     }
+
+    /// <summary>Each mode's standing for the saved profile, with the reason when a stored pass no longer counts.</summary>
+    internal static IReadOnlyList<string> StatusLines(TuningProfile profile) =>
+    [
+        $"Certification of '{profile.Name}':",
+        .. CertificationModes.All.Select(mode => $"  {mode,-12} {profile.Describe(mode)}"),
+    ];
 
     /// <summary>
     /// Why this command cannot certify the profile as saved, or null. A fan

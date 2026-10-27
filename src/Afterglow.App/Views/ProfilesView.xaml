@@ -88,8 +88,14 @@
                                                 <Border Background="#2EE8B33C" CornerRadius="4" Padding="6,1" Margin="6,0,0,0"
                                                         VerticalAlignment="Center"
                                                         Visibility="{Binding FullyCertified, Converter={x:Static views:Converters.BoolToVisibility}}"
-                                                        ToolTip="Passed all four stability modes (sustained, transitions, excursions, VRAM) at these offsets.">
+                                                        ToolTip="Passed all four stability modes (sustained, transitions, excursions, VRAM) at these settings, on this driver, with the current stress test.">
                                                     <TextBlock Text="Certified" FontSize="12" Foreground="{StaticResource Warn}" />
+                                                </Border>
+                                                <Border Background="#2E97A1AE" CornerRadius="4" Padding="6,1" Margin="6,0,0,0"
+                                                        VerticalAlignment="Center"
+                                                        Visibility="{Binding CertifiedWithOlderStressTest, Converter={x:Static views:Converters.BoolToVisibility}}"
+                                                        ToolTip="Some of its stability passes were earned with an older stress test that could not detect a miscalculation, so they no longer count. Certify it again below.">
+                                                    <TextBlock Text="Re-certify" FontSize="12" Foreground="{StaticResource TextMuted}" />
                                                 </Border>
                                             </StackPanel>
                                             <TextBlock Style="{StaticResource Caption}" Margin="0,2,0,0">
@@ -133,7 +139,7 @@
                     <StackPanel>
                         <TextBlock Text="Certify a profile" Style="{StaticResource SectionTitle}" />
                         <TextBlock Style="{StaticResource SectionDescription}"
-                                   Text="Applies the selected profile and runs all four stability modes against it in turn: sustained burn, transition cycling, boost excursions and the full-VRAM test. Each pass is recorded in the profile and tied to its exact offsets (changing them clears the record). Passing all four marks it stable. A failure stops the run and resets the GPU to driver defaults." />
+                                   Text="Applies the selected profile and runs all four stability modes against it in turn: sustained burn, transition cycling, boost excursions and the full-VRAM test. Each pass is recorded in the profile, tied to its exact settings, its driver and the stress test that earned it; when any of those changes, the pass no longer counts. Passing all four marks it stable. A failure stops the run and resets the GPU to driver defaults." />
 
                         <ContentControl Style="{StaticResource WarnBanner}" Content="{Binding CertifyGateText}" Margin="0,12,0,0"
                                         Visibility="{Binding CanCertify, Converter={x:Static views:Converters.InverseBoolToVisibility}}" />

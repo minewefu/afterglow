@@ -81,13 +81,22 @@ public sealed record TuningProfile
     /// <summary>
     /// Stability modes this profile has passed (see <see cref="CertificationModes"/>).
     /// A certification only counts while the profile's offsets still match the
-    /// values it was earned at.
+    /// values it was earned at (see <see cref="CertificationModes.IsValidFor"/>
+    /// for the full rule).
     /// </summary>
     public IReadOnlyList<ProfileCertification> Certifications { get; init; } = [];
 
     /// <summary>All four modes passed at the current offsets (display convenience).</summary>
     [System.Text.Json.Serialization.JsonIgnore]
     public bool FullyCertified => this.IsFullyCertified();
+
+    /// <summary>
+    /// Some mode was passed at the current configuration only by a burn from
+    /// before R-01's fix, so it no longer counts (display convenience — the
+    /// Profiles list says "Re-certify" instead of silently losing its badge).
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool CertifiedWithOlderStressTest => this.HasCertificationFromOlderStressTest();
 
     /// <summary>Free-form user notes.</summary>
     public string Notes { get; init; } = string.Empty;

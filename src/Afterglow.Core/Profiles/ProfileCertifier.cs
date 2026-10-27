@@ -38,7 +38,8 @@ public sealed record CertifierStatus(
 /// tuning — and runs all four stability modes against it in sequence: sustained
 /// burn, transition cycling, boost excursions, and the full-VRAM test. Every
 /// pass is stamped into the profile, pinned to the fingerprint of the tested
-/// configuration; passing all four marks the profile stable. A demonstrated
+/// configuration (and, for the three burn modes, to the burn's workload
+/// revision); passing all four marks the profile stable. A demonstrated
 /// failure (an artifact or a driver reset) revokes that configuration's stable
 /// mark and the failed mode's certificate, then resets the GPU to driver
 /// defaults, because the config just proved itself unsafe.
@@ -216,6 +217,19 @@ public sealed class ProfileCertifier
             return new Outcome("interrupted", 0, Passed: false);
         }
 
+        // Passes the burn earned before R-01's fix are kept on the profile but
+        // no longer count; say so up front, so a run over a profile that read
+        // "certified" is not mistaken for a pointless repeat.
+        string[] olderBurn = [.. CertificationModes.All.Where(mode =>
+            saved.StandingOf(mode) == CertificationStanding.OlderStressTest)];
+        if (olderBurn.Length > 0)
+        {
+            bool one = olderBurn.Length == 1;
+            Log($"Its earlier {string.Join(", ", olderBurn)} {(one ? "pass was" : "passes were")} earned with an " +
+                "older stress test, which could not detect a miscalculation, so " +
+                $"{(one ? "it no longer counts" : "they no longer count")}. This run tests every mode again.");
+        }
+
         // The fan policy is part of the configuration under test (R-11), and it
         // goes on first, so a policy the driver refuses leaves the clocks alone.
         if (ApplyFans(profile) is string fanRefusal)
@@ -259,9 +273,12 @@ public sealed class ProfileCertifier
                 mode == CertificationModes.Transitions ? Math.Max(seconds, 90) : seconds);
 
             Log($"[{i + 1}/4] {ModeTitle(mode)} for {duration.TotalSeconds:F0} s…");
-            var result = mode == CertificationModes.Vram
-                ? RunVramMode(i, duration, guard)
-                : RunStressMode(mode, i, duration, guard);
+
+            // One predicate picks the engine and says which passes carry the
+            // burn's workload revision (StampCertification), so the two agree.
+            var result = CertificationModes.UsesBurnWorkload(mode)
+                ? RunStressMode(mode, i, duration, guard)
+                : RunVramMode(i, duration, guard);
 
             // A demonstrated fault decides the outcome before anything else,
             // cancel and interruption included (R-04): the hardware misbehaved,
@@ -630,6 +647,11 @@ public sealed class ProfileCertifier
                 GpuUuid = _tuner.GpuUuid,
                 DriverVersion = CertificationModes.CurrentDriverFor(_tuner.GpuUuid),
                 TuningFingerprint = fingerprint,
+
+                // Which burn earned it: a pass is evidence only of what that
+                // burn could detect, and revision 1 could not see a
+                // miscalculation (R-01). The VRAM test is not the burn.
+                WorkloadRevision = CertificationModes.UsesBurnWorkload(mode) ? GpuStressTest.WorkloadRevision : null,
             });
             _store.Save(stored with { Certifications = kept, ModifiedAt = DateTimeOffset.Now });
         }

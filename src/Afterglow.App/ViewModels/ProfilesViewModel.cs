@@ -87,14 +87,11 @@ public partial class ProfilesViewModel : ObservableObject
 
     public string CertifySecondsLabel => $"{CertifySeconds:F0} s per mode";
 
-    public string SelectedCertificationText => Selected is not { } p
-        ? string.Empty
-        : string.Join("   ", CertificationModes.All.Select(mode =>
-            p.ValidCertification(mode) is { } cert
-                ? $"{mode} ✓ {cert.PassedAt:MM-dd}"
-                : p.OffsetMatchedCertification(mode) is not null
-                    ? $"{mode} ⚠ driver changed"
-                    : $"{mode} —"));
+    /// <summary>
+    /// Each mode's mark, then why any stored pass no longer counts — a driver
+    /// change, or a burn from before R-01's fix (Core, so it is tested).
+    /// </summary>
+    public string SelectedCertificationText => Selected?.StatusSummary() ?? string.Empty;
 
     partial void OnSelectedChanged(TuningProfile? value) =>
         OnPropertyChanged(nameof(SelectedCertificationText));

@@ -420,9 +420,9 @@ internal static class McpCommand
 
             new ToolDef(
                 "list_profiles",
-                "Saved tuning profiles.",
+                "Saved tuning profiles, and what each one's stored certifications count for now.",
                 Schema(),
-                _ => new { profiles = profiles.LoadAll() }),
+                _ => ListProfiles(profiles)),
 
             new ToolDef(
                 "save_profile",
@@ -453,6 +453,34 @@ internal static class McpCommand
                     return new { applied = name, all_succeeded = result.AllSucceeded, results = result.Results };
                 }),
         ];
+    }
+
+    /// <summary>
+    /// The list_profiles tool: the profiles as stored, plus each mode's
+    /// standing. A certification record stays stored after it stops counting —
+    /// the settings or the driver changed, or the burn that earned it predates
+    /// R-01's fix and could not see a miscalculation — so an agent reading the
+    /// records alone would take four stored passes for a certified profile.
+    /// </summary>
+    internal static object ListProfiles(ProfileStore profiles)
+    {
+        var all = profiles.LoadAll();
+        return new
+        {
+            profiles = all,
+            certification = all.Select(p => new
+            {
+                name = p.Name,
+                fully_certified = p.FullyCertified,
+                modes = CertificationModes.All.ToDictionary(
+                    mode => mode,
+                    mode => new
+                    {
+                        counts = p.StandingOf(mode) == CertificationStanding.Valid,
+                        detail = p.Describe(mode),
+                    }),
+            }).ToArray(),
+        };
     }
 
     /// <summary>The save_profile tool: capture what this card runs now, then store it.</summary>

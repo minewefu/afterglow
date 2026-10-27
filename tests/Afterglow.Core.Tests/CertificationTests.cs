@@ -5,6 +5,7 @@ namespace Afterglow.Core.Tests;
 
 public class CertificationTests
 {
+    /// <summary>A pass this build's certifier would write: burn modes carry the current burn's revision.</summary>
     private static ProfileCertification Cert(string mode, int core, int mem) => new()
     {
         Mode = mode,
@@ -12,6 +13,7 @@ public class CertificationTests
         DurationSeconds = 90,
         CoreOffsetMHz = core,
         MemOffsetMHz = mem,
+        WorkloadRevision = mode == CertificationModes.Vram ? null : GpuStressTest.WorkloadRevision,
     };
 
     private static TuningProfile Profile(int core, int mem, params ProfileCertification[] certs) => new()
