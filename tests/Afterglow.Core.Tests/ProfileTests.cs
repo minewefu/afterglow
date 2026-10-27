@@ -77,6 +77,130 @@ public class ProfileTests : IDisposable
         Assert.NotNull(new TuningProfile { Name = "x", FanMode = FanMode.Curve }.Validate());
     }
 
+    [Fact]
+    public void Validate_reports_null_collections_instead_of_throwing()
+    {
+        // R-24: the apply engine validates whatever profile it is handed, so a
+        // null that slipped in through JSON must come back as an error, not as
+        // a NullReferenceException from inside the check.
+        Assert.NotNull(new TuningProfile
+        {
+            Name = "x", FanMode = FanMode.Curve, FanCurve = new FanCurveConfig { Points = null! },
+        }.Validate());
+        Assert.NotNull(new TuningProfile
+        {
+            Name = "x", FanMode = FanMode.Curve, FanCurve = new FanCurveConfig { Points = [null!, new(90, 100)] },
+        }.Validate());
+
+        // A curve carried by a fixed-fan profile still reaches the Fans page
+        // editor when the profile is applied, so its shape is checked too.
+        Assert.NotNull(new TuningProfile
+        {
+            Name = "x", FanMode = FanMode.Fixed, FanCurve = new FanCurveConfig { Points = null! },
+        }.Validate());
+        Assert.NotNull(new TuningProfile { Name = "x", Certifications = null! }.Validate());
+        Assert.NotNull(new TuningProfile { Name = "x", Certifications = [null!] }.Validate());
+    }
+
+    // R-25: PathFor folds every character Windows can't put in a file name to
+    // '_', and NTFS ignores letter case, so distinct names can share one file.
+    // Saving the second used to replace the first silently, after which Load
+    // and Delete by the first name reached the second profile.
+    [Theory]
+    [InlineData("Game: Quiet", "Game_ Quiet")]
+    [InlineData("Game_ Quiet", "Game: Quiet")]
+    [InlineData("a/b", "a\\b")]
+    [InlineData("Quiet", "quiet")]
+    public void A_name_whose_file_holds_another_profile_is_refused(string first, string second)
+    {
+        var store = new ProfileStore(_dir);
+        store.Save(new TuningProfile { Name = first, CoreOffsetMHz = 100 });
+
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => store.Save(new TuningProfile { Name = second, CoreOffsetMHz = 500 }));
+        Assert.Contains($"'{first}'", ex.Message, StringComparison.Ordinal);
+
+        // The first profile is untouched and the only one answering to its name.
+        Assert.Equal(100, store.Load(first)?.CoreOffsetMHz);
+        Assert.Null(store.Load(second));
+        Assert.Equal(first, Assert.Single(store.LoadAll()).Name);
+        Assert.False(store.Delete(second));
+        Assert.Equal(100, store.Load(first)?.CoreOffsetMHz);
+    }
+
+    [Fact]
+    public void Resaving_the_same_name_still_updates_it_in_place()
+    {
+        var store = new ProfileStore(_dir);
+        store.Save(new TuningProfile { Name = "Game: Quiet", CoreOffsetMHz = 100 });
+        store.Save(new TuningProfile { Name = "Game: Quiet", CoreOffsetMHz = 200 });
+
+        Assert.Equal(200, store.Load("Game: Quiet")?.CoreOffsetMHz);
+        Assert.Single(Directory.GetFiles(_dir, "*.json"));
+    }
+
+    [Fact]
+    public void A_collision_an_older_build_left_resolves_only_to_the_survivor()
+    {
+        // What an older build left after saving 'Game: Quiet' and then
+        // 'Game_ Quiet': one file, holding the second profile. A startup,
+        // game-rule or automation reference to the first name must now find
+        // nothing rather than the other profile's tuning, and deleting by the
+        // first name must not delete the survivor.
+        Directory.CreateDirectory(_dir);
+        File.WriteAllText(
+            Path.Combine(_dir, "Game_ Quiet.json"), """{ "name": "Game_ Quiet", "coreOffsetMHz": 500 }""");
+        var store = new ProfileStore(_dir);
+
+        Assert.Null(store.Load("Game: Quiet"));
+        Assert.False(store.Delete("Game: Quiet"));
+        Assert.Equal(500, store.Load("Game_ Quiet")?.CoreOffsetMHz);
+        Assert.True(store.Delete("Game_ Quiet"));
+        Assert.Empty(store.LoadAll());
+    }
+
+    [Fact]
+    public void Files_written_under_the_underscore_mapping_keep_loading_and_deleting()
+    {
+        // No migration: the mapping is unchanged, so a file an earlier build
+        // wrote stays where it is and keeps answering to its own name.
+        Directory.CreateDirectory(_dir);
+        File.WriteAllText(
+            Path.Combine(_dir, "Game_ Quiet.json"), """{ "name": "Game: Quiet", "coreOffsetMHz": 100 }""");
+        var store = new ProfileStore(_dir);
+
+        Assert.Equal("Game: Quiet", Assert.Single(store.LoadAll()).Name);
+        Assert.Equal(100, store.Load("Game: Quiet")?.CoreOffsetMHz);
+
+        store.Save(new TuningProfile { Name = "Game: Quiet", CoreOffsetMHz = 150 });
+        Assert.Equal(150, store.Load("Game: Quiet")?.CoreOffsetMHz);
+        Assert.Single(Directory.GetFiles(_dir, "*.json"));
+
+        Assert.True(store.Delete("Game: Quiet"));
+        Assert.Empty(Directory.GetFiles(_dir, "*.json"));
+    }
+
+    [Fact]
+    public void A_profile_this_build_cannot_parse_still_guards_its_file()
+    {
+        // A profile from a newer build (a value this one doesn't know) fails
+        // to deserialize, but it still names itself — a colliding name must
+        // not overwrite it.
+        Directory.CreateDirectory(_dir);
+        string newer = Path.Combine(_dir, "Game_ Quiet.json");
+        File.WriteAllText(newer, """{ "name": "Game: Quiet", "fanMode": "Hybrid" }""");
+        var store = new ProfileStore(_dir);
+
+        Assert.Throws<InvalidOperationException>(() => store.Save(new TuningProfile { Name = "Game_ Quiet" }));
+        Assert.Contains("Hybrid", File.ReadAllText(newer), StringComparison.Ordinal);
+
+        // A file that names nothing (not JSON at all) identifies no profile,
+        // so saving over it still works, as before.
+        File.WriteAllText(Path.Combine(_dir, "junk.json"), "{ not json ");
+        store.Save(new TuningProfile { Name = "junk", CoreOffsetMHz = 50 });
+        Assert.Equal(50, store.Load("junk")?.CoreOffsetMHz);
+    }
+
     public void Dispose()
     {
         GC.SuppressFinalize(this);

@@ -134,6 +134,12 @@ public sealed record TuningProfile
             return "Profile needs a name.";
         }
 
+        // Before anything below dereferences a collection (R-24).
+        if (StructuralError() is string structural)
+        {
+            return structural;
+        }
+
         // Generous static bounds; the apply engine additionally clamps to the
         // driver-reported range for the actual GPU.
         if (CoreOffsetMHz is < -1500 or > 1500)
@@ -196,6 +202,52 @@ public sealed record TuningProfile
                 if (offset is < -1500 or > 1500)
                 {
                     return $"V/F point offset {offset} MHz outside ±1500 MHz.";
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Returns a description of the first collection, or collection element,
+    /// that is null although its type says it can't be, or null when the shape
+    /// is intact. JSON null passes straight through System.Text.Json into
+    /// non-nullable members, so a hand-edited or half-written profile file can
+    /// carry <c>"points": null</c> or <c>"certifications": [null]</c>; the range
+    /// checks in <see cref="Validate"/>, the certification lookups and the Fans
+    /// page editor all dereference these, and a NullReferenceException out of
+    /// <see cref="ProfileStore.LoadAll"/> stopped the app from starting (R-24).
+    /// </summary>
+    internal string? StructuralError()
+    {
+        if (Certifications is null)
+        {
+            return "Certifications list is null.";
+        }
+
+        for (int i = 0; i < Certifications.Count; i++)
+        {
+            if (Certifications[i] is null)
+            {
+                return $"Certification {i + 1} is null.";
+            }
+        }
+
+        // Checked in every fan mode, not only Curve: applying a fixed-fan
+        // profile still hands its curve to the Fans page editor.
+        if (FanCurve is { } curve)
+        {
+            if (curve.Points is null)
+            {
+                return "Fan curve has no point list (null).";
+            }
+
+            for (int i = 0; i < curve.Points.Count; i++)
+            {
+                if (curve.Points[i] is null)
+                {
+                    return $"Fan curve point {i + 1} is null.";
                 }
             }
         }
