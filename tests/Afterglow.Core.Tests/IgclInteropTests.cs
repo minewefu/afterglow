@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Afterglow.Core.Interop.Igcl;
@@ -104,6 +105,64 @@ public class IgclStructLayoutTests
         Assert.Equal(36, Marshal.SizeOf<CtlPowerLimits>());
         Assert.Equal(20, Marshal.SizeOf<CtlPowerDomainProperties>());
         Assert.Equal(24, Marshal.SizeOf<CtlPowerEnergyCounter>());
+    }
+
+    [Fact]
+    public void Gpu_lock_pair_field_offsets_match_the_official_header()
+    {
+        // ctl_oc_vf_pair_t, re-checked for R-45 against igcl_api.h v298
+        // (commit b6c4629) with clang 22.1.8, x86_64-pc-windows-msvc:
+        // uint32 Size @0, uint8 Version @4, double Voltage @8, double
+        // Frequency @16, sizeof 24. The pad after Version is where a wrong
+        // Pack would first show.
+        Assert.Equal(24, Marshal.SizeOf<CtlOcVfPair>());
+        Assert.Equal(0, (int)Marshal.OffsetOf<CtlOcVfPair>(nameof(CtlOcVfPair.Size)));
+        Assert.Equal(4, (int)Marshal.OffsetOf<CtlOcVfPair>(nameof(CtlOcVfPair.Version)));
+        Assert.Equal(8, (int)Marshal.OffsetOf<CtlOcVfPair>(nameof(CtlOcVfPair.Voltage)));
+        Assert.Equal(16, (int)Marshal.OffsetOf<CtlOcVfPair>(nameof(CtlOcVfPair.Frequency)));
+    }
+
+    [Fact]
+    public void The_gpu_lock_request_carries_its_size_both_ways()
+    {
+        // The getter and the setter send one request shape. A default pair
+        // reached the driver with Size 0, and a contract-validating driver
+        // refused it, so selftest called the getter unavailable (R-45).
+        var query = IgclDevice.VfPair();
+        Assert.Equal(24u, query.Size);
+        Assert.Equal(0, query.Version);
+        Assert.Equal((0d, 0d), (query.Voltage, query.Frequency));
+
+        var set = IgclDevice.VfPair(850, 1500);
+        Assert.Equal(24u, set.Size);
+        Assert.Equal((850d, 1500d), (set.Voltage, set.Frequency));
+    }
+
+    [Fact]
+    public void No_size_headed_struct_reaches_the_driver_through_an_out_argument()
+    {
+        // Every IGCL struct's Size and Version are "[in]", even where the
+        // pointer is documented "[out]" (ctlOverclockGpuLockGet's pVfPair).
+        // A C# out argument cannot carry them in: the marshaller hands the
+        // driver a zeroed struct. They travel by ref, or by value.
+        var outArgs = typeof(IgclNative)
+            .GetMethods(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
+            .SelectMany(m => m.GetParameters().Select(p => (Method: m.Name, Parameter: p)))
+            .Where(x => x.Parameter.ParameterType.IsByRef
+                && x.Parameter.ParameterType.GetElementType() is { IsValueType: true } type
+                && type.GetField("Size") is { } size && size.FieldType == typeof(uint)
+                && Marshal.OffsetOf(type, "Size") == 0
+                && x.Parameter.IsOut)
+            .Select(x => $"{x.Method}({x.Parameter.Name})")
+            .ToList();
+
+        Assert.Empty(outArgs);
+
+        var lockGet = typeof(IgclNative).GetMethod(
+            nameof(IgclNative.ctlOverclockGpuLockGet), BindingFlags.Static | BindingFlags.NonPublic)!;
+        var pair = lockGet.GetParameters()[1];
+        Assert.Equal(typeof(CtlOcVfPair).MakeByRefType(), pair.ParameterType);
+        Assert.False(pair.IsOut);
     }
 }
 

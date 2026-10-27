@@ -294,6 +294,191 @@ public sealed class ArcClockLockScenarioTests : IDisposable
     }
 
     [Fact]
+    public void A_retried_sweep_carries_forward_the_lock_an_earlier_restore_could_not_put_back()
+    {
+        // R-16: user lock 1800 -> probe pin 1500 -> refused restore -> retry.
+        // The retry's pre-sweep release empties the tracking; the lock the
+        // first sweep displaced must survive it and be what the retry restores.
+        var dev = new FakeArcDevice();
+        var tuner = Tuner(dev);
+        Assert.True(tuner.Apply(Lock(1800)).AllSucceeded);
+        Assert.Null(tuner.BeginProbe().Refusal);
+        Assert.Equal(NvmlReturn.Success, tuner.LockClockForProbe(1500));
+        dev.WriteResult = CtlResult.ErrorUnknown;
+        Assert.False(tuner.EndProbe().Applied);
+        dev.WriteResult = CtlResult.Success;
+
+        var retry = tuner.BeginProbe();
+
+        Assert.Null(retry.Refusal);
+        Assert.Equal(1800u, retry.LockToRestoreMHz);
+        Assert.Null(retry.ForeignClampNote); // the pin it released was this process's own
+        Assert.Equal(1800u, tuner.AppliedLockMHz);
+        Assert.Equal(NvmlReturn.Success, tuner.LockClockForProbe(2000));
+
+        var end = tuner.EndProbe();
+
+        Assert.True(end.Applied, end.Detail);
+        Assert.Equal((100d, 1800d), (dev.Min, dev.Max));
+        Assert.Equal(1800u, tuner.AppliedLockMHz);
+        var record = AppliedStateStore.Load(Uuid);
+        Assert.Equal(1800u, record?.LockedCoreClockMHz);
+        Assert.NotEqual(true, record?.ProbeLockPending);
+    }
+
+    [Fact]
+    public void A_retry_whose_pre_sweep_release_is_refused_still_holds_the_displaced_lock()
+    {
+        var dev = new FakeArcDevice();
+        var tuner = Tuner(dev);
+        Assert.True(tuner.Apply(Lock(1800)).AllSucceeded);
+        Assert.Null(tuner.BeginProbe().Refusal);
+        Assert.Equal(NvmlReturn.Success, tuner.LockClockForProbe(1500));
+        dev.WriteResult = CtlResult.ErrorUnknown;
+        Assert.False(tuner.EndProbe().Applied);
+        dev.RestoreResult = CtlResult.ErrorUnknown;
+
+        Assert.NotNull(tuner.BeginProbe().Refusal);
+        Assert.Equal(1800u, tuner.AppliedLockMHz);
+
+        dev.WriteResult = CtlResult.Success;
+        dev.RestoreResult = CtlResult.Success;
+        Assert.Equal(1800u, tuner.BeginProbe().LockToRestoreMHz);
+        Assert.True(tuner.EndProbe().Applied);
+        Assert.Equal((100d, 1800d), (dev.Min, dev.Max));
+    }
+
+    [Fact]
+    public void A_lock_applied_after_a_failed_restore_replaces_the_displaced_one()
+    {
+        // Carrying the displaced lock forward must not outrank a lock the user
+        // applied since: that one is on the card, is what the record persists,
+        // and is what the next sweep puts back.
+        var dev = new FakeArcDevice();
+        var tuner = Tuner(dev);
+        Assert.True(tuner.Apply(Lock(1800)).AllSucceeded);
+        Assert.Null(tuner.BeginProbe().Refusal);
+        Assert.Equal(NvmlReturn.Success, tuner.LockClockForProbe(1500));
+        dev.WriteResult = CtlResult.ErrorUnknown;
+        Assert.False(tuner.EndProbe().Applied);
+        dev.WriteResult = CtlResult.Success;
+
+        var apply = tuner.Apply(Lock(2000));
+
+        Assert.True(apply.AllSucceeded, apply.Summary);
+        Assert.Equal(2000u, tuner.AppliedLockMHz);
+        Assert.Equal(2000u, AppliedStateStore.Load(Uuid)?.LockedCoreClockMHz);
+
+        Assert.Equal(2000u, tuner.BeginProbe().LockToRestoreMHz);
+        Assert.Equal(NvmlReturn.Success, tuner.LockClockForProbe(1500));
+        Assert.True(tuner.EndProbe().Applied);
+        Assert.Equal((100d, 2000d), (dev.Min, dev.Max));
+        Assert.Equal(2000u, tuner.AppliedLockMHz);
+    }
+
+    [Fact]
+    public void A_factory_floor_above_the_hardware_minimum_is_a_released_state()
+    {
+        // R-17. Intel's ctl_freq_range_t: the -1 restore returns the minimum to
+        // the factory value, which "can be larger than the hardware min".
+        var dev = new FakeArcDevice { HwMin = 100, FactoryMin = 300 };
+        var tuner = Tuner(dev);
+
+        var unlock = tuner.ForceUnlock();
+
+        Assert.True(unlock.Applied, unlock.Detail);
+        Assert.Contains("factory floor", unlock.Detail, StringComparison.Ordinal); // adopted, honestly worded
+        Assert.Equal((300d, 2300d), (dev.Min, dev.Max));
+        Assert.Null(tuner.ReadCurrent().LockedCoreClockMHz);
+        Assert.Null(tuner.AppliedLockMHz);
+
+        // Remembered: the next release lands on the verified floor.
+        var again = tuner.ForceUnlock();
+        Assert.True(again.Applied, again.Detail);
+        Assert.Contains("(verified)", again.Detail, StringComparison.Ordinal);
+
+        var reset = tuner.ResetToDefaults();
+        Assert.True(reset.AllSucceeded, reset.Summary);
+        var plain = tuner.Apply(NoLock());
+        Assert.True(plain.AllSucceeded, plain.Summary);
+        Assert.Null(AppliedStateStore.Load(Uuid)?.LockedCoreClockMHz);
+    }
+
+    [Fact]
+    public void A_fresh_process_on_a_raised_factory_floor_can_unlock_reset_apply_and_probe()
+    {
+        // The review's sequence, each step in a process that has verified nothing.
+        static FakeArcDevice Card() => new() { HwMin = 100, FactoryMin = 300 };
+
+        var unlock = Tuner(Card()).ForceUnlock();
+        Assert.True(unlock.Applied, unlock.Detail);
+
+        var reset = Tuner(Card()).ResetToDefaults();
+        Assert.True(reset.AllSucceeded, reset.Summary);
+
+        var plain = Tuner(Card()).Apply(NoLock());
+        Assert.True(plain.AllSucceeded, plain.Summary);
+        Assert.DoesNotContain("100..", plain.Summary, StringComparison.Ordinal); // the floor was 300, never quoted as 100
+
+        var start = Tuner(Card()).BeginProbe();
+        Assert.Null(start.Refusal);
+        Assert.Equal(2300u, start.MaxClockMHz);
+        Assert.Contains("300 MHz clock floor", start.ForeignClampNote, StringComparison.Ordinal); // not a "2300 MHz ceiling"
+    }
+
+    [Fact]
+    public void A_range_lock_on_a_raised_factory_floor_card_releases_verified()
+    {
+        var dev = new FakeArcDevice { HwMin = 100, FactoryMin = 300 };
+        var tuner = Tuner(dev);
+        Assert.True(tuner.ForceUnlock().Applied); // verifies the 300 floor
+        Assert.True(tuner.Apply(Lock(1500)).AllSucceeded);
+        Assert.Equal(1500u, tuner.ReadCurrent().LockedCoreClockMHz);
+
+        var release = tuner.Apply(NoLock());
+
+        Assert.True(release.AllSucceeded, release.Summary);
+        Assert.Equal((300d, 2300d), (dev.Min, dev.Max));
+        Assert.Null(tuner.ReadCurrent().LockedCoreClockMHz);
+    }
+
+    [Fact]
+    public void A_pin_a_release_leaves_in_place_still_fails_on_a_raised_factory_floor_card()
+    {
+        // Adopting a factory floor must not adopt a pin: a range whose floor
+        // meets its ceiling is still an exact pin, whatever the floor is.
+        var inner = new FakeArcDevice { HwMin = 100, FactoryMin = 300 };
+        var dev = new RestoreKeeps(inner) { KeepPin = true };
+        var tuner = new ArcGpuTuner(dev, Uuid);
+        Assert.Equal(NvmlReturn.Success, tuner.LockClockForProbe(1500));
+
+        var release = tuner.ForceUnlock();
+
+        Assert.False(release.Applied, release.Detail);
+        Assert.Equal(1500u, tuner.ReadCurrent().LockedCoreClockMHz);
+        Assert.True(AppliedStateStore.Load(Uuid)?.ProbeLockPending);
+    }
+
+    [Fact]
+    public void A_release_whose_floor_stays_above_a_floor_this_process_verified_fails()
+    {
+        // The floor's twin of the ceiling rule: once a release has verified the
+        // 300 floor, a release that leaves it at 1500 kept part of the pin.
+        var inner = new FakeArcDevice { HwMin = 100, FactoryMin = 300 };
+        var dev = new RestoreKeeps(inner);
+        var tuner = new ArcGpuTuner(dev, Uuid);
+        Assert.True(tuner.ForceUnlock().Applied); // verifies 300..2300
+        Assert.Equal(NvmlReturn.Success, tuner.LockClockForProbe(1500));
+        dev.KeepFloor = true;
+
+        var release = tuner.ForceUnlock();
+
+        Assert.False(release.Applied, release.Detail);
+        Assert.Equal((1500d, 2300d), (inner.Min, inner.Max));
+        Assert.NotNull(tuner.ReadCurrent().LockedCoreClockMHz);
+    }
+
+    [Fact]
     public void A_sweep_that_pinned_nothing_ends_with_nothing_to_release()
     {
         var dev = new FakeArcDevice { WriteResult = CtlResult.ErrorInsufficientPermissions };
@@ -536,5 +721,45 @@ public sealed class ArcClockLockScenarioTests : IDisposable
 
         Assert.True(release.Applied, release.Detail);
         Assert.Equal((100d, 2300d), (dev.Min, dev.Max));
+    }
+
+    /// <summary>
+    /// A frequency domain whose factory restore reports success but keeps part
+    /// of what was there: the floor (<see cref="KeepFloor"/>) or the whole
+    /// range (<see cref="KeepPin"/>). No driver has been measured doing this;
+    /// it is the shape the release's floor rule exists to refuse.
+    /// </summary>
+    private sealed class RestoreKeeps(FakeArcDevice inner) : IArcDevice
+    {
+        public bool KeepFloor { get; set; }
+
+        public bool KeepPin { get; set; }
+
+        public IReadOnlyList<(nint Handle, CtlFreqProperties Properties)> GetFrequencyDomains() =>
+            inner.GetFrequencyDomains();
+
+        public CtlResult TryGetFrequencyRange(nint domain, out CtlFreqRange range) =>
+            inner.TryGetFrequencyRange(domain, out range);
+
+        public CtlResult TrySetFrequencyRange(nint domain, double minMhz, double maxMhz)
+        {
+            var (min, max) = (inner.Min, inner.Max);
+            var rc = inner.TrySetFrequencyRange(domain, minMhz, maxMhz);
+            if (rc == CtlResult.Success && minMhz < 0 && maxMhz < 0)
+            {
+                inner.Min = KeepFloor || KeepPin ? min : inner.Min;
+                inner.Max = KeepPin ? max : inner.Max;
+            }
+
+            return rc;
+        }
+
+        public CtlResult TryGetOcProperties(out CtlOcProperties properties) => inner.TryGetOcProperties(out properties);
+
+        public CtlResult TrySetOverclockWaiver() => inner.TrySetOverclockWaiver();
+
+        public CtlResult TryGetOcPowerLimitV2(out double limit) => inner.TryGetOcPowerLimitV2(out limit);
+
+        public CtlResult TrySetOcPowerLimitV2(double limit) => inner.TrySetOcPowerLimitV2(limit);
     }
 }
