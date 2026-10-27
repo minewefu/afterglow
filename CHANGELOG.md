@@ -161,6 +161,14 @@ A full-version review reported 49 defects; all 49 were confirmed in the code.
   VRAM, not memory junction.
 - **A V/F probe that failed to put your clock lock back no longer loses it on
   the next try.**
+- **A clock lock applied while a V/F probe runs is the lock you end up with.**
+  A lock set mid-sweep by a hotkey, game rule or profile stops the probe.
+  - Before, the probe then put back the lock it started under, or released the
+    new lock entirely, while the saved state still named the new one.
+  - The new lock now stays, even when the probe's next pin lands just after it.
+  - A profile without a lock removes the lock the probe was holding aside, as it
+    does outside a sweep.
+  - NVIDIA wasn't affected; tests now hold both vendors to the same behaviour.
 - **Raised factory minimum clocks no longer block unlock, reset and probing.**
   On cards whose factory minimum is above the hardware minimum, the raised floor
   used to be read as a stuck pin. Tested against a simulated driver only.

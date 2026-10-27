@@ -8,7 +8,7 @@ namespace Afterglow.Core.Tuning;
 /// What a V/F sweep starts from (see <see cref="IGpuTuner.BeginProbe"/>).
 /// </summary>
 /// <param name="MaxClockMHz">The highest clock the sweep may pin: the domain maximum, or the released ceiling once one has been verified.</param>
-/// <param name="LockToRestoreMHz">The range lock this process had applied, which <see cref="IGpuTuner.EndProbe"/> puts back.</param>
+/// <param name="LockToRestoreMHz">The range lock this process had applied when the sweep began. <see cref="IGpuTuner.EndProbe"/> puts back the lock in force at its end, which is this one unless a newer lock was written (or the lock released) during the sweep.</param>
 /// <param name="ForeignClampNote">Set when a clamp this process had not applied was released before the sweep, for the outcome text.</param>
 /// <param name="Refusal">Non-null when the card could not be prepared (a clamp that would not release); nothing was pinned.</param>
 public sealed record ProbeStart(uint MaxClockMHz, uint? LockToRestoreMHz, string? ForeignClampNote, string? Refusal = null);
@@ -107,9 +107,10 @@ public interface IGpuTuner
     ProbeStart BeginProbe() => new(Capabilities.MaxCoreClockMHz, AppliedLockMHz, null);
 
     /// <summary>
-    /// Ends a V/F sweep: puts back the lock <see cref="BeginProbe"/> remembered,
-    /// or releases the pin when there was none (and does nothing when no pin
-    /// ever landed). A failed verdict is the restore failure the probe reports.
+    /// Ends a V/F sweep: puts back the lock in force — the one
+    /// <see cref="BeginProbe"/> remembered, or a newer one written during the
+    /// sweep — or releases the pin when there is none (and does nothing when no
+    /// pin ever landed). A failed verdict is the restore failure the probe reports.
     /// </summary>
     KnobResult EndProbe() => ForceUnlock();
 
