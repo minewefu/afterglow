@@ -413,10 +413,20 @@ public partial class TuningViewModel : ObservableObject
             return;
         }
 
-        var result = _gpu.Tuner.ResetToDefaults();
+        // The card's fan service is reset with the tuner, and first (R-09): the
+        // tuner's reset hands the fans back to firmware at the driver, but a fan
+        // service left in Curve mode commanded them again on the next telemetry
+        // tick — with this page saying "fans: ok (auto)".
+        _services.FanControl.TryGetValue(_gpu.Index, out var fans);
+        var reset = DefaultsReset.Card(_gpu.Index, _gpu.Tuner, fans);
+        var result = reset.AsApplyResult();
         ApplyResultText = result.Summary;
         LastApplyFailed = !result.AllSucceeded;
         LockEnabled = false;
         RefreshFromHardware();
+        ResetCompleted?.Invoke(reset);
     }
+
+    /// <summary>Raised after Reset, so the Fans page can say the fans went back to firmware control.</summary>
+    public event Action<CardResetResult>? ResetCompleted;
 }

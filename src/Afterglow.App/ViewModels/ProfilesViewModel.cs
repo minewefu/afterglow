@@ -347,10 +347,9 @@ public partial class ProfilesViewModel : ObservableObject
             return;
         }
 
-        // Load first: a full apply reloads the sliders from the card when it lands, so
-        // they end on what the card is running (a clamp or a refused knob shows), and a
-        // refused apply leaves the profile loaded and marked as unapplied.
-        _tuning.LoadProfile(Selected);
+        // The apply callback loads the profile into the Tuning sliders first when it
+        // lands on the selected card, and leaves them alone when it lands on another
+        // GPU (MainViewModel.ApplyFromProfilesPage, R-49).
         var result = _applyFull(Selected);
         StatusText = $"Applied '{Selected.Name}': {result.Summary}";
     }
