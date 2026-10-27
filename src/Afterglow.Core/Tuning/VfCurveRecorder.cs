@@ -1,4 +1,7 @@
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
+using Afterglow.Core.Interop.Nvapi;
 using Afterglow.Core.Telemetry;
 
 namespace Afterglow.Core.Tuning;
@@ -100,10 +103,111 @@ public sealed class VfCurveRecorder
     /// </summary>
     public bool VoltageSensorLooksAbsent => SamplesWithVoltage == 0 && SamplesMissingVoltage >= 8;
 
+    // --- Tuning epochs (R-20) -------------------------------------------------
+    //
+    // Every bin is a max clock at a voltage, and that clock includes whatever
+    // tuning was in force when it was sampled. Bins used to persist across
+    // tuning changes and sessions while PlanUndervolt added the CURRENT core
+    // offset to the gap against them: measure 2800 MHz at 900 mV at +0, plan
+    // 2900 (+100), apply it, plan the same target again before new samples and
+    // the answer was +200. Historical boosted samples biased plans after a
+    // reset the same way, because MaxClock keeps the highest clock ever seen.
+    //
+    // Normalising each sample by the offset it was taken under would keep the
+    // data, but it assumes the offset shifts the whole curve uniformly — false
+    // for the per-point edits this same page writes. So the recorder keeps ONE
+    // epoch: the bins belong to the tuning they were measured under, a change
+    // of that tuning discards them, and a plan is only made against the exact
+    // tuning its bins carry. A clock lock is not part of the tuning here: a
+    // lock limits which points the GPU visits, it does not move the clock at a
+    // voltage — and the probe measures the curve BY locking.
+
+    /// <summary>
+    /// The tuning every bin was measured under; null when that is unknown (a
+    /// curve file written before epochs, or samples taken before anyone said).
+    /// A curve of unknown provenance is drawn but never planned from.
+    /// </summary>
+    public VfTuningState? TuningState
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _tuningState;
+            }
+        }
+    }
+
+    private VfTuningState? _tuningState;
+
+    /// <summary>
+    /// Declares the tuning the card runs NOW. When it differs from the tuning
+    /// the bins were measured under — or that is unknown — the bins are
+    /// discarded and a new measurement epoch starts under <paramref name="state"/>.
+    /// Call it after every tuning write (<see cref="IGpuTuner.StateWritten"/>,
+    /// from a thread that may read the driver — not inside the handler) and
+    /// before planning. Returns true when measurements were discarded.
+    /// </summary>
+    public bool SetTuningState(VfTuningState state)
+    {
+        VfTuningState? previous;
+        long discarded;
+        lock (_lock)
+        {
+            if (_tuningState == state)
+            {
+                return false;
+            }
+
+            previous = _tuningState;
+            discarded = TotalSamples;
+            _tuningState = state;
+            if (_bins.Count == 0)
+            {
+                return false;
+            }
+
+            _bins.Clear();
+            TotalSamples = 0;
+        }
+
+        Diagnostics.Log.Info(
+            $"V/F curve{(DeviceIndex is uint own ? $" for GPU {own}" : string.Empty)}: {discarded} sample(s) measured under " +
+            $"{previous?.Describe() ?? "unrecorded tuning"} were set aside — the card now runs {state.Describe()}, " +
+            "and a plan may only use samples taken under the tuning it builds on.");
+        return true;
+    }
+
+    /// <summary>
+    /// Declares the tuning the bins ALREADY held were measured under, keeping
+    /// them. Only for data whose provenance is known by construction — the
+    /// demo's synthetic stock curve. Ignored once a tuning has been declared;
+    /// live samples of unknown provenance go through
+    /// <see cref="SetTuningState"/>, which discards them.
+    /// </summary>
+    public void AdoptTuningState(VfTuningState state)
+    {
+        lock (_lock)
+        {
+            _tuningState ??= state;
+        }
+    }
+
 
     /// <summary>Feeds one telemetry snapshot into the curve.</summary>
-    public void Add(GpuSnapshot snapshot)
+    public void Add(GpuSnapshot snapshot) => TryAdd(snapshot, out _);
+
+    /// <summary>
+    /// Feeds one telemetry snapshot into the curve and says whether it was
+    /// binned. Returns true with the voltage of the bin it went into; false
+    /// when the sample was refused (another card, no voltage, idle load, out of
+    /// range). The probe uses the bin to know when a step has collected enough
+    /// samples for <see cref="PlanUndervolt(double, double, VfTuningState, TuningCapabilities?)"/> (R-47).
+    /// </summary>
+    public bool TryAdd(GpuSnapshot snapshot, out double binVoltageMv)
     {
+        binVoltageMv = 0;
+
         // Checked, not trusted: the probe samples through a caller-supplied
         // delegate, and a delegate pointing at the wrong card would otherwise
         // write another GPU's silicon into this card's persisted curve.
@@ -122,7 +226,7 @@ public sealed class VfCurveRecorder
                     "the curve stays this card's.");
             }
 
-            return;
+            return false;
         }
 
         if (snapshot.CoreVoltageMv is not double mv ||
@@ -148,7 +252,7 @@ public sealed class VfCurveRecorder
                 }
             }
 
-            return;
+            return false;
         }
 
         lock (_lock)
@@ -156,10 +260,11 @@ public sealed class VfCurveRecorder
             SamplesWithVoltage++;
         }
 
-
-        if (load < MinLoadPct || mv < MinVoltageMv || mv > MaxVoltageMv || mhz < 200)
+        // Finite first (R-21): the range bounds are false for NaN, which then
+        // rounded to bin 0 — a "0 mV" point in a curve that drives writes.
+        if (!double.IsFinite(mv) || load < MinLoadPct || mv < MinVoltageMv || mv > MaxVoltageMv || mhz < 200)
         {
-            return;
+            return false;
         }
 
         int key = (int)Math.Round(mv / BinMv);
@@ -175,6 +280,26 @@ public sealed class VfCurveRecorder
             bin.ClockSum += mhz;
             bin.Samples++;
             TotalSamples++;
+        }
+
+        binVoltageMv = key * BinMv;
+        return true;
+    }
+
+    /// <summary>
+    /// Samples in the bin that holds <paramref name="voltageMv"/> — what
+    /// <see cref="PlanMinBinSamples"/> is compared against. 0 for an empty bin.
+    /// </summary>
+    public long SamplesInBinAt(double voltageMv)
+    {
+        if (!double.IsFinite(voltageMv))
+        {
+            return 0;
+        }
+
+        lock (_lock)
+        {
+            return _bins.TryGetValue((int)Math.Round(voltageMv / BinMv), out var bin) ? bin.Samples : 0;
         }
     }
 
@@ -224,6 +349,9 @@ public sealed class VfCurveRecorder
             // core voltage" and refusing the probe on hardware that plainly does.
             SamplesMissingVoltage = 0;
             SamplesWithVoltage = 0;
+
+            // The tuning stays declared: clearing the curve does not change what
+            // the card runs, so new samples still belong to the same epoch (R-20).
         }
     }
 
@@ -266,14 +394,54 @@ public sealed class VfCurveRecorder
     }
 
     /// <summary>
+    /// <see cref="PlanUndervolt(double, double, VfTuningState, TuningCapabilities?)"/>
+    /// for a card whose only curve-shaping tuning is a global core offset
+    /// (no per-point edits). The bins must have been measured under exactly
+    /// that offset (R-20).
+    /// </summary>
+    public UndervoltPlan? PlanUndervolt(
+        double targetVoltageMv, double targetClockMHz, int currentOffsetMHz, TuningCapabilities? caps = null) =>
+        PlanUndervolt(targetVoltageMv, targetClockMHz, new VfTuningState(currentOffsetMHz), caps);
+
+    /// <summary>
     /// Computes the tuning needed to hold <paramref name="targetClockMHz"/> at
     /// <paramref name="targetVoltageMv"/>: a core offset that lifts the curve by the
     /// difference, plus a clock lock so the GPU never boosts past the target (which
-    /// would require more voltage). Returns null when the curve lacks coverage.
+    /// would require more voltage). Returns null when the curve lacks coverage,
+    /// when its bins were measured under any tuning other than
+    /// <paramref name="current"/> (or under unknown tuning), and when
+    /// <paramref name="current"/> carries per-point edits.
     /// </summary>
     public UndervoltPlan? PlanUndervolt(
-        double targetVoltageMv, double targetClockMHz, int currentOffsetMHz, TuningCapabilities? caps = null)
+        double targetVoltageMv, double targetClockMHz, VfTuningState current, TuningCapabilities? caps = null)
     {
+        // Finite inputs only (R-21). The bounds below happened to reject NaN
+        // and infinity today; that rested on how a saturating cast lands, not
+        // on a check.
+        if (!double.IsFinite(targetVoltageMv) || !double.IsFinite(targetClockMHz))
+        {
+            return null;
+        }
+
+        // The bins must have been measured under exactly the tuning planned
+        // against (R-20): the arithmetic below assumes the measured clock
+        // already contains current.CoreOffsetMHz and nothing else. Unknown
+        // provenance (null) never matches.
+        if (TuningState != current)
+        {
+            return null;
+        }
+
+        // A plan is one global core offset, and applying it erases per-point
+        // edits. Under a shaped table the measured clock at this voltage
+        // contains that point's own offset, not the global one, so
+        // "current + (target - measured)" is not the offset that holds the
+        // target once the shape is gone.
+        if (current.PointShape is not null)
+        {
+            return null;
+        }
+
         // Plans drive hardware writes, so they require well-populated bins
         // (PlanMinBinSamples), unlike merely drawing the curve.
         if (ClockPointAt(targetVoltageMv, PlanMinBinSamples) is not var (measuredClock, binSamples))
@@ -281,9 +449,16 @@ public sealed class VfCurveRecorder
             return null;
         }
 
-        // The measured curve already includes the current offset, so the delta is
-        // added on top of it.
-        int requiredOffset = (int)Math.Round(currentOffsetMHz + (targetClockMHz - measuredClock));
+        // A new epoch may have started while the curve was read; the bins
+        // just used may then not be the ones the check above vouched for.
+        if (TuningState != current)
+        {
+            return null;
+        }
+
+        // The measured curve already includes the current offset (the epoch
+        // check above is what makes that true), so the delta is added on top.
+        int requiredOffset = (int)Math.Round(current.CoreOffsetMHz + (targetClockMHz - measuredClock));
         uint lockClock = (uint)Math.Round(Math.Max(0, targetClockMHz));
 
         // Refuse plans that cannot be applied instead of describing nonsense
@@ -332,11 +507,18 @@ public sealed class VfCurveRecorder
     private sealed record PersistedBin(int Key, double MaxClock, double ClockSum, long Samples);
 
     /// <summary>
-    /// The on-disk shape: the owning card's identity (UUID and PCI vendor) plus
-    /// its bins. A bare <see cref="PersistedBin"/> array is still read — that is
-    /// what earlier versions wrote — under the legacy rule in <see cref="Load"/>.
+    /// The on-disk shape: the owning card's identity (UUID and PCI vendor), the
+    /// tuning its bins were measured under (R-20; absent in files written
+    /// before epochs, which then load as unknown provenance), and its bins. A
+    /// bare <see cref="PersistedBin"/> array is still read — that is what
+    /// earlier versions wrote — under the legacy rule in <see cref="Load"/>.
     /// </summary>
-    private sealed record PersistedCurve(string? GpuUuid, uint? VendorId, PersistedBin[] Bins);
+    private sealed record PersistedCurve(
+        string? GpuUuid,
+        uint? VendorId,
+        PersistedBin[] Bins,
+        int? TuningCoreOffsetMHz = null,
+        string? TuningPointShape = null);
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = false };
 
@@ -433,9 +615,13 @@ public sealed class VfCurveRecorder
         {
             AppPaths.EnsureCreated();
             PersistedBin[] data;
+            VfTuningState? tuning;
             lock (_lock)
             {
+                // Bins and their epoch in one snapshot: a stamp read separately
+                // could label one epoch's bins with the next epoch's tuning.
                 data = _bins.Select(kv => new PersistedBin(kv.Key, kv.Value.MaxClock, kv.Value.ClockSum, kv.Value.Samples)).ToArray();
+                tuning = _tuningState;
             }
 
             // Guard the WRITE as well as the read. The read half refuses a file
@@ -449,7 +635,8 @@ public sealed class VfCurveRecorder
                 return false;
             }
 
-            File.WriteAllText(file, JsonSerializer.Serialize(new PersistedCurve(GpuUuid, VendorId, data), JsonOptions));
+            File.WriteAllText(file, JsonSerializer.Serialize(
+                new PersistedCurve(GpuUuid, VendorId, data, tuning?.CoreOffsetMHz, tuning?.PointShape), JsonOptions));
             return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -516,6 +703,7 @@ public sealed class VfCurveRecorder
 
             string text = File.ReadAllText(file);
             PersistedBin[]? data;
+            VfTuningState? tuning = null; // a legacy or pre-epoch file: provenance unknown (R-20)
 
             // Stamped envelope, or the legacy bare array earlier versions wrote.
             if (text.TrimStart().StartsWith('{'))
@@ -535,6 +723,10 @@ public sealed class VfCurveRecorder
                 }
 
                 data = envelope.Bins;
+                if (envelope.TuningCoreOffsetMHz is int core)
+                {
+                    tuning = new VfTuningState(core, envelope.TuningPointShape);
+                }
             }
             else
             {
@@ -566,6 +758,7 @@ public sealed class VfCurveRecorder
             {
                 _bins.Clear();
                 TotalSamples = 0;
+                _tuningState = tuning; // the bins arrive with the epoch they were measured in
                 foreach (var entry in data)
                 {
                     double voltage = entry.Key * BinMv;
@@ -614,4 +807,74 @@ public sealed record UndervoltPlan(
         $"Hold {TargetClockMHz:F0} MHz at ~{TargetVoltageMv:F0} mV: " +
         $"core offset {(CoreOffsetMHz >= 0 ? "+" : string.Empty)}{CoreOffsetMHz} MHz with the clock locked at {LockClockMHz} MHz " +
         $"(measured {MeasuredClockAtVoltage:F0} MHz at that voltage today, {BinSamples} samples in that bin).";
+}
+
+/// <summary>
+/// The tuning a measured V/F curve is only valid under (R-20): what moves the
+/// clock the GPU runs at a given voltage. That is the global core offset and
+/// any per-point edits to the stored table — not a clock lock (it limits which
+/// points are visited, and the probe measures by locking), not the power limit
+/// (it moves the operating point along the curve, not the curve).
+/// </summary>
+/// <param name="CoreOffsetMHz">The global core offset in force.</param>
+/// <param name="PointShape">
+/// Null when the stored table carries no per-point edits — every slot reads
+/// the core offset, or the GPU exposes no per-point table at all. Otherwise a
+/// fingerprint of the slot offsets, or <see cref="UnreadableShape"/> when the
+/// table exists but did not read back (edits cannot then be ruled out).
+/// </param>
+public readonly record struct VfTuningState(int CoreOffsetMHz, string? PointShape = null)
+{
+    /// <summary>The shape recorded when the table exists but would not read back.</summary>
+    public const string UnreadableShape = "unreadable";
+
+    /// <summary>No core offset, no per-point edits.</summary>
+    public static VfTuningState Stock => default;
+
+    /// <summary>
+    /// Reads the tuning a card runs now. Driver reads only — no write, no
+    /// notification — but not free either: call it from a UI or worker thread,
+    /// never from inside a <see cref="IGpuTuner.StateWritten"/> handler.
+    /// </summary>
+    public static VfTuningState Read(IGpuTuner tuner)
+    {
+        int core = tuner.ReadCurrent().CoreOffsetMHz;
+        if (!tuner.Capabilities.SupportsVfPoints)
+        {
+            return new VfTuningState(core);
+        }
+
+        return tuner.TryReadVfPoints(out var points) == NvapiStatus.Ok
+            ? new VfTuningState(core, ShapeOf(points, core))
+            : new VfTuningState(core, UnreadableShape);
+    }
+
+    /// <summary>
+    /// Null when every slot reads the global core offset (the table holds
+    /// nothing the offset alone does not); otherwise a stable fingerprint of
+    /// the slot offsets. Only offsets are hashed: the stored base clocks can
+    /// move with temperature without any tuning having changed.
+    /// </summary>
+    public static string? ShapeOf(IReadOnlyList<NvapiGpu.VfpTablePoint> points, int coreOffsetMHz)
+    {
+        if (points.All(point => point.OffsetMHz == coreOffsetMHz))
+        {
+            return null;
+        }
+
+        string canonical = string.Join(',', points
+            .OrderBy(point => point.Index)
+            .Select(point => FormattableString.Invariant($"{point.Index}:{point.OffsetMHz}")));
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical)))[..16];
+    }
+
+    /// <summary>For logs and status lines: "core offset +100 MHz" (and whether the table is shaped).</summary>
+    public string Describe() =>
+        FormattableString.Invariant($"core offset {CoreOffsetMHz:+0;-0;0} MHz") +
+        (PointShape switch
+        {
+            null => string.Empty,
+            UnreadableShape => " (the stored V/F table did not read back)",
+            _ => " with per-point V/F edits",
+        });
 }

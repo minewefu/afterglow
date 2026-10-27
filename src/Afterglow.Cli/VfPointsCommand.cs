@@ -296,6 +296,15 @@ internal static class VfPointsCommand
                 return null;
             }
 
+            // NumberStyles.Float parses "NaN" and "Infinity". Refused here, before
+            // the GPU is opened (R-21): a NaN clock used to reach the planner and
+            // come back as an all-zero plan that cleared the whole curve.
+            if (!double.IsFinite(mv) || !double.IsFinite(mhz))
+            {
+                error = "Bad --flatten value: MV and MHZ must be finite numbers (e.g. 875:1875).";
+                return null;
+            }
+
             return new VfPointsRequest(gpuIndex, VfPointsAction.Flatten, FlattenVoltageMv: mv, FlattenClockMHz: mhz);
         }
 

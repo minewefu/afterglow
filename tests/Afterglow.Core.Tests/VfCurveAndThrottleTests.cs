@@ -51,7 +51,10 @@ public class VfCurveRecorderTests
 
     private static VfCurveRecorder WellSampledCurve()
     {
+        // Measured at stock, and said so: a curve of unrecorded tuning is never
+        // planned from (R-20), which would make every refusal below vacuous.
         var recorder = new VfCurveRecorder();
+        recorder.SetTuningState(VfTuningState.Stock);
         foreach ((double mv, uint mhz) in new[] { (900.0, 2800u), (950.0, 2900u), (1000.0, 3000u) })
         {
             for (int i = 0; i < 25; i++)
@@ -113,6 +116,7 @@ public class VfCurveRecorderTests
     public void Thin_bins_draw_the_curve_but_may_not_drive_a_write()
     {
         var recorder = new VfCurveRecorder();
+        recorder.SetTuningState(VfTuningState.Stock); // so the refusal below is the thin bin's, not the epoch's
         for (int i = 0; i < 3; i++)
         {
             recorder.Add(Sample(900, 2800));

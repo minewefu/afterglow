@@ -38,6 +38,7 @@ internal static class VfCurveCommand
 
         int probeStepsDone = 0;
         int probeStepsTotal = 0;
+        int probeStepsBelowPlanCoverage = 0;
 
         if (CliArgs.Validate(args, "vfcurve") is string argError)
         {
@@ -107,6 +108,8 @@ internal static class VfCurveCommand
                     load_failure = (string?)null,
                     probe_steps_measured = probe ? 0 : (int?)null,
                     probe_steps_total = probe ? 0 : (int?)null,
+                    probe_steps_below_plan_coverage = probe ? 0 : (int?)null,
+                    tuning_changed = false,
                     points = Array.Empty<VfBin>(),
                 }, JsonOut));
             }
@@ -124,6 +127,18 @@ internal static class VfCurveCommand
         if (!fresh)
         {
             recorder.Load();
+        }
+
+        // The file's samples count only if they were measured under the tuning
+        // this card runs now (R-20). Otherwise they are set aside, so this run
+        // never merges into — or re-labels — a curve taken under another offset.
+        var tuningAtStart = VfTuningState.Read(gpu.Tuner);
+        var fileTuning = recorder.TuningState;
+        if (recorder.SetTuningState(tuningAtStart) && !json)
+        {
+            Console.WriteLine(
+                $"  note: the saved curve was measured under {fileTuning?.Describe() ?? "unrecorded tuning"}; this card " +
+                $"now runs {tuningAtStart.Describe()}, so it starts over.");
         }
 
         if (probe)
@@ -161,6 +176,7 @@ internal static class VfCurveCommand
                     // sweep serialize "0 of 0" next to probe_complete: true.
                     probeStepsDone = progress.StepIndex;
                     probeStepsTotal = progress.StepCount;
+                    probeStepsBelowPlanCoverage = progress.StepsBelowPlanCoverage;
 
                     // Coverage and hardware state are independent signals — the
                     // engine documents them that way, and a fully measured sweep
@@ -259,8 +275,25 @@ internal static class VfCurveCommand
             }
         }
 
-        bool saved = recorder.Save();
-        if (!saved && !json)
+        // Another program (or the app) can change this card's tuning while the
+        // run samples, and nothing in this process would hear of it. Re-read:
+        // if it moved, the samples cannot be attributed to either tuning and
+        // are set aside rather than saved under a label they do not match.
+        var tuningAtEnd = VfTuningState.Read(gpu.Tuner);
+        bool tuningMoved = recorder.SetTuningState(tuningAtEnd);
+        if (tuningMoved && !json)
+        {
+            Console.Error.WriteLine(
+                $"  ⚠ This card's tuning changed while recording ({tuningAtStart.Describe()} -> {tuningAtEnd.Describe()}), " +
+                "so the samples could not be attributed to either and were not kept; the saved curve was left as " +
+                "it was. Run it again.");
+        }
+
+        // Not saved when the tuning moved: the file still holds what was
+        // measured before this run, correctly labelled, and this run has
+        // nothing attributable to add to it.
+        bool saved = !tuningMoved && recorder.Save();
+        if (!saved && !tuningMoved && !json)
         {
             // A card with no UUID has no curve file at all (F-15/F-55: a file keyed
             // by enumeration position handed one card's curve to another), so say
@@ -294,9 +327,17 @@ internal static class VfCurveCommand
                 load_failure = loadFailure,
                 probe_steps_measured = probe ? probeStepsDone : (int?)null,
                 probe_steps_total = probe ? probeStepsTotal : (int?)null,
+
+                // Measured is not plannable (R-47): steps whose voltage bin
+                // stayed below the plan minimum, so no undervolt there yet.
+                probe_steps_below_plan_coverage = probe ? probeStepsBelowPlanCoverage : (int?)null,
+
+                // The card's tuning moved during the run (R-20); nothing was kept.
+                tuning_changed = tuningMoved,
                 points = curve,
             }, JsonOut));
-            return probeIncomplete || probeRestoreFailed || loadFailure is not null ? 1 : curve.Count > 0 ? 0 : 3;
+            return probeIncomplete || probeRestoreFailed || loadFailure is not null || tuningMoved ? 1
+                : curve.Count > 0 ? 0 : 3;
         }
 
         Console.WriteLine($"{gpu.Name}: {curve.Count} voltage points from {recorder.TotalSamples:N0} samples under load");
@@ -305,6 +346,14 @@ internal static class VfCurveCommand
             Console.WriteLine(
                 "  ⚠ The probe did not complete, so this curve is not a full measured V/F map — " +
                 "it also includes any previously recorded samples (use --fresh to start clean).");
+        }
+
+        if (probeStepsBelowPlanCoverage > 0)
+        {
+            Console.WriteLine(
+                $"  ⚠ {probeStepsBelowPlanCoverage} of {probeStepsDone} probe steps collected fewer than " +
+                $"{VfCurveRecorder.PlanMinBinSamples} samples at their voltage, so an undervolt cannot be planned " +
+                "there yet. Run the probe again to fill them in.");
         }
 
         if (loadFailure is not null)
@@ -325,7 +374,8 @@ internal static class VfCurveCommand
                 $"  {bin.VoltageMv,7:F0} mV -> max {bin.MaxClockMHz,7:F0} MHz  (avg {bin.AvgClockMHz,7:F0}, {bin.Samples,5} samples)");
         }
 
-        return probeIncomplete || probeRestoreFailed || loadFailure is not null ? 1 : curve.Count > 0 ? 0 : 3;
+        return probeIncomplete || probeRestoreFailed || loadFailure is not null || tuningMoved ? 1
+            : curve.Count > 0 ? 0 : 3;
     }
 
     /// <summary>
