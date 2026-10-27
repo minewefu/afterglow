@@ -64,7 +64,9 @@ public partial class App : Application
 
         // Installer hook: register the elevated no-UAC logon task and exit.
         // The installer's post-install step runs elevated, so this succeeds
-        // without any prompt of its own.
+        // without any prompt of its own. Setup may run as an administrator who
+        // only typed a password for the signed-in user, so the task is for the
+        // user signed in to this session, not for this process's account (R-41).
         if (args.Contains("--register-startup"))
         {
             string? failure = AppServices.CheckElevated()
@@ -72,9 +74,26 @@ public partial class App : Application
                 : "the post-install step did not run elevated.";
             if (failure is not null)
             {
-                // Inno runs this hidden and ignores the exit code, so the log is
-                // the only place a refusal can still be read afterwards.
+                // Setup runs this hidden and can only show a generic message
+                // from the exit code; the log keeps the actual reason.
                 Core.Diagnostics.Log.Error($"--register-startup did not register the task: {failure}");
+            }
+
+            Shutdown(failure is null ? 0 : 1);
+            return;
+        }
+
+        // Uninstaller hook (R-46): every Windows user has their own startup task,
+        // so no fixed name in [UninstallRun] can remove them all. Enumerate and
+        // delete every user's task plus the legacy machine-global one, and exit.
+        if (args.Contains("--unregister-startup-all-users"))
+        {
+            string? failure = AppServices.CheckElevated()
+                ? (StartupTaskService.RemoveAllUsersTasks() ? null : "not every startup task could be removed.")
+                : "the uninstall step did not run elevated.";
+            if (failure is not null)
+            {
+                Core.Diagnostics.Log.Error($"--unregister-startup-all-users: {failure}");
             }
 
             Shutdown(failure is null ? 0 : 1);
