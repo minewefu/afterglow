@@ -7,7 +7,10 @@ namespace Afterglow.Cli;
 /// <summary>
 /// `drs --exe NAME [--cap FPS] [--vsync default|on|off] [--low-latency on|off] [--clear]`
 /// — per-game NVIDIA driver settings (the same store the NVIDIA Control Panel
-/// edits). With only --exe, prints the current values.
+/// edits). With only --exe, prints the current values. `--cap 0` turns the
+/// limiter off for this game (stored as the driver's explicit "disabled", so a
+/// global cap does not apply); --clear removes Afterglow's settings so the game
+/// inherits the global ones again.
 ///   --cleanup [--apply]   find the profile "A" that 1.2.0-beta.4 and earlier left
 ///                         (names truncated to one letter); a dry run unless
 ///                         --apply, which deletes exact matches only (admin)
@@ -19,6 +22,7 @@ internal static class DrsCommand
     private const string Usage =
         "Usage: afterglow-cli drs --exe game.exe [--cap FPS] [--vsync default|on|off] " +
         "[--low-latency on|off] [--clear]\n" +
+        "         --cap 0 = limiter off for this game (overrides a global cap); --clear = back to the global settings\n" +
         "       afterglow-cli drs --cleanup [--apply]\n" +
         "       afterglow-cli drs --selftest";
 
@@ -124,8 +128,11 @@ internal static class DrsCommand
 
         if (args.Contains("--probe-create"))
         {
-            Console.WriteLine("  " + drs.ProbeCreate($"AfterglowProbe{Environment.TickCount % 100000}"));
-            Console.WriteLine("  " + drs.ProbeCreate("Afterglow - afterglow-drstest.exe"));
+            foreach (string name in ProbeCreateNames())
+            {
+                Console.WriteLine($"  \"{name}\": {drs.ProbeCreate(name)}");
+            }
+
             return 0;
         }
 
@@ -157,16 +164,21 @@ internal static class DrsCommand
 
         if (clear)
         {
-            var rc = drs.ClearSettings(exe);
+            // ClearSettings reports a refused lookup or delete and checks the store
+            // from a fresh session (R-32); the note says what was done or what failed.
+            var rc = drs.ClearSettings(exe, out string clearNote);
             Console.WriteLine(rc == NvapiStatus.Ok
-                ? $"Cleared Afterglow-managed driver settings for {exe}."
-                : $"Clear failed: {rc}");
+                ? $"Cleared Afterglow-managed driver settings for {exe}: {clearNote}."
+                : $"Clear failed: {Describe(rc)} — {clearNote}.");
             return rc == NvapiStatus.Ok ? 0 : 1;
         }
 
         if (cap >= 0 || vsync is not null || lowLatency is not null)
         {
-            // Start from what's stored so unspecified knobs are preserved.
+            // Start from what's stored so unspecified knobs are preserved. These
+            // are the values the game currently gets, inherited ones included, and
+            // all three are written: without --cap, a game running uncapped gets
+            // an explicit "off" (R-31), which a global cap set later won't override.
             _ = drs.ReadSettings(exe, out var current);
             var settings = new GameDriverSettings
             {
@@ -187,6 +199,19 @@ internal static class DrsCommand
             ? $"{exe}: cap={stored.FrameCapFps} (0=off) vsync={stored.Vsync} low-latency={stored.LowLatency}"
             : $"{exe}: no driver profile found ({read})");
         return 0;
+    }
+
+    /// <summary>
+    /// The hidden --probe-create's two profile names: a bare one, and one shaped
+    /// like the profiles ApplySettings creates ("Afterglow - exe"). Both carry a
+    /// fresh random suffix (R-33): the second used to be the fixed
+    /// "Afterglow - afterglow-drstest.exe", so a profile already holding that
+    /// name was the one the probe deleted.
+    /// </summary>
+    internal static string[] ProbeCreateNames()
+    {
+        string suffix = RandomNumberGenerator.GetHexString(8, lowercase: true);
+        return [$"AfterglowProbe-{suffix}", DrsApi.ProfileNameFor($"afterglow-drstest-{suffix}.exe")];
     }
 
     private static int RunMaintenance(string[] args, bool cleanup, bool apply, bool selfTest)

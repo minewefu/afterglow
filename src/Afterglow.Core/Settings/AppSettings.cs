@@ -64,7 +64,13 @@ public sealed record GameRule
     /// <summary>Restore the previous tuning when the game exits.</summary>
     public bool RevertOnExit { get; init; } = true;
 
-    /// <summary>Driver frame-rate limiter for this game (DRS); 0 = off.</summary>
+    /// <summary>
+    /// Driver frame-rate limiter for this game (DRS), 0–1000; 0 = no cap. When
+    /// the rule writes driver settings (another option set), 0 is stored as the
+    /// driver's explicit "off" for this game, which overrides a global cap set in
+    /// NVIDIA Control Panel. A rule with no driver option set writes nothing, so
+    /// the driver's own settings, a global cap included, stay in charge.
+    /// </summary>
     public int FrameCapFps { get; init; }
 
     /// <summary>Driver vsync for this game: "default", "on", or "off".</summary>
