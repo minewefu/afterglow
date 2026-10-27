@@ -89,6 +89,23 @@ public sealed class TuningFlightRecordTests : IDisposable
     private static CrashForensics.EventEvidence HardReset() => new(true, 0, true, 0, 0, 0);
 
     [Fact]
+    public void A_lock_unconfirmed_since_a_sleep_is_recorded_as_unknown_not_none()
+    {
+        var tuner = new FakeTuner { UnconfirmedLock = 1800 };
+
+        var state = TuningFlightSampler.Read(tuner, FakeTuner.Uuid);
+
+        // "lock=none" here would let a crash on this card read as stock.
+        Assert.False(state.LockRecorded);
+        Assert.False(state.FullyRecorded);
+        Assert.Null(state.LockedCoreClockMHz);
+
+        // A lock applied since the wake is known again, whatever came before.
+        var confirmed = new FakeTuner { UnconfirmedLock = null };
+        Assert.True(TuningFlightSampler.Read(confirmed, FakeTuner.Uuid).LockRecorded);
+    }
+
+    [Fact]
     public void A_profile_applied_just_after_a_stock_sample_is_on_record_before_the_next_sample()
     {
         // The review's case: the periodic sample saw stock, a profile landed a

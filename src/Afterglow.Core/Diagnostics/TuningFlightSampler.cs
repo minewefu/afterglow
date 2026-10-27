@@ -148,6 +148,12 @@ public sealed class TuningFlightSampler
         var current = tuner.ReadCurrent();
         uint? lockMHz = tuner.AppliedLockMHz;
 
+        // A lock applied before the PC slept may or may not still be in force
+        // (UnconfirmedLockMHz). Recording "lock=none" for it would let the
+        // diagnosis call a crash on that card stock; the lock is "not
+        // recorded" instead, so the verdict never clears Afterglow on it.
+        bool lockKnown = lockMHz is not null || tuner.UnconfirmedLockMHz is null;
+
         int? edited = 0;
         int? highest = null;
         if (tuner.Capabilities.SupportsVfPoints)
@@ -174,7 +180,7 @@ public sealed class TuningFlightSampler
         {
             CoreOffsetMHz = current.CoreOffsetMHz,
             MemOffsetMHz = current.MemOffsetMHz,
-            LockRecorded = true,
+            LockRecorded = lockKnown,
             LockedCoreClockMHz = lockMHz,
             VfPointsEdited = edited,
             VfPointMaxOffsetMHz = highest,

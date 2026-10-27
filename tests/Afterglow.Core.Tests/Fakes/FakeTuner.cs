@@ -49,6 +49,11 @@ internal sealed class FakeTuner : IGpuTuner
 
     public string RecordKey => Uuid;
 
+    /// <summary>A lock from before the last sleep that may or may not still be in force (IGpuTuner.UnconfirmedLockMHz).</summary>
+    public uint? UnconfirmedLock { get; set; }
+
+    public uint? UnconfirmedLockMHz => UnconfirmedLock;
+
     public uint? AppliedLockMHz
     {
         get
