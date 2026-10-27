@@ -8,7 +8,8 @@ public sealed record TrackedApp(int ProcessId, string Application, string Presen
 /// Aggregates PresentMon events into per-process rolling windows and serves
 /// statistics for "the game" — either an explicitly selected process or the
 /// busiest one. Swap chains are tracked separately per process and the busiest
-/// chain wins, so launcher/overlay swap chains don't pollute game numbers.
+/// chain that is still presenting wins, so launcher/overlay swap chains — and a
+/// chain the game has replaced — don't pollute game numbers.
 /// </summary>
 public sealed class FrameMetricsService : IDisposable
 {
@@ -22,6 +23,10 @@ public sealed class FrameMetricsService : IDisposable
     private sealed class ProcessEntry
     {
         public required string Application { get; init; }
+
+        /// <summary>When this capture first saw the process present; a process started later is a reused id.</summary>
+        public required DateTime FirstSeenUtc { get; init; }
+
         public readonly ConcurrentDictionary<string, ChainWindow> Chains = new();
         public double LastSeenMs;
 
@@ -33,6 +38,15 @@ public sealed class FrameMetricsService : IDisposable
         /// </summary>
         public long LastSeenTicks;
     }
+
+    /// <summary>
+    /// This process. Afterglow's own window presents too, and as the foreground
+    /// window it became "the game" whenever the user switched to it — the readout
+    /// showed Afterglow's frame rate mid-game, and pressing Stop after a game
+    /// exited recorded the session as Afterglow's (or dropped it). The app is
+    /// never the subject of its own measurement.
+    /// </summary>
+    private static readonly int OwnProcessId = Environment.ProcessId;
 
     private readonly PresentMonSession _session;
     private readonly ConcurrentDictionary<int, ProcessEntry> _processes = new();
@@ -54,41 +68,116 @@ public sealed class FrameMetricsService : IDisposable
         _session.FramePresented += OnFrame;
     }
 
-    public bool Start(string? exePath = null) => _session.Start(exePath);
+    /// <summary>
+    /// Starts a capture; while one is running this changes nothing. A new capture
+    /// starts from nothing (R-26): the GUI's Stop ended PresentMon but kept these
+    /// windows, and a new PresentMon's timestamps restart at zero, so the old
+    /// frames never aged out and the next capture reported a blend of both runs.
+    /// The session is stopped before the windows are cleared, so no line of the
+    /// old capture can still arrive after the clear.
+    /// </summary>
+    public bool Start(string? exePath = null)
+    {
+        if (_session.State == PresentMonState.Running)
+        {
+            return true;
+        }
+
+        _session.Stop();
+        ClearCapture();
+        return _session.Start(exePath);
+    }
+
+    /// <summary>
+    /// Ends the capture and drops its windows, so nothing can serve them as a
+    /// current reading afterwards. Read what a report needs before calling this.
+    /// </summary>
+    public void Stop()
+    {
+        _session.Stop();
+        ClearCapture();
+    }
+
+    private void ClearCapture()
+    {
+        _processes.Clear();
+        Volatile.Write(ref _lastEventMs, 0);
+    }
 
     private void OnFrame(PresentEvent e)
     {
-        // Ignore the compositor itself.
-        if (e.Application.Equals("dwm.exe", StringComparison.OrdinalIgnoreCase))
+        // Ignore the compositor itself, and this app's own window.
+        if (e.ProcessId == OwnProcessId || e.Application.Equals("dwm.exe", StringComparison.OrdinalIgnoreCase))
         {
             return;
         }
 
-        var entry = _processes.GetOrAdd(e.ProcessId, _ => new ProcessEntry { Application = e.Application });
+        var entry = _processes.GetOrAdd(e.ProcessId, static (_, app) => new ProcessEntry
+        {
+            Application = app,
+            FirstSeenUtc = DateTime.UtcNow,
+        }, e.Application);
         var chain = entry.Chains.GetOrAdd(e.SwapChain, _ => new ChainWindow
         {
             Window = new FrametimeWindow(_statsWindow),
         });
 
         chain.Window.Add(e.TimestampMs, e.FrametimeMs);
-        chain.LastSeenMs = e.TimestampMs;
+        Volatile.Write(ref chain.LastSeenMs, e.TimestampMs);
         chain.PresentMode = e.PresentMode;
-        entry.LastSeenMs = e.TimestampMs;
+        if (entry.Chains.Count > 1)
+        {
+            AgeOtherChains(entry, chain, e.TimestampMs);
+        }
+
+        Volatile.Write(ref entry.LastSeenMs, e.TimestampMs);
         Volatile.Write(ref entry.LastSeenTicks, Environment.TickCount64);
         Volatile.Write(ref _lastEventMs, e.TimestampMs);
 
-        // Opportunistic cleanup: drop processes idle for >60 s.
+        // Opportunistic cleanup of long-idle processes.
         if (_processes.Count > 32)
         {
             Prune(e.TimestampMs);
         }
     }
 
+    /// <summary>
+    /// The process's other swap chains age on this frame too, against the
+    /// capture's shared timeline (R-27). A window used to be aged only by its own
+    /// frames, so a chain the game stopped using — after a resolution change or a
+    /// fullscreen toggle — kept its whole window forever. A chain silent for a
+    /// whole window holds nothing any more and is dropped, so a game that
+    /// recreates its swap chain on every mode change doesn't accumulate them.
+    /// </summary>
+    private void AgeOtherChains(ProcessEntry entry, ChainWindow current, double nowMs)
+    {
+        foreach (var (key, other) in entry.Chains)
+        {
+            if (ReferenceEquals(other, current))
+            {
+                continue;
+            }
+
+            other.Window.Age(nowMs);
+            if (other.Window.Count == 0 && nowMs - Volatile.Read(ref other.LastSeenMs) > _statsWindow.TotalMilliseconds)
+            {
+                entry.Chains.TryRemove(key, out _);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Drops processes idle for a minute beyond the stats window, and never sooner:
+    /// a process whose window could still be reported stays, so a capture no
+    /// longer than its window (the CLI sizes the window to the capture) keeps
+    /// every participant for its summary (R-30).
+    /// </summary>
     private void Prune(double nowMs)
     {
+        double idleMs = _statsWindow.TotalMilliseconds + 60_000;
         foreach (var (pid, entry) in _processes)
         {
-            if (nowMs - Volatile.Read(ref entry.LastSeenMs) > 60_000)
+            if (nowMs - Volatile.Read(ref entry.LastSeenMs) > idleMs)
             {
                 _processes.TryRemove(pid, out _);
             }
@@ -100,7 +189,14 @@ public sealed class FrameMetricsService : IDisposable
     /// Past this, the overlay and dashboard must show nothing rather than keep
     /// repainting the final average as though the game were still running.
     /// </summary>
-    private static readonly long StaleAfterMs = 2000;
+    internal const long StaleAfterMs = 2000;
+
+    /// <summary>
+    /// How far a swap chain's last frame may trail its process's newest frame and
+    /// still count as a chain the process presents through (R-27). The same two
+    /// seconds as a process's own freshness, on the PresentMon timeline.
+    /// </summary>
+    private const double ChainStaleMs = 2000;
 
     private static bool IsFresh(ProcessEntry entry) =>
         Environment.TickCount64 - Volatile.Read(ref entry.LastSeenTicks) <= StaleAfterMs;
@@ -144,12 +240,26 @@ public sealed class FrameMetricsService : IDisposable
         return best;
     }
 
+    /// <summary>
+    /// The chain with the most frames among those still presenting. A chain is
+    /// judged against its process's newest frame, not the wall clock: for a live
+    /// process that is the capture's current time, and for a process that quit
+    /// before a finished capture ended it is the moment it quit, so the summary
+    /// still reports the chain it was presenting through. A stale chain can't
+    /// win (R-27): it used to out-count the chain the game presents through now.
+    /// </summary>
     private static ChainWindow? BusiestChain(ProcessEntry entry)
     {
+        double newest = Volatile.Read(ref entry.LastSeenMs);
         ChainWindow? best = null;
         int bestCount = 0;
         foreach (var chain in entry.Chains.Values)
         {
+            if (newest - Volatile.Read(ref chain.LastSeenMs) > ChainStaleMs)
+            {
+                continue;
+            }
+
             int count = chain.Window.Count;
             if (count > bestCount)
             {
@@ -163,6 +273,15 @@ public sealed class FrameMetricsService : IDisposable
 
     /// <summary>Whether the process has presented within the freshness window.</summary>
     public bool IsLive(int pid) => _processes.TryGetValue(pid, out var entry) && IsFresh(entry);
+
+    /// <summary>
+    /// Whether the process that presented as <paramref name="pid"/> in this capture
+    /// is still running — that same process, not a newer one reusing the id.
+    /// Session reports use it to tell a tuning change made while the game ran
+    /// from one made after it exited (R-28).
+    /// </summary>
+    public bool IsStillRunning(int pid) =>
+        _processes.TryGetValue(pid, out var entry) && ProcessLiveness.IsRunning(pid, entry.FirstSeenUtc);
 
     /// <param name="pid">The process to report on.</param>
     /// <param name="requireFresh">
@@ -212,14 +331,26 @@ public sealed class FrameMetricsService : IDisposable
         return BusiestChain(entry)?.Window.GetRecentFrametimes(maxCount) ?? [];
     }
 
-    public IReadOnlyList<TrackedApp> GetTrackedApps()
+    /// <summary>The live view: applications that presented within the last ten seconds of the capture.</summary>
+    public IReadOnlyList<TrackedApp> GetTrackedApps() => Apps(maxIdleMs: 10_000);
+
+    /// <summary>
+    /// Every application that presented during this capture, however long ago it
+    /// stopped — what a report over a finished capture lists (R-30). The CLI's
+    /// summary used the live view, which drops an application ten seconds after
+    /// its last frame: a benchmark that finished fifteen seconds before the
+    /// capture did vanished while a background browser stayed.
+    /// </summary>
+    public IReadOnlyList<TrackedApp> GetCapturedApps() => Apps(maxIdleMs: null);
+
+    private TrackedApp[] Apps(double? maxIdleMs)
     {
         double now = Volatile.Read(ref _lastEventMs);
         var apps = new List<TrackedApp>();
         foreach (var (pid, entry) in _processes)
         {
             double lastSeen = Volatile.Read(ref entry.LastSeenMs);
-            if (now - lastSeen > 10_000)
+            if (maxIdleMs is { } idle && now - lastSeen > idle)
             {
                 continue;
             }

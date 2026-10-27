@@ -39,7 +39,16 @@ public partial class MetricsViewModel : ObservableObject
 
     private readonly SessionReportStore _sessionStore = new();
     private DateTimeOffset _captureStartedAt;
-    private (string App, FrameWindowStats Stats)? _lastTargetStats;
+
+    /// <summary>
+    /// The target's last live statistics in this capture: its process, and when
+    /// they were read (<see cref="Environment.TickCount64"/>, the tuning
+    /// timeline's clock).
+    /// </summary>
+    private (string App, int Pid, FrameWindowStats Stats, long AtMs)? _lastTargetStats;
+
+    /// <summary>The tuning the capture ran under, read as it goes (R-28).</summary>
+    private CaptureTuningTimeline _tuning = new();
 
     public System.Collections.ObjectModel.ObservableCollection<SessionReport> SessionHistory { get; } = [];
 
@@ -105,12 +114,22 @@ public partial class MetricsViewModel : ObservableObject
     /// <summary>The GPU the running capture was started on (see ToggleCapture).</summary>
     private Core.Hardware.GpuContext? _captureGpu;
 
-    private void RecordSession()
+    /// <summary>
+    /// Adds a reading of the capture's card to the tuning timeline. The capture's
+    /// card, not the selector's: the selector can move to another GPU mid-game,
+    /// and the report used to stamp that card's offsets under the first card's
+    /// name and averages. No card (FPS capture needs none) reads as nothing.
+    /// </summary>
+    private void ReadCaptureTuning() =>
+        _tuning.AddReading(Environment.TickCount64, _captureGpu is { } gpu ? TuningReading.Read(gpu.Tuner) : null);
+
+    /// <returns>The recorded report, or null when the capture was too short to record.</returns>
+    private SessionReport? RecordSession()
     {
         int duration = (int)(DateTimeOffset.Now - _captureStartedAt).TotalSeconds;
         if (duration < 30 || _lastTargetStats is not { } last || last.Stats.FrameCount < 100)
         {
-            return;
+            return null;
         }
 
         // FPS capture needs no supported GPU; with none there is no history
@@ -120,26 +139,14 @@ public partial class MetricsViewModel : ObservableObject
         var telemetry = Core.Metrics.SessionTelemetry.Since(
             _services.Telemetry, captureGpu?.Index ?? 0, _captureStartedAt);
 
-        // The capture's card, not the selector's: the selector can move to
-        // another GPU mid-game, and this report used to stamp that card's
-        // offsets under the first card's name and averages. And null, not 0,
-        // for a knob the card does not have — an Arc session was exporting
-        // "core 0 / mem 0 MHz" for offsets it cannot apply.
-        int? core = null;
-        int? mem = null;
-        if (captureGpu is { } gpu)
-        {
-            try
-            {
-                var current = gpu.Tuner.ReadCurrent();
-                var caps = gpu.Tuner.Capabilities;
-                core = caps.SupportsCoreOffset ? current.CoreOffsetMHz : null;
-                mem = caps.SupportsMemOffset ? current.MemOffsetMHz : null;
-            }
-            catch (InvalidOperationException)
-            {
-            }
-        }
+        // The tuning in force while these frames were presented, from the
+        // timeline Refresh kept — never a read of the card now (R-28). In the
+        // game-profile workflow the game's exit has already restored the
+        // baseline by the time Stop is clicked, and reading it here stamped the
+        // tuned run with the untuned settings. Offsets stay null, not 0, for a
+        // knob the card does not have (an Arc session exported "core 0 / mem 0
+        // MHz" for offsets it cannot apply).
+        var tuning = _tuning.AttributeTo(last.Pid, last.AtMs, last.Stats);
 
         var report = new SessionReport
         {
@@ -155,12 +162,14 @@ public partial class MetricsViewModel : ObservableObject
             AvgPowerW = telemetry.PowerW,
             AvgGpuTempC = telemetry.GpuTempC,
             AvgMemJunctionC = telemetry.MemJunctionC,
-            CoreOffsetMHz = core,
-            MemOffsetMHz = mem,
+            CoreOffsetMHz = tuning.Reading?.CoreOffsetMHz,
+            MemOffsetMHz = tuning.Reading?.MemOffsetMHz,
+            TuningChangedDuringWindow = tuning.Reading is null ? null : tuning.ChangedDuringWindow,
         };
         _sessionStore.Append(report);
         SessionHistory.Insert(0, report);
         _services.Flight?.Marker($"session-recorded app={report.Application} fps={report.AvgFps:F1}");
+        return report;
     }
 
     public MetricsViewModel(AppServices services)
@@ -219,20 +228,7 @@ public partial class MetricsViewModel : ObservableObject
     {
         if (CaptureRunning)
         {
-            try
-            {
-                RecordSession();
-            }
-            finally
-            {
-                // Stopping never depends on the report: whatever goes wrong
-                // writing it, the capture ends and the button leaves the
-                // running state instead of rethrowing on every click (F-18).
-                _services.FrameMetrics.Session.Dispose();
-                CaptureRunning = false;
-                CaptureStatusText = "Capture stopped.";
-            }
-
+            EndCapture(endedOnItsOwn: null);
             return;
         }
 
@@ -246,12 +242,55 @@ public partial class MetricsViewModel : ObservableObject
             // selector again at Stop attributed a whole session's sensor averages
             // to whichever card the user had switched to since.
             _captureGpu = _services.SelectedGpu;
+
+            // The tuning in force as the capture begins opens its timeline.
+            _tuning = new CaptureTuningTimeline();
+            ReadCaptureTuning();
             CaptureStatusText = "Capturing present events for all processes (ETW).";
         }
         else
         {
             CaptureStatusText = _services.FrameMetrics.Session.FailureReason ?? "Could not start capture.";
             PresentMonMissing = !File.Exists(PresentMonSession.DefaultExePath);
+        }
+    }
+
+    /// <summary>
+    /// Ends the capture, recording its session first. <paramref name="endedOnItsOwn"/>
+    /// is null when the user pressed Stop, else why PresentMon stopped by itself:
+    /// a capture that ended early still measured what it measured, so it is
+    /// recorded like any other (the same 30 s / 100 frame minimum applies) and
+    /// the status says so.
+    /// </summary>
+    private void EndCapture(string? endedOnItsOwn)
+    {
+        SessionReport? recorded = null;
+        try
+        {
+            recorded = RecordSession();
+        }
+        finally
+        {
+            // Stopping never depends on the report: whatever goes wrong
+            // writing it, the capture ends and the button leaves the
+            // running state instead of rethrowing on every click (F-18).
+            // The service's Stop, not just the session's: it also drops the
+            // capture's frame windows (R-26).
+            _services.FrameMetrics.Stop();
+            CaptureRunning = false;
+
+            string status = endedOnItsOwn is null ? "Capture stopped." : $"Capture ended: {endedOnItsOwn}";
+            if (endedOnItsOwn is not null && recorded is not null)
+            {
+                status += " The session up to that point was recorded.";
+            }
+
+            if (recorded?.TuningChangedDuringWindow == true)
+            {
+                status += " The tuning changed during its last 30 s, so that session's numbers mix two configurations.";
+            }
+
+            CaptureStatusText = status;
         }
     }
 
@@ -268,13 +307,23 @@ public partial class MetricsViewModel : ObservableObject
             return;
         }
 
-        if (_services.FrameMetrics.Session.State == PresentMonState.Failed)
+        // Every terminal state ends the capture (R-29). Only Failed was handled,
+        // so a PresentMon that exited — its trace stopped by another capture
+        // under the once-shared session name, or a crash — left the page
+        // labelled "Capturing" over a capture that had ended.
+        var session = _services.FrameMetrics.Session;
+        if (session.State != PresentMonState.Running)
         {
-            CaptureRunning = false;
-            CaptureStatusText = _services.FrameMetrics.Session.FailureReason ?? "Capture failed.";
+            EndCapture(session.FailureReason ?? (session.State == PresentMonState.Failed
+                ? "Capture failed."
+                : "PresentMon exited."));
             return;
         }
 
+        // Tuning first, then the stats, then whether their process still runs:
+        // that order is what lets the report place a tuning change before or
+        // after the game's last frame (R-28, see CaptureTuningTimeline).
+        ReadCaptureTuning();
         var stats = _services.FrameMetrics.GetTargetStats();
         if (stats is null)
         {
@@ -292,7 +341,12 @@ public partial class MetricsViewModel : ObservableObject
 
 
         var (app, s) = stats.Value;
-        _lastTargetStats = (app.Application, s);
+        _lastTargetStats = (app.Application, app.ProcessId, s, Environment.TickCount64);
+        if (_services.FrameMetrics.IsStillRunning(app.ProcessId))
+        {
+            _tuning.ConfirmRunning(app.ProcessId);
+        }
+
         AppText = $"{app.Application} (PID {app.ProcessId})";
         PresentModeText = app.PresentMode;
         AvgFpsText = s.AverageFps.ToString("F1");
