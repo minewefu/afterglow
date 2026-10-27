@@ -91,17 +91,20 @@ internal static class CertifyCommand
         var certifier = new ProfileCertifier(gpu.Tuner, store, gpu.PciBusId, gpu.PciVendorId,
             new CertificationFans(fanService, () => null));
         var done = new ManualResetEventSlim(false);
-        int lastLogCount = 0;
+        // The run's log is capped (#7): once full, its Count stops growing, so a
+        // count-based cursor would print nothing more. The cursor numbers lines
+        // across the whole run instead.
+        var logCursor = new Core.Stress.RunLogCursor();
         CertifierStatus? final = null;
 
         certifier.StatusChanged += status =>
         {
             lock (Console.Out)
             {
-                for (; lastLogCount < status.Log.Count; lastLogCount++)
+                for (int i = logCursor.Advance(status.Log).From; i < status.Log.Count; i++)
                 {
                     Console.WriteLine();
-                    Console.WriteLine(status.Log[lastLogCount]);
+                    Console.WriteLine(status.Log[i]);
                 }
 
                 if (status.Running && status.ModeDuration > TimeSpan.Zero)

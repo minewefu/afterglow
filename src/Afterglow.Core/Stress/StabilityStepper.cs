@@ -26,6 +26,12 @@ public sealed record StepperStatus(
     int? LastGoodOffsetMHz,
     TimeSpan StepElapsed,
     TimeSpan StepDuration,
+
+    /// <summary>
+    /// The run's log so far, capped at <see cref="RunLog.DefaultCapacity"/>
+    /// lines plus a marker for any dropped. From a run this is a
+    /// <see cref="RunLogLines"/>, numbered so a viewer can add only new lines.
+    /// </summary>
     IReadOnlyList<string> Log,
     int? ResultOffsetMHz,
 
@@ -72,10 +78,11 @@ public sealed class StabilityStepper
 
     private readonly IGpuTuner _tuner;
     private readonly Lock _lock = new();
-    private readonly List<string> _log = [];
+    // The whole run's log, capped (#7): the app now shows all of it, not the last 14 lines.
+    private readonly RunLog _log = new();
     private Thread? _thread;
     private volatile bool _cancel;
-    private StepperStatus _status = new(false, "idle", 0, null, TimeSpan.Zero, TimeSpan.Zero, [], null);
+    private StepperStatus _status = new(false, "idle", 0, null, TimeSpan.Zero, TimeSpan.Zero, RunLogLines.Empty, null);
 
     /// <summary>The current run's ownership of the tuning; set and used on the run thread only.</summary>
     private TuningRunGuard? _guard;
@@ -206,7 +213,8 @@ public sealed class StabilityStepper
         StepperStatus status;
         lock (_lock)
         {
-            status = new StepperStatus(running, phase, offset, lastGood, stepElapsed, stepDuration, _log.ToArray(), result, restored);
+            // A cached snapshot: a progress tick that added no line copies nothing.
+            status = new StepperStatus(running, phase, offset, lastGood, stepElapsed, stepDuration, _log.Snapshot(), result, restored);
             _status = status;
         }
 

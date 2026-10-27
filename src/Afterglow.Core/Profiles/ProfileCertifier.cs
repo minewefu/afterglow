@@ -17,6 +17,12 @@ public sealed record CertifierStatus(
     int ModeCount,
     TimeSpan ModeElapsed,
     TimeSpan ModeDuration,
+
+    /// <summary>
+    /// The run's log so far, capped at <see cref="RunLog.DefaultCapacity"/>
+    /// lines plus a marker for any dropped. From a run this is a
+    /// <see cref="RunLogLines"/>, numbered so a viewer can add only new lines.
+    /// </summary>
     IReadOnlyList<string> Log,
     bool? Passed,
     string? FailedMode,
@@ -58,10 +64,11 @@ public sealed class ProfileCertifier
     private readonly ProfileStore _store;
     private readonly CertificationFans? _fans;
     private readonly Lock _lock = new();
-    private readonly List<string> _log = [];
+    // The whole run's log, capped (#7): the app now shows all of it, not the last 10 lines.
+    private readonly RunLog _log = new();
     private Thread? _thread;
     private volatile bool _cancel;
-    private CertifierStatus _status = new(false, "idle", 0, 4, TimeSpan.Zero, TimeSpan.Zero, [], null, null);
+    private CertifierStatus _status = new(false, "idle", 0, 4, TimeSpan.Zero, TimeSpan.Zero, RunLogLines.Empty, null, null);
 
     public event Action<CertifierStatus>? StatusChanged;
 
@@ -147,9 +154,10 @@ public sealed class ProfileCertifier
         CertifierStatus status;
         lock (_lock)
         {
+            // A cached snapshot: a progress tick that added no line copies nothing.
             status = new CertifierStatus(
                 running, phase, modeIndex, CertificationModes.All.Count, elapsed, duration,
-                _log.ToArray(), passed, failedMode, resetSucceeded);
+                _log.Snapshot(), passed, failedMode, resetSucceeded);
             _status = status;
         }
 

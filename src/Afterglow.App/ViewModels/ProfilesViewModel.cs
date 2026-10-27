@@ -66,7 +66,8 @@ public partial class ProfilesViewModel : ObservableObject
     [ObservableProperty] public partial bool CertifyRunning { get; set; }
     [ObservableProperty] public partial string CertifyPhaseText { get; set; } = string.Empty;
     [ObservableProperty] public partial double CertifyProgress { get; set; }
-    [ObservableProperty] public partial string CertifyLog { get; set; } = string.Empty;
+    /// <summary>The run's whole log, shown by a LogView that appends only new lines (#7).</summary>
+    [ObservableProperty] public partial IReadOnlyList<string> CertifyLog { get; set; } = Core.Stress.RunLogLines.Empty;
 
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(CertifySecondsLabel))]
@@ -120,6 +121,9 @@ public partial class ProfilesViewModel : ObservableObject
         _certifier.Start(profile, new CertifierOptions { SecondsPerMode = (int)CertifySeconds });
     }
 
+    [RelayCommand]
+    private void CopyCertifyLog() => ClipboardSafe.Copy(string.Join(Environment.NewLine, CertifyLog));
+
     private void OnCertifierStatus(CertifierStatus status)
     {
         CertifyRunning = status.Running;
@@ -154,7 +158,7 @@ public partial class ProfilesViewModel : ObservableObject
                 (status.ModeIndex + status.ModeElapsed.TotalSeconds / status.ModeDuration.TotalSeconds) /
                 status.ModeCount, 0, 1)
             : status.Passed == true ? 1 : 0;
-        CertifyLog = string.Join(Environment.NewLine, status.Log.TakeLast(10));
+        CertifyLog = status.Log;
 
         if (!status.Running)
         {

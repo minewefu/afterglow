@@ -129,7 +129,8 @@ public partial class StabilityViewModel : ObservableObject, IDisposable, ILivePa
     [ObservableProperty] public partial bool StepperRunning { get; set; }
     [ObservableProperty] public partial string StepperPhaseText { get; set; } = string.Empty;
     [ObservableProperty] public partial double StepperProgress { get; set; }
-    [ObservableProperty] public partial string StepperLog { get; set; } = string.Empty;
+    /// <summary>The run's whole log, shown by a LogView that appends only new lines (#7).</summary>
+    [ObservableProperty] public partial IReadOnlyList<string> StepperLog { get; set; } = RunLogLines.Empty;
     [ObservableProperty] public partial double StepMHz { get; set; } = 30;
     [ObservableProperty] public partial double SecondsPerStep { get; set; } = 60;
     [ObservableProperty] public partial double MaxOffset { get; set; } = 300;
@@ -197,7 +198,7 @@ public partial class StabilityViewModel : ObservableObject, IDisposable, ILivePa
             StressStatusText = string.Empty;
             VramStatusText = string.Empty;
             StepperPhaseText = string.Empty;
-            StepperLog = string.Empty;
+            StepperLog = RunLogLines.Empty;
         }
         else if (previous is not null && previous.Index != _gpu?.Index)
         {
@@ -206,7 +207,7 @@ public partial class StabilityViewModel : ObservableObject, IDisposable, ILivePa
             // is instead of leaving its readings to be read as the new card's.
             StressStatusText = string.Empty;
             VramStatusText = string.Empty;
-            StepperLog = string.Empty;
+            StepperLog = RunLogLines.Empty;
             StepperPhaseText = $"Still running on GPU {previous.Index} — {previous.Name}; " +
                                "its results stay on that card.";
         }
@@ -589,8 +590,11 @@ public partial class StabilityViewModel : ObservableObject, IDisposable, ILivePa
         StepperProgress = status.StepDuration.TotalSeconds > 0
             ? Math.Clamp(status.StepElapsed.TotalSeconds / status.StepDuration.TotalSeconds, 0, 1)
             : 0;
-        StepperLog = string.Join(Environment.NewLine, status.Log.TakeLast(14));
+        StepperLog = status.Log;
     }
+
+    [RelayCommand]
+    private void CopyStepperLog() => ClipboardSafe.Copy(string.Join(Environment.NewLine, StepperLog));
 
     private static string Capitalize(string text) =>
         text.Length == 0 ? text : char.ToUpperInvariant(text[0]) + text[1..];

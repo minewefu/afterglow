@@ -1,6 +1,7 @@
 <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-                    xmlns:views="clr-namespace:Afterglow.App.Views">
+                    xmlns:views="clr-namespace:Afterglow.App.Views"
+                    xmlns:controls="clr-namespace:Afterglow.App.Controls">
 
     <!-- Design system. Type follows the Windows 11 type ramp (Caption 12/16, Body 14/20,
          Body Strong 14/20 semibold, Title 28/36; nothing under 12 px); geometry follows Windows 11
@@ -226,6 +227,52 @@
         <Setter Property="LineHeight" Value="17" />
         <Setter Property="Foreground" Value="{StaticResource TextMuted}" />
         <Setter Property="TextWrapping" Value="Wrap" />
+    </Style>
+
+    <!-- A run's whole log (stepper, certification; controls:LogView, #7): InsetPanel and LogText
+         as one read-only text box, so it scrolls and its text can be selected and copied. Up to
+         14 lines tall (14 x 17 + 20), then a scroll bar. The border stays transparent until the
+         box has keyboard focus, which is when Ctrl+A / Ctrl+C act on it.
+         Selection: WPF lays it over the text as an adorner at SelectionOpacity (SelectionTextBrush
+         does not apply in that mode), so the opacity trades the band's visibility against the
+         selected text's contrast. Accent at 0.22 over Bg1 is #463024, 1.5:1 against Bg1, and
+         TextMuted under it stays 4.7:1. The TextBox style's AccentSoft (20 % alpha) at WPF's
+         default 0.4 is #251F1F, 1.1:1: hard to see. Worked out from the palette, not measured
+         on screen. -->
+    <Style TargetType="controls:LogView">
+        <Setter Property="Background" Value="{StaticResource Bg1}" />
+        <Setter Property="Foreground" Value="{StaticResource TextMuted}" />
+        <Setter Property="BorderBrush" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="FontFamily" Value="{StaticResource MonoFont}" />
+        <Setter Property="FontSize" Value="12" />
+        <Setter Property="TextBlock.LineHeight" Value="17" />
+        <Setter Property="TextOptions.TextFormattingMode" Value="Ideal" />
+        <Setter Property="SelectionBrush" Value="{StaticResource Accent}" />
+        <Setter Property="SelectionOpacity" Value="0.22" />
+        <Setter Property="MaxHeight" Value="258" />
+        <Setter Property="Padding" Value="9,5,4,5" />
+        <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="controls:LogView">
+                    <!-- Padding is the TextBox's own: TextBoxBase hands it to PART_ContentHost (a
+                         Padding set on that ScrollViewer here is overwritten), which insets the
+                         text but not the scroll bar. 1 border + 4 + 5 = the inset's 10 px top and
+                         bottom; 1 + 9 + the 2 px a TextBox keeps either side of its text = its
+                         12 px left; the scroll bar sits 3 px in from the right. -->
+                    <Border x:Name="Root" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="4" Padding="0,4,3,4">
+                        <ScrollViewer x:Name="PART_ContentHost" />
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsKeyboardFocused" Value="True">
+                            <Setter TargetName="Root" Property="BorderBrush" Value="{StaticResource Accent}" />
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
     </Style>
 
     <!-- Warning banner: <ContentControl Style="{StaticResource WarnBanner}" Content="{Binding …}" />.
