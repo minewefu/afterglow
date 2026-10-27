@@ -160,8 +160,13 @@ public sealed class AppServices : IDisposable
     /// <summary>Mutates and persists settings; side effects (interval, rules) are applied.</summary>
     public void UpdateSettings(Func<AppSettings, AppSettings> mutate)
     {
-        _settings = mutate(_settings);
-        SettingsStore.Save(_settings);
+        // Saved before it is kept (R-37): settings the file can't hold (a NaN
+        // threshold) used to replace the in-memory copy first, so the save threw
+        // and every later, unrelated change failed the same way until a restart.
+        // Save still swallows disk errors, so a read-only disk behaves as before.
+        var next = mutate(_settings);
+        SettingsStore.Save(next);
+        _settings = next;
         Telemetry.Interval = TimeSpan.FromMilliseconds(_settings.PollingIntervalMs);
         GameWatcher.UpdateRules(_settings.GameRules);
         SettingsChanged?.Invoke(_settings);

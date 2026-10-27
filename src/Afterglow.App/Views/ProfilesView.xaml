@@ -212,7 +212,7 @@
                             <TextBox Text="{Binding NewRuleCapFps, UpdateSourceTrigger=PropertyChanged}" Width="72"
                                      TextAlignment="Center" views:Hint.Placeholder="off" Margin="0,0,20,0"
                                      AutomationProperties.Name="Frame cap, frames per second"
-                                     ToolTip="The driver's frame-rate limiter; empty or 0 = off" />
+                                     ToolTip="The driver's frame-rate limiter; empty or 0 = no cap. With another driver option set, 0 is written as off for this game, which overrides a global cap; otherwise the driver's own settings stay in charge." />
                             <TextBlock Text="Vsync" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,8,0" />
                             <ComboBox SelectedIndex="{Binding NewRuleVsyncIndex}" MinWidth="150" Margin="0,0,20,0"
                                       AutomationProperties.Name="Vsync">

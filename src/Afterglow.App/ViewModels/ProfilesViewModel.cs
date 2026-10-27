@@ -211,6 +211,13 @@ public partial class ProfilesViewModel : ObservableObject
 
         if (_services.Profiles.LastLoadErrors.Count > 0)
         {
+            // The status line points at the log, so the log has to say which
+            // files and why (R-24 made a corrupt profile one of them).
+            foreach (var (file, error) in _services.Profiles.LastLoadErrors)
+            {
+                Core.Diagnostics.Log.Warn($"Profile not loaded: {file}: {error}");
+            }
+
             StatusText = $"{_services.Profiles.LastLoadErrors.Count} profile file(s) could not be loaded (see logs).";
         }
     }

@@ -20,7 +20,7 @@ feature, with the method behind it and where it has been verified.
   claiming verification). Verified live on RTX 5090; expected on RTX 20/30/40 via the same
   interfaces. Also `afterglow-cli vfpoints`
 - **Measured V/F curve** — the stored table says what the driver intends; the measured curve
-  shows what the GPU actually does under the power limit and thermals. A ~1-minute probe locks
+  shows what the GPU actually does under the power limit and thermals. A one-to-two-minute probe locks
   each clock step under load and records the voltage the driver selects (plus continuous
   passive recording while you game). Pick any
   point on the measured curve and Afterglow computes the exact offset + lock that holds that

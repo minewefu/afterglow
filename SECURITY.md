@@ -31,8 +31,9 @@ Afterglow's attack surface is deliberately small:
 - Settings/profiles are plain JSON under `%ProgramData%\Afterglow`. Afterglow writes no
   registry values of its own. The installer's only registry action is to *delete* a
   pre-1.0.2 `HKLM\...\Run\Afterglow` value left by the old autostart; current autostart is
-  a Task Scheduler entry (the "Afterglow" logon task), created by the optional installer
-  checkbox and removed at uninstall.
+  a Task Scheduler entry per Windows user (`Afterglow-<user SID>`; older builds used one
+  machine-wide "Afterglow" task, which is migrated or removed), created by the optional
+  installer checkbox or the Settings toggle and removed for every user at uninstall.
 
 ## Known trust boundary
 

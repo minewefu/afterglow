@@ -65,9 +65,10 @@
                 </Button>
 
                 <Button Style="{StaticResource TileButton}" Margin="0,0,12,12" Tag="power" Click="OnTileClick"
-                        ToolTip="Show the last 10 minutes" AutomationProperties.Name="Board power: show the last 10 minutes">
+                        ToolTip="Show the last 10 minutes"
+                        AutomationProperties.Name="{Binding PowerTitle, StringFormat='{}{0}: show the last 10 minutes'}">
                     <StackPanel>
-                        <TextBlock Text="Board power" Style="{StaticResource CardTitle}" />
+                        <TextBlock Text="{Binding PowerTitle}" Style="{StaticResource CardTitle}" />
                         <StackPanel Orientation="Horizontal" Margin="0,2,0,0">
                             <TextBlock Text="{Binding PowerText}" Style="{StaticResource MetricValue}" />
                             <TextBlock Text="W" Style="{StaticResource MetricUnit}" />
@@ -221,7 +222,7 @@
                         <StackPanel Orientation="Horizontal">
                             <TextBlock Text="Temperatures · last 10 min" Style="{StaticResource CardTitle}" />
                             <TextBlock Text="   ● GPU" FontSize="12" Foreground="{StaticResource SeriesTemp}" />
-                            <TextBlock Text="   ● memory junction" FontSize="12" Foreground="{StaticResource SeriesVram}" />
+                            <TextBlock Text="{Binding MemSeriesLabel, StringFormat='   ● {0}'}" FontSize="12" Foreground="{StaticResource SeriesVram}" />
                         </StackPanel>
                         <controls:SparkGraph Values="{Binding TempSeries}" Values2="{Binding MemJunctionSeries}"
                                              Stroke="{StaticResource SeriesTemp}" Stroke2="{StaticResource SeriesVram}"
@@ -234,7 +235,7 @@
 
                 <Border Style="{StaticResource Card}" Grid.Row="2" Grid.Column="0">
                     <StackPanel>
-                        <TextBlock Text="Board power · last 10 min" Style="{StaticResource CardTitle}" />
+                        <TextBlock Text="{Binding PowerTitle, StringFormat='{}{0} · last 10 min'}" Style="{StaticResource CardTitle}" />
                         <controls:SparkGraph Values="{Binding PowerSeries}" Stroke="{StaticResource SeriesPower}"
                                              Times="{Binding SeriesTimes}" HoverEnabled="True" Unit="W"
                                              Height="140" Margin="0,12,0,0" Capacity="600" />

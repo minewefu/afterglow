@@ -9,7 +9,14 @@ namespace Afterglow.Core.Tests;
 /// Regression tests for the "never report a number you did not measure" rule.
 /// Each of these covers a place that used to print a fabricated 0 (or crash)
 /// where the honest answer was "not measured".
+/// <para>
+/// In the "AppPaths" collection because one test here changes the process's
+/// current directory, and CommandLineTests (same collection) resolves relative
+/// --data-dir paths against it: run side by side, that test intermittently saw
+/// the scratch directory instead of its own.
+/// </para>
 /// </summary>
+[Collection("AppPaths")]
 public class HonestReportingTests
 {
     private static SessionReport Report(string app, double? power, double? gpuTemp, double? memJunction) => new()
