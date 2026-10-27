@@ -1,6 +1,20 @@
 # Changelog
 
-## Unreleased
+## 1.5.1 — 2026-10-28
+
+**What this release is about.** Three things a 1.5.0 user will notice.
+
+- **Keyboard shortcuts no longer swallow AltGr characters.** On international
+  layouts they used to take the character from typing. Every shortcut can now be
+  changed or turned off.
+- **The stability burn can now detect a miscalculation.** Its old arithmetic
+  overflowed, so sustained, transition and boost-excursion certifications earned
+  with 1.5.0 or earlier show "Re-certify" and are worth running again.
+- **All 49 findings of a full code review are fixed**, and the stepper and
+  certification logs now keep the whole run in a scrollable box.
+
+None of it was verified on physical GPUs. Driver behaviour was tested against
+fake drivers built from vendor documentation.
 
 ### Keyboard shortcuts no longer take characters from typing ([#6](https://github.com/minewefu/afterglow/issues/6))
 
