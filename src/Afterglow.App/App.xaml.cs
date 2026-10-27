@@ -446,9 +446,14 @@ public partial class App : Application
         }
 
         _exitRequested = true;
-        _tooltipTimer?.Stop();
-        _services.Hotkeys.Dispose();
-        _tray?.Dispose();
+
+        // Every step is independent (R-05): one that throws is logged and the
+        // rest still run — above all the services' hardware release, then the
+        // mutexes. A plain sequence let any early failure skip the fan release.
+        var steps = new Core.Services.ShutdownSteps();
+        steps.Run("tooltip timer", () => _tooltipTimer?.Stop());
+        steps.Run("hotkeys", () => _services.Hotkeys.Dispose());
+        steps.Run("tray icon", () => _tray?.Dispose());
 
         // Before the clean-shutdown mark and before the GPU services go away: a
         // stepper still in flight has an untested offset applied, and its cancel
@@ -461,26 +466,32 @@ public partial class App : Application
         // surviving with nothing to say so (F-27).
         // The V/F probe pins exact clocks the same way: cancel it first so its
         // unwind overlaps the stepper's, then require both to have landed.
-        _mainViewModel?.VfCurve.RequestProbeStop();
-        bool settled = _mainViewModel?.Stability.StopForShutdown() ?? true;
-        settled &= _mainViewModel?.VfCurve.StopForShutdown() ?? true;
+        steps.Run("V/F probe stop request", () => _mainViewModel?.VfCurve.RequestProbeStop());
+        steps.RunEssential("stability stepper", () => _mainViewModel?.Stability.StopForShutdown() ?? true);
+        steps.RunEssential("V/F probe", () => _mainViewModel?.VfCurve.StopForShutdown() ?? true);
+        steps.Run("stability page", () => _mainViewModel?.Stability.Dispose());
+
+        // The services hand the fans back BEFORE the clean-shutdown mark, and
+        // the mark waits on them (R-05). Marking first stamped the session clean
+        // even when the release never ran (a teardown step threw ahead of it)
+        // or the driver refused it, and the next launch showed no banner for a
+        // card left pinned — possibly stopped.
+        steps.RunEssential("services", _services.Shutdown);
 
         // Only the resident instance may vouch for a clean exit: a --demo or
         // --screenshot run starts services but applies nothing, and a second
         // launch that just signalled the first holds no instance mutex — either
         // would otherwise mark the RUNNING instance's records clean and erase
-        // its crash evidence.
-        if (settled && !_ephemeralRun && _singleInstanceMutex is not null)
+        // its crash evidence. The instance mutex is still held here.
+        if (steps.EssentialSucceeded && !_ephemeralRun && _singleInstanceMutex is not null)
         {
-            AppliedStateStore.MarkCleanShutdown();
+            steps.Run("clean-shutdown mark", () => AppliedStateStore.MarkCleanShutdown());
         }
 
-        _mainViewModel?.Stability.Dispose();
-        _services?.Dispose();
-        _activationWait?.Unregister(null);
-        _activationSignal?.Dispose();
-        _singleInstanceMutex?.Dispose();
-        _hardwareOwnerMutex?.Dispose();
+        steps.Run("activation wait", () => _activationWait?.Unregister(null));
+        steps.Run("activation signal", () => _activationSignal?.Dispose());
+        steps.Run("single-instance mutex", () => _singleInstanceMutex?.Dispose());
+        steps.Run("hardware-owner mutex", () => _hardwareOwnerMutex?.Dispose());
         base.OnExit(e);
     }
 }

@@ -415,39 +415,70 @@ public sealed class AppServices : IDisposable
         return services;
     }
 
-    public void Dispose()
+    private bool? _hardwareReleased;
+
+    public void Dispose() => _ = Shutdown();
+
+    /// <summary>
+    /// Tears every service down and says whether the hardware was handed back:
+    /// true only when every card's fan release succeeded (R-05). App.OnExit
+    /// stamps the session clean only on true. Each step runs on its own — one
+    /// that throws is logged and the rest still run: a CSV flush failing on a
+    /// full or disconnected drive used to throw out of here before the fans
+    /// were released, leaving a card pinned at a manual duty after exit with
+    /// the session already stamped clean. Later calls return the first answer.
+    /// </summary>
+    public bool Shutdown()
     {
+        if (_hardwareReleased is bool done)
+        {
+            return done;
+        }
+
+        var steps = new ShutdownSteps();
+        steps.Run("game watcher", GameWatcher.Dispose);
+        steps.Run("TDR watchdog", TdrWatchdog.Dispose);
+
+        // Telemetry before the fans. Its SnapshotTaken subscription drives the
+        // fan curve, and stopping the fans while snapshots are still arriving
+        // let one land after the release and command the fans again — leaving
+        // the card on manual fans after exit. FrameMetrics is disposed here too
+        // because its teardown waits on PresentMon for up to two seconds, which
+        // used to sit between the fan release and the poller still feeding it.
+        steps.Run("frame metrics", FrameMetrics.Dispose);
+        steps.Run("telemetry", Telemetry.Dispose);
+
+        foreach (var (index, fans) in FanControl)
+        {
+            steps.RunEssential($"GPU {index} fan release", fans.ReleaseForShutdown);
+        }
+
+        // File writes wait until the hardware is safe: a slow or failing disk
+        // must not delay the fan release, let alone skip it.
+        if (ActiveCsvLogger is { } csv)
+        {
+            steps.Run("CSV log", csv.Dispose);
+        }
+
         if (!DemoMode)
         {
             foreach (var recorder in VfCurves.Values)
             {
-                recorder.Save();
+                steps.Run("V/F curve save", () => recorder.Save());
             }
-        }
-
-        GameWatcher.Dispose();
-        TdrWatchdog.Dispose();
-
-        // Telemetry FIRST. Its SnapshotTaken subscription drives the fan curve,
-        // and stopping the fans while snapshots are still arriving let one land
-        // after the release and command the fans again — leaving the card on
-        // manual fans after exit. FrameMetrics is disposed here too because its
-        // teardown waits on PresentMon for up to two seconds, which used to sit
-        // between the fan release and the poller still feeding it.
-        FrameMetrics.Dispose();
-        ActiveCsvLogger?.Dispose();
-        Telemetry.Dispose();
-
-        foreach (var fans in FanControl.Values)
-        {
-            fans.Dispose();
         }
 
         foreach (var flightRecorder in Flights.Values)
         {
-            flightRecorder.Dispose();
+            steps.Run("flight recorder", flightRecorder.Dispose);
         }
 
-        Manager?.Dispose();
+        if (Manager is { } manager)
+        {
+            steps.Run("GPU manager", manager.Dispose);
+        }
+
+        _hardwareReleased = steps.EssentialSucceeded;
+        return steps.EssentialSucceeded;
     }
 }

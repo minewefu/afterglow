@@ -40,6 +40,7 @@ public sealed class CsvLogger : IDisposable
     ];
 
     private readonly Lock _lock = new();
+    private readonly Func<string, StreamWriter> _openWriter;
     private StreamWriter? _writer;
     private string _basePath;
     private int _rotation;
@@ -48,7 +49,18 @@ public sealed class CsvLogger : IDisposable
     public string? CurrentFile { get; private set; }
 
     public CsvLogger(string? basePath = null)
+        : this(basePath, static path => new StreamWriter(path, append: false, Encoding.UTF8))
     {
+    }
+
+    /// <summary>
+    /// Test seam: the same logger over a caller-supplied writer factory, so a
+    /// failing disk can be simulated without one.
+    /// </summary>
+    internal CsvLogger(string? basePath, Func<string, StreamWriter> openWriter)
+    {
+        _openWriter = openWriter;
+
         // Resolve immediately. A bare filename ("session.csv" — the form the
         // help text and README show) has no directory part, and Start's
         // Directory.CreateDirectory(GetDirectoryName(...)) then threw
@@ -94,7 +106,7 @@ public sealed class CsvLogger : IDisposable
 
     private void OpenWriter(string path)
     {
-        _writer = new StreamWriter(path, append: false, Encoding.UTF8);
+        _writer = _openWriter(path);
         _writer.WriteLine(string.Join(',', Columns));
         CurrentFile = path;
     }
@@ -195,13 +207,23 @@ public sealed class CsvLogger : IDisposable
         }
     }
 
+    /// <summary>
+    /// Flushes and closes the log. A flush that fails (a full or disconnected
+    /// drive) is still thrown — the tail of the log is lost and the caller may
+    /// say so — but the logger is stopped and its file closed either way (R-05):
+    /// it used to keep the broken writer, so the file stayed open and every
+    /// later Stop (the toggle, then app shutdown) threw the same error again.
+    /// </summary>
     public void Stop()
     {
         lock (_lock)
         {
-            _writer?.Flush();
-            _writer?.Dispose();
+            var writer = _writer;
             _writer = null;
+
+            // StreamWriter.Dispose flushes, then closes the stream even when
+            // that flush throws.
+            writer?.Dispose();
         }
     }
 

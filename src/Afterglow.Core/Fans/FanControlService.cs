@@ -45,6 +45,25 @@ public sealed class FanControlService : IDisposable
     /// </summary>
     private double _lastManualDuty = -1;
     private bool _weControlFans;
+
+    /// <summary>
+    /// Set when a fan write was issued and refused (R-06). A refusal does not
+    /// mean nothing moved: the NVIDIA fallback commands each cooler in turn and
+    /// reports only the worst result, so cooler 0 can be pinned (even stopped)
+    /// while cooler 1 refused. The driver says nothing per cooler, so every
+    /// refused write counts as a possible takeover: shutdown releases it, and
+    /// only a release the driver accepted clears it.
+    /// </summary>
+    private bool _fansMayBeManual;
+
+    /// <summary>
+    /// Set when the shutdown release begins (R-07). No fan command starts after
+    /// it, so nothing can take the fans back once they were handed over.
+    /// </summary>
+    private bool _shutDown;
+
+    /// <summary>The first shutdown release's outcome, returned to every later call.</summary>
+    private bool? _shutdownReleased;
     private long _generation;
 
     public FanControlService(IGpuTuner tuner)
@@ -148,6 +167,7 @@ public sealed class FanControlService : IDisposable
                 lock (_lock)
                 {
                     _weControlFans = false;
+                    _fansMayBeManual = false;
                     _lastCommandedDuty = -1;
                     _lastManualDuty = -1;
                 }
@@ -198,7 +218,8 @@ public sealed class FanControlService : IDisposable
 
         // Record manual control only when the command actually landed — a
         // failed command (e.g. not elevated) must not persist a claim that
-        // Afterglow took the fans over.
+        // Afterglow took the fans over. It is still tracked in memory as a
+        // possible takeover (R-06), so shutdown releases whatever it moved.
         if (!Command(duty, generation))
         {
             return false;
@@ -318,19 +339,34 @@ public sealed class FanControlService : IDisposable
         NvmlReturn rc;
         lock (_commandLock)
         {
-            if (!IsCurrent(generation))
+            lock (_lock)
             {
-                return false;
+                if (_shutDown || _generation != generation)
+                {
+                    return false;
+                }
             }
 
             rc = _setAllFans((uint)Math.Round(duty));
-            if (rc == NvmlReturn.Success)
+            lock (_lock)
             {
-                lock (_lock)
+                if (rc == NvmlReturn.Success)
                 {
                     _lastCommandedDuty = duty;
                     _lastManualDuty = -1; // an all-fan command supersedes any per-fan set
                     _weControlFans = true;
+                }
+                else
+                {
+                    // R-06: the refusal may have come after some coolers took
+                    // the duty, so the card may now be partly manual — release
+                    // it on shutdown. And neither duty memo describes the card
+                    // any more: the curve's "already commanded" memo used to make
+                    // it skip its next write whenever it asked for that duty
+                    // again, leaving the cooler this write moved where it was.
+                    _fansMayBeManual = true;
+                    _lastCommandedDuty = -1;
+                    _lastManualDuty = -1;
                 }
             }
         }
@@ -345,23 +381,21 @@ public sealed class FanControlService : IDisposable
         return false;
     }
 
-    public void Dispose()
+    public void Dispose() => _ = ReleaseForShutdown();
+
+    /// <summary>
+    /// The shutdown release <see cref="Dispose"/> performs, with its outcome
+    /// (R-05): true when the fans are left under no control of ours — nothing
+    /// was taken over, the driver accepted the release, or a card with no fan
+    /// interface had nothing to release; false when a takeover may still be on
+    /// the card, which is then re-recorded as unclean. The app stamps the
+    /// session clean only on true. No fan command starts after the first call,
+    /// and later calls return its answer without touching the driver.
+    /// </summary>
+    public bool ReleaseForShutdown()
     {
-        bool release;
-        double lastDuty;
         lock (_lock)
         {
-            release = _weControlFans;
-
-            // A per-fan manual set clears the curve memo on purpose, so fall
-            // back to the duty it recorded: the unclean-shutdown record below
-            // used to say "unknown" for a card stuck at exactly the value the
-            // user had just typed.
-            lastDuty = _lastCommandedDuty >= 0 ? _lastCommandedDuty : _lastManualDuty;
-            _weControlFans = false;
-            _lastCommandedDuty = -1;
-            _lastManualDuty = -1;
-
             // Stop the curve too, exactly as SetAuto does. Leaving _mode at
             // Curve with a live evaluator meant one telemetry snapshot arriving
             // after this point passed the mode guard, found no previous duty to
@@ -373,36 +407,87 @@ public sealed class FanControlService : IDisposable
             _mode = FanControlMode.Auto;
             _evaluator = null;
             _generation++;
+            _shutDown = true;
         }
 
-        if (!release)
-        {
-            // Deliberately narrower than SetAuto: shutdown is not a request to
-            // release, so a manual mode this service never set (another tool,
-            // another process) is left exactly as the user left it.
-            return;
-        }
-
-        NvmlReturn rc;
+        bool takenOver;
+        double lastDuty;
+        NvmlReturn rc = NvmlReturn.Success;
+        bool released;
         lock (_commandLock)
         {
-            rc = _restoreAutoFans();
+            // R-07: ownership is read only now, holding the command lock, so a
+            // command already inside the driver when shutdown began has finished
+            // and its takeover is seen. Reading it before the lock missed the
+            // FIRST curve write — still in flight, flag still false — released
+            // nothing, and let that write land after the "release".
+            bool mayBeManual;
+            lock (_lock)
+            {
+                if (_shutdownReleased is bool done)
+                {
+                    return done;
+                }
+
+                takenOver = _weControlFans;
+                mayBeManual = _fansMayBeManual;
+
+                // A per-fan manual set clears the curve memo on purpose, so fall
+                // back to the duty it recorded: the unclean-shutdown record below
+                // used to say "unknown" for a card stuck at exactly the value the
+                // user had just typed.
+                lastDuty = _lastCommandedDuty >= 0 ? _lastCommandedDuty : _lastManualDuty;
+                _weControlFans = false;
+                _fansMayBeManual = false;
+                _lastCommandedDuty = -1;
+                _lastManualDuty = -1;
+
+                // Until the driver answers: a release that throws must not let
+                // a later call report a clean hand-back.
+                _shutdownReleased = false;
+            }
+
+            if (!takenOver && !mayBeManual)
+            {
+                // Deliberately narrower than SetAuto: shutdown is not a request to
+                // release, so a manual mode this service never set (another tool,
+                // another process) is left exactly as the user left it.
+                released = true;
+            }
+            else
+            {
+                rc = _restoreAutoFans();
+
+                // NotSupported after nothing but refused writes: the card has no
+                // fan interface (Arc refuses every write that way), so nothing
+                // moved and there is nothing to hand back. After a write the
+                // driver accepted, it is a release that did not happen.
+                released = rc == NvmlReturn.Success || (rc == NvmlReturn.NotSupported && !takenOver);
+            }
+
+            lock (_lock)
+            {
+                _shutdownReleased = released;
+            }
         }
 
-        if (rc != NvmlReturn.Success)
+        if (released)
         {
-            // Logged, not raised: subscribers are being torn down with us.
-            Diagnostics.Log.Warn($"Fan release to firmware control on shutdown failed: {rc}");
-
-            // The fans are still under Afterglow's manual control — physically
-            // pinned at the last commanded duty, possibly stopped — and the
-            // session was already stamped clean by App.OnExit, so the next
-            // launch would show no banner and the Fans page would claim
-            // "Firmware (auto)" over a card that is nothing of the sort.
-            // Re-recording clears the clean flag on purpose: this shutdown did
-            // NOT leave the hardware as it found it, and the user needs to know.
-            AppliedStateStore.RecordFans(
-                "fixed", lastDuty >= 0 ? (uint)Math.Round(lastDuty) : null, _recordKey);
+            return true;
         }
+
+        // Logged, not raised: subscribers are being torn down with us.
+        Diagnostics.Log.Warn($"Fan release to firmware control on shutdown failed: {rc}");
+
+        // The fans are (or may be) still under Afterglow's manual control —
+        // pinned at the last commanded duty, possibly stopped. Re-recording
+        // keeps the record unclean on purpose: this shutdown did NOT leave the
+        // hardware as it found it, the next launch's banner must say so, and the
+        // Fans page must not claim "Firmware (auto)". App.OnExit stamps the
+        // session clean only when this returned true (R-05). After a refused
+        // write the duty is unknown (the memos were cleared), and so recorded.
+        AppliedStateStore.RecordFans(
+            "fixed", lastDuty >= 0 ? (uint)Math.Round(lastDuty) : null, _recordKey);
+        return false;
     }
 }
