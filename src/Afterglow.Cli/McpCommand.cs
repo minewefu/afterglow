@@ -30,20 +30,18 @@ internal static class McpCommand
 
     public static int Run(string[]? args = null)
     {
+        if (ParseStartup(args ?? ["mcp"], out uint? wantedGpu) is string startupError)
+        {
+            Console.Error.WriteLine(startupError);
+            return 2;
+        }
+
         using var manager = new GpuManager();
 
         // `mcp --gpu N` binds the whole server to one card; agents that want
         // another card run a second server. Default: the first NVML device.
         var gpu = manager.Gpus.Count > 0 ? manager.Gpus[0] : null;
-        if (args is not null && !CliGpu.TryParseIndex(args, out _, out string? gpuArgError))
-        {
-            // Never fall back to GPU 0 here: this binds every tuning write and
-            // every stability verdict the agent will make.
-            Console.Error.WriteLine(gpuArgError);
-            return 2;
-        }
-
-        if (args is not null && CliGpu.ParseIndex(args) is { } wantedIndex)
+        if (wantedGpu is { } wantedIndex)
         {
             gpu = manager.Gpus.FirstOrDefault(g => g.Index == wantedIndex);
             if (gpu is null)
@@ -174,6 +172,28 @@ internal static class McpCommand
         }
 
         return 0;
+    }
+
+    /// <summary>
+    /// The startup options, checked before any GPU is opened. Null with the
+    /// requested index (null = none named) when the server may start;
+    /// otherwise the message to print before exiting 2.
+    /// </summary>
+    internal static string? ParseStartup(string[] args, out uint? gpuIndex)
+    {
+        gpuIndex = null;
+
+        // The shared checker first, as every other command does (R-34). Only a
+        // literal --gpu was ever looked at, so `mcp --gpuu 1` — or a bare `1` —
+        // was "no card named": the server started, answered, and bound every
+        // tuning write and every stability verdict of the session to GPU 0.
+        if (CliArgs.Validate(args, "mcp") is string argError)
+        {
+            return argError;
+        }
+
+        // Never fall back to GPU 0 here either: a repeated --gpu is ambiguous.
+        return CliGpu.TryParseIndex(args, out gpuIndex, out string? gpuArgError) ? null : gpuArgError;
     }
 
     /// <summary>
@@ -406,39 +426,10 @@ internal static class McpCommand
 
             new ToolDef(
                 "save_profile",
-                "Save the currently applied tuning as a named profile (e.g., after a successful tuning loop).",
+                "Save the currently applied tuning as a named profile (e.g., after a successful tuning loop), " +
+                "stamped for this GPU and including its per-point V/F curve where the driver exposes one.",
                 Schema(("name", "string", "Profile name", true)),
-                args =>
-                {
-                    if (gpu is null)
-                    {
-                        return RequireGpu();
-                    }
-
-                    string name = args?["name"]?.GetValue<string>() ?? "agent";
-                    var (core, mem, power, boost, _) = gpu.Tuner.ReadCurrent();
-                    var profile = new TuningProfile
-                    {
-                        Name = name,
-                        CoreOffsetMHz = core,
-                        MemOffsetMHz = mem,
-                        PowerLimitW = power > 0 ? power : null,
-                        VoltageBoostPct = boost,
-                        // The lock Afterglow applied, never the observed ceiling
-                        // (see IGpuTuner.ReadCurrent): a profile that captured an
-                        // Arc factory ceiling re-applied it as a clamp.
-                        LockedCoreClockMHz = gpu.Tuner.AppliedLockMHz,
-
-                        // Stamp the card these values were read from. Without it
-                        // TuningProfile's own cross-card guard short-circuits
-                        // (null matches anything), so a profile captured from one
-                        // GPU applied silently to another.
-                        GpuUuid = gpu.Uuid,
-                        Notes = $"Saved via MCP {DateTimeOffset.Now:u}",
-                    };
-                    profiles.Save(profile);
-                    return new { saved = name, profile };
-                }),
+                args => gpu is null ? RequireGpu() : SaveProfile(gpu, profiles, args)),
 
             new ToolDef(
                 "apply_profile",
@@ -462,6 +453,37 @@ internal static class McpCommand
                     return new { applied = name, all_succeeded = result.AllSucceeded, results = result.Results };
                 }),
         ];
+    }
+
+    /// <summary>The save_profile tool: capture what this card runs now, then store it.</summary>
+    internal static object SaveProfile(GpuContext gpu, ProfileStore profiles, JsonObject? args)
+    {
+        string name = args?["name"]?.GetValue<string>() ?? "agent";
+        var (core, mem, power, boost, _) = gpu.Tuner.ReadCurrent();
+        var scalars = new TuningProfile
+        {
+            Name = name,
+            CoreOffsetMHz = core,
+            MemOffsetMHz = mem,
+            PowerLimitW = power > 0 ? power : null,
+            VoltageBoostPct = boost,
+            // The lock Afterglow applied, never the observed ceiling
+            // (see IGpuTuner.ReadCurrent): a profile that captured an
+            // Arc factory ceiling re-applied it as a clamp.
+            LockedCoreClockMHz = gpu.Tuner.AppliedLockMHz,
+            Notes = $"Saved via MCP {DateTimeOffset.Now:u}",
+        };
+
+        // Stamped with the card these values were read from — without it
+        // TuningProfile's cross-card guard short-circuits (null matches
+        // anything) — and carrying its per-point curve, through the same Core
+        // capture the Profiles page uses. This save read only the scalars above
+        // (R-35), so a curve an agent shaped and saved here was missing from
+        // the profile, CapturedVfPoints said the table was never read, and
+        // applying the profile after a reset could not put the curve back.
+        var profile = scalars.CapturedFrom(gpu);
+        profiles.Save(profile);
+        return new { saved = name, profile };
     }
 
     private static object ApplyTuning(GpuContext gpu, JsonObject? args)

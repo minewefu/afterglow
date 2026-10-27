@@ -63,6 +63,10 @@ internal static class CliArgs
                 ["--json"],
                 ["--core-offset", "--mem-offset", "--power-limit", "--lock-clock",
                  "--voltage-boost", "--temp-limit", "--fan", "--gpu"]),
+
+            // `mcp --gpuu 1` used to start a server bound to GPU 0 (R-34): the
+            // server reads only --gpu, and nothing checked the rest.
+            ["mcp"] = ([], ["--gpu"]),
         };
 
     /// <summary>Validates <paramref name="args"/> against the named command's declared options.</summary>

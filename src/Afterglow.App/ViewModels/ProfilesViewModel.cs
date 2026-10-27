@@ -318,34 +318,16 @@ public partial class ProfilesViewModel : ObservableObject
             var gpu = _services.SelectedGpu;
 
             // Per-point curve offsets are part of the picture too, on any GPU
-            // whose driver answered the live probe: capture whatever is applied
-            // right now — the whole table, explicit zeros included, whenever it
-            // holds more than the global core offset (F-02/F-07: dropping the
-            // zeros a flatten writes let re-apply resurrect what was under them).
-            IReadOnlyDictionary<int, int>? vfPoints = null;
-            bool capturedVfPoints = false;
-            if (gpu is { Tuner.Capabilities.SupportsVfPoints: true } &&
-                gpu.Tuner.TryReadVfPoints(out var tablePoints) == Core.Interop.Nvapi.NvapiStatus.Ok)
-            {
-                vfPoints = Core.Tuning.VfPointPlanner.CaptureForProfile(
-                    tablePoints, gpu.Tuner.ReadCurrent().CoreOffsetMHz);
-
-                // The table was read, so "none" here is a fact about this card
-                // and applying the profile may remove a curve. A profile that
-                // never read it says nothing about the curve either way.
-                capturedVfPoints = true;
-            }
-
-            var profile = _tuning.ToProfile(name) with
+            // whose driver answered the live probe: the whole table, explicit
+            // zeros included (F-02/F-07), and CapturedVfPoints only when it was
+            // actually read. Shared with MCP's save_profile (R-35), which had
+            // its own copy of this save without the table.
+            var profile = (_tuning.ToProfile(name) with
             {
                 FanMode = fanMode,
                 FixedFanPct = fixedPct,
                 FanCurve = fanMode == FanMode.Curve ? curve : null,
-                GpuUuid = gpu?.Uuid,
-                GpuName = gpu?.Name,
-                VfPointOffsetsMHz = vfPoints,
-                CapturedVfPoints = capturedVfPoints,
-            };
+            }).CapturedFrom(gpu);
             _services.Profiles.Save(profile);
             StatusText = $"Saved '{name}' (tuning + {fanMode switch { FanMode.Curve => "fan curve", FanMode.Fixed => "fixed fans", _ => "auto fans" }}).";
             NewProfileName = string.Empty;

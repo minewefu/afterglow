@@ -55,6 +55,10 @@ public class CliContractTests
         { "drs", ["drs", "--exe", "game.exe", "--probe-list"] },
         { "drs", ["drs", "--exe", "game.exe", "--probe-create"] },
         { "drs", ["drs", "--exe", "game.exe", "--probe-profile"] },
+
+        // mcp: the documented MCP client configs pass nothing or --gpu N.
+        { "mcp", ["mcp"] },
+        { "mcp", ["mcp", "--gpu", "1"] },
     };
 
     [Theory]
@@ -79,6 +83,7 @@ public class CliContractTests
     [InlineData("drs", "DrsCommand")]
     [InlineData("monitor", "MonitorCommand")]
     [InlineData("set", "TuneCommands")]
+    [InlineData("mcp", "McpCommand")]
     public void Every_option_the_command_reads_is_declared(string command, string sourceFile)
     {
         string path = Path.Combine(RepoRoot(), "src", "Afterglow.Cli", sourceFile + ".cs");
